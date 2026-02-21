@@ -298,6 +298,20 @@ function appendToDailyLog(groupDir: string, entry: string): void {
   }
 }
 
+/**
+ * Append a session entry to DEVLOG.md in the project root.
+ */
+function appendToDevLog(projectDir: string, entry: string): void {
+  try {
+    const devlogPath = path.join(projectDir, 'DEVLOG.md');
+    if (fs.existsSync(devlogPath)) {
+      fs.appendFileSync(devlogPath, entry + '\n\n');
+    }
+  } catch (err) {
+    log(`Failed to append to DEVLOG: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
 function sanitizeFilename(summary: string): string {
   return summary
     .toLowerCase()
@@ -636,6 +650,38 @@ async function main(): Promise<void> {
     prompt += '\n' + pending.join('\n');
   }
 
+  // Write progress.json so CENTCOMM Live dashboard can track this session
+  const progressPath = path.join(IPC_BASE_DIR, 'progress.json');
+  const sessionIdForProgress = containerInput.sessionId || `new-${Date.now()}`;
+  const writeProgress = (status: 'running' | 'completed' | 'error', error: string | null = null) => {
+    try {
+      fs.mkdirSync(path.dirname(progressPath), { recursive: true });
+      fs.writeFileSync(progressPath, JSON.stringify({
+        groupFolder: containerInput.groupFolder,
+        groupName: containerInput.groupFolder,
+        sessionId: sessionIdForProgress,
+        status,
+        startedAt: new Date(sessionStartTime).toISOString(),
+        lastUpdate: new Date().toISOString(),
+        prompt: containerInput.prompt.slice(0, 500),
+        steps: [],
+        currentStep: null,
+        logs: [],
+        error,
+      }));
+    } catch { /* non-fatal */ }
+  };
+  writeProgress('running');
+
+  // DevLog: record session start
+  const devlogTs = () => new Date().toISOString().slice(0, 16).replace('T', ' ');
+  const devlogPromptPreview = containerInput.prompt.slice(0, 150).replace(/\n/g, ' ');
+  const devlogType = containerInput.isScheduledTask ? 'Scheduled Task' : 'Session';
+  appendToDevLog(PROJECT_DIR,
+    `### [${devlogTs()}] SESSION_START | ${devlogType} — ${containerInput.groupFolder}\n` +
+    `- Prompt: ${devlogPromptPreview}${containerInput.prompt.length > 150 ? '...' : ''}`
+  );
+
   // Query loop: run query → wait for IPC message → run new query → repeat
   let resumeAt: string | undefined;
   try {
@@ -687,6 +733,12 @@ async function main(): Promise<void> {
       `- Status: Completed`
     );
     log('Session summary appended to daily log');
+    writeProgress('completed');
+    appendToDevLog(PROJECT_DIR,
+      `### [${devlogTs()}] SESSION_END | ${devlogType} — ${containerInput.groupFolder}\n` +
+      `- Status: Completed\n` +
+      `- Duration: ${durationMin}min`
+    );
 
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
@@ -699,6 +751,12 @@ async function main(): Promise<void> {
       `## Session @ ${timeStr} [ERROR]\n` +
       `- Error: ${errorMessage.slice(0, 200)}\n` +
       `- Prompt: ${containerInput.prompt.slice(0, 80).replace(/\n/g, ' ')}...`
+    );
+    writeProgress('error', errorMessage.slice(0, 500));
+    appendToDevLog(PROJECT_DIR,
+      `### [${devlogTs()}] SESSION_END | ${devlogType} — ${containerInput.groupFolder}\n` +
+      `- Status: ERROR\n` +
+      `- Error: ${errorMessage.slice(0, 300)}`
     );
 
     writeOutput({
