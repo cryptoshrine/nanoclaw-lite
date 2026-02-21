@@ -1,33 +1,46 @@
-import { ChildProcess } from 'child_process';
 import { CronExpressionParser } from 'cron-parser';
 import fs from 'fs';
 import path from 'path';
 
 import {
+  DATA_DIR,
   GROUPS_DIR,
-  IDLE_TIMEOUT,
   MAIN_GROUP_FOLDER,
   SCHEDULER_POLL_INTERVAL,
   TIMEZONE,
 } from './config.js';
-import { ContainerOutput, runContainerAgent, writeTasksSnapshot } from './container-runner.js';
+import { runAgent as runContainerAgentDispatch, writeTasksSnapshot } from './container-runner.js';
 import {
   getAllTasks,
   getDueTasks,
   getTaskById,
   logTaskRun,
+  markTaskFailed,
   updateTaskAfterRun,
+  updateTaskRetry,
 } from './db.js';
-import { GroupQueue } from './group-queue.js';
 import { logger } from './logger.js';
 import { RegisteredGroup, ScheduledTask } from './types.js';
 
 export interface SchedulerDependencies {
+  sendMessage: (jid: string, text: string) => Promise<void>;
   registeredGroups: () => Record<string, RegisteredGroup>;
   getSessions: () => Record<string, string>;
-  queue: GroupQueue;
-  onProcess: (groupJid: string, proc: ChildProcess, containerName: string, groupFolder: string) => void;
-  sendMessage: (jid: string, text: string) => Promise<void>;
+}
+
+/**
+ * Calculate exponential backoff delay for retries.
+ * Retry 1: 1 minute
+ * Retry 2: 5 minutes
+ * Retry 3: 15 minutes
+ */
+function calculateBackoffDelay(retryCount: number): number {
+  const delays = [
+    60 * 1000, // 1 minute
+    5 * 60 * 1000, // 5 minutes
+    15 * 60 * 1000, // 15 minutes
+  ];
+  return delays[Math.min(retryCount, delays.length - 1)];
 }
 
 async function runTask(
@@ -89,50 +102,19 @@ async function runTask(
   const sessionId =
     task.context_mode === 'group' ? sessions[task.group_folder] : undefined;
 
-  // Idle timer: writes _close sentinel after IDLE_TIMEOUT of no output,
-  // so the container exits instead of hanging at waitForIpcMessage forever.
-  let idleTimer: ReturnType<typeof setTimeout> | null = null;
-
-  const resetIdleTimer = () => {
-    if (idleTimer) clearTimeout(idleTimer);
-    idleTimer = setTimeout(() => {
-      logger.debug({ taskId: task.id }, 'Scheduled task idle timeout, closing container stdin');
-      deps.queue.closeStdin(task.chat_jid);
-    }, IDLE_TIMEOUT);
-  };
-
   try {
-    const output = await runContainerAgent(
-      group,
-      {
-        prompt: task.prompt,
-        sessionId,
-        groupFolder: task.group_folder,
-        chatJid: task.chat_jid,
-        isMain,
-        isScheduledTask: true,
-      },
-      (proc, containerName) => deps.onProcess(task.chat_jid, proc, containerName, task.group_folder),
-      async (streamedOutput: ContainerOutput) => {
-        if (streamedOutput.result) {
-          result = streamedOutput.result;
-          // Forward result to user (sendMessage handles formatting)
-          await deps.sendMessage(task.chat_jid, streamedOutput.result);
-          // Only reset idle timer on actual results, not session-update markers
-          resetIdleTimer();
-        }
-        if (streamedOutput.status === 'error') {
-          error = streamedOutput.error || 'Unknown error';
-        }
-      },
-    );
-
-    if (idleTimer) clearTimeout(idleTimer);
+    const output = await runContainerAgentDispatch(group, {
+      prompt: task.prompt,
+      sessionId,
+      groupFolder: task.group_folder,
+      chatJid: task.chat_jid,
+      isMain,
+      isScheduledTask: true,
+    });
 
     if (output.status === 'error') {
       error = output.error || 'Unknown error';
-    } else if (output.result) {
-      // Messages are sent via MCP tool (IPC), result text is just logged
+    } else {
       result = output.result;
     }
 
@@ -141,7 +123,6 @@ async function runTask(
       'Task completed',
     );
   } catch (err) {
-    if (idleTimer) clearTimeout(idleTimer);
     error = err instanceof Error ? err.message : String(err);
     logger.error({ taskId: task.id, error }, 'Task failed');
   }
@@ -157,6 +138,62 @@ async function runTask(
     error,
   });
 
+  // Handle retry logic on failure
+  if (error) {
+    const currentRetry = task.retry_count || 0;
+    const maxRetries = task.max_retries || 3;
+
+    if (currentRetry < maxRetries) {
+      // Schedule retry with exponential backoff
+      const backoffDelay = calculateBackoffDelay(currentRetry);
+      const retryTime = new Date(Date.now() + backoffDelay).toISOString();
+      const newRetryCount = currentRetry + 1;
+
+      logger.warn(
+        {
+          taskId: task.id,
+          retry: newRetryCount,
+          maxRetries,
+          nextRetry: retryTime,
+        },
+        'Task failed, scheduling retry',
+      );
+
+      updateTaskRetry(task.id, newRetryCount, retryTime, error);
+
+      // Notify user about retry
+      try {
+        await deps.sendMessage(
+          task.chat_jid,
+          `⚠️ Scheduled task failed (attempt ${newRetryCount}/${maxRetries}). Retrying in ${Math.round(backoffDelay / 60000)} minutes.\nError: ${error.slice(0, 100)}`,
+        );
+      } catch {
+        // Ignore send errors
+      }
+      return;
+    } else {
+      // Max retries exceeded, mark as failed
+      logger.error(
+        { taskId: task.id, retries: currentRetry },
+        'Task failed after max retries',
+      );
+
+      markTaskFailed(task.id, error);
+
+      // Notify user about permanent failure
+      try {
+        await deps.sendMessage(
+          task.chat_jid,
+          `❌ Scheduled task permanently failed after ${maxRetries} retries.\nError: ${error.slice(0, 200)}`,
+        );
+      } catch {
+        // Ignore send errors
+      }
+      return;
+    }
+  }
+
+  // Success - calculate next run
   let nextRun: string | null = null;
   if (task.schedule_type === 'cron') {
     const interval = CronExpressionParser.parse(task.schedule_value, {
@@ -169,22 +206,11 @@ async function runTask(
   }
   // 'once' tasks have no next run
 
-  const resultSummary = error
-    ? `Error: ${error}`
-    : result
-      ? result.slice(0, 200)
-      : 'Completed';
+  const resultSummary = result ? result.slice(0, 200) : 'Completed';
   updateTaskAfterRun(task.id, nextRun, resultSummary);
 }
 
-let schedulerRunning = false;
-
 export function startSchedulerLoop(deps: SchedulerDependencies): void {
-  if (schedulerRunning) {
-    logger.debug('Scheduler loop already running, skipping duplicate start');
-    return;
-  }
-  schedulerRunning = true;
   logger.info('Scheduler loop started');
 
   const loop = async () => {
@@ -195,17 +221,21 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
       }
 
       for (const task of dueTasks) {
-        // Re-check task status in case it was paused/cancelled
+        // Re-check task status in case it was paused/cancelled/failed
         const currentTask = getTaskById(task.id);
-        if (!currentTask || currentTask.status !== 'active') {
+        if (
+          !currentTask ||
+          (currentTask.status !== 'active' && currentTask.status !== 'failed')
+        ) {
           continue;
         }
 
-        deps.queue.enqueueTask(
-          currentTask.chat_jid,
-          currentTask.id,
-          () => runTask(currentTask, deps),
-        );
+        // Skip permanently failed tasks (status='failed' means max retries exceeded)
+        if (currentTask.status === 'failed') {
+          continue;
+        }
+
+        await runTask(currentTask, deps);
       }
     } catch (err) {
       logger.error({ err }, 'Error in scheduler loop');

@@ -1,22 +1,12 @@
 import path from 'path';
 
-import { readEnvFile } from './env.js';
-
-// Read config values from .env (falls back to process.env).
-// Secrets are NOT read here — they stay on disk and are loaded only
-// where needed (container-runner.ts) to avoid leaking to child processes.
-const envConfig = readEnvFile(['ASSISTANT_NAME', 'ASSISTANT_HAS_OWN_NUMBER']);
-
-export const ASSISTANT_NAME =
-  process.env.ASSISTANT_NAME || envConfig.ASSISTANT_NAME || 'Andy';
-export const ASSISTANT_HAS_OWN_NUMBER =
-  (process.env.ASSISTANT_HAS_OWN_NUMBER || envConfig.ASSISTANT_HAS_OWN_NUMBER) === 'true';
+export const ASSISTANT_NAME = process.env.ASSISTANT_NAME || 'Andy';
 export const POLL_INTERVAL = 2000;
 export const SCHEDULER_POLL_INTERVAL = 60000;
 
 // Absolute paths needed for container mounts
-const PROJECT_ROOT = process.cwd();
-const HOME_DIR = process.env.HOME || '/Users/user';
+export const PROJECT_ROOT = process.cwd();
+const HOME_DIR = process.env.HOME || process.env.USERPROFILE || '/Users/user';
 
 // Mount security: allowlist stored OUTSIDE project root, never mounted into containers
 export const MOUNT_ALLOWLIST_PATH = path.join(
@@ -30,10 +20,17 @@ export const GROUPS_DIR = path.resolve(PROJECT_ROOT, 'groups');
 export const DATA_DIR = path.resolve(PROJECT_ROOT, 'data');
 export const MAIN_GROUP_FOLDER = 'main';
 
+export const EXECUTION_MODE: 'local' | 'docker' =
+  (process.env.EXECUTION_MODE as 'local' | 'docker') || 'local';
+
+export const AGENT_RUNNER_ENTRY = path.resolve(
+  PROJECT_ROOT, 'container', 'agent-runner', 'dist', 'index.js'
+);
+
 export const CONTAINER_IMAGE =
   process.env.CONTAINER_IMAGE || 'nanoclaw-agent:latest';
 export const CONTAINER_TIMEOUT = parseInt(
-  process.env.CONTAINER_TIMEOUT || '1800000',
+  process.env.CONTAINER_TIMEOUT || '300000',
   10,
 );
 export const CONTAINER_MAX_OUTPUT_SIZE = parseInt(
@@ -41,13 +38,13 @@ export const CONTAINER_MAX_OUTPUT_SIZE = parseInt(
   10,
 ); // 10MB default
 export const IPC_POLL_INTERVAL = 1000;
-export const IDLE_TIMEOUT = parseInt(
-  process.env.IDLE_TIMEOUT || '1800000',
+
+// Maximum age of messages to replay when rebuilding agent context.
+// Prevents replaying days of history when the agent has been offline.
+// Default: 4 hours (14_400_000 ms)
+export const MAX_HISTORY_AGE_MS = parseInt(
+  process.env.MAX_HISTORY_AGE_MS || '14400000',
   10,
-); // 30min default — how long to keep container alive after last result
-export const MAX_CONCURRENT_CONTAINERS = Math.max(
-  1,
-  parseInt(process.env.MAX_CONCURRENT_CONTAINERS || '5', 10) || 5,
 );
 
 function escapeRegex(str: string): string {
@@ -63,3 +60,13 @@ export const TRIGGER_PATTERN = new RegExp(
 // Uses system timezone by default
 export const TIMEZONE =
   process.env.TZ || Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+// Memory IPC configuration
+export const MEMORY_IPC_POLL_MS = 100;
+export const MEMORY_IPC_TIMEOUT_MS = 30000;
+
+// Agent Teams configuration
+export const TEAM_DIR = path.resolve(DATA_DIR, 'teams');
+export const TEAM_POLL_INTERVAL = 2000; // Poll interval for teammate status checks
+export const TEAMMATE_TIMEOUT = 600000; // 10 minutes timeout for teammates
+export const DEFAULT_TEAMMATE_MODEL = 'claude-sonnet-4-6';

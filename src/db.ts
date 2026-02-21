@@ -2,13 +2,34 @@ import Database from 'better-sqlite3';
 import fs from 'fs';
 import path from 'path';
 
-import { ASSISTANT_NAME, DATA_DIR, STORE_DIR } from './config.js';
-import { NewMessage, RegisteredGroup, ScheduledTask, TaskRunLog } from './types.js';
+import { STORE_DIR } from './config.js';
+import { initMemorySchema } from './memory/schema.js';
+import {
+  NewMessage,
+  ScheduledTask,
+  TaskRunLog,
+  Team,
+  TeamMember,
+  TeamTask,
+  TeamMessage,
+} from './types.js';
 
 let db: Database.Database;
 
-function createSchema(database: Database.Database): void {
-  database.exec(`
+/**
+ * Get the database instance. Must call initDatabase() first.
+ */
+export function getDb(): Database.Database {
+  if (!db) throw new Error('Database not initialized — call initDatabase() first');
+  return db;
+}
+
+export function initDatabase(): void {
+  const dbPath = path.join(STORE_DIR, 'messages.db');
+  fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+
+  db = new Database(dbPath);
+  db.exec(`
     CREATE TABLE IF NOT EXISTS chats (
       jid TEXT PRIMARY KEY,
       name TEXT,
@@ -22,7 +43,6 @@ function createSchema(database: Database.Database): void {
       content TEXT,
       timestamp TEXT,
       is_from_me INTEGER,
-      is_bot_message INTEGER DEFAULT 0,
       PRIMARY KEY (id, chat_jid),
       FOREIGN KEY (chat_jid) REFERENCES chats(jid)
     );
@@ -55,64 +75,102 @@ function createSchema(database: Database.Database): void {
       FOREIGN KEY (task_id) REFERENCES scheduled_tasks(id)
     );
     CREATE INDEX IF NOT EXISTS idx_task_run_logs ON task_run_logs(task_id, run_at);
-
-    CREATE TABLE IF NOT EXISTS router_state (
-      key TEXT PRIMARY KEY,
-      value TEXT NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS sessions (
-      group_folder TEXT PRIMARY KEY,
-      session_id TEXT NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS registered_groups (
-      jid TEXT PRIMARY KEY,
-      name TEXT NOT NULL,
-      folder TEXT NOT NULL UNIQUE,
-      trigger_pattern TEXT NOT NULL,
-      added_at TEXT NOT NULL,
-      container_config TEXT,
-      requires_trigger INTEGER DEFAULT 1
-    );
   `);
+
+  // Add sender_name column if it doesn't exist (migration for existing DBs)
+  try {
+    db.exec(`ALTER TABLE messages ADD COLUMN sender_name TEXT`);
+  } catch {
+    /* column already exists */
+  }
 
   // Add context_mode column if it doesn't exist (migration for existing DBs)
   try {
-    database.exec(
+    db.exec(
       `ALTER TABLE scheduled_tasks ADD COLUMN context_mode TEXT DEFAULT 'isolated'`,
     );
   } catch {
     /* column already exists */
   }
 
-  // Add is_bot_message column if it doesn't exist (migration for existing DBs)
+  // Add retry columns if they don't exist (migration for existing DBs)
   try {
-    database.exec(
-      `ALTER TABLE messages ADD COLUMN is_bot_message INTEGER DEFAULT 0`,
+    db.exec(
+      `ALTER TABLE scheduled_tasks ADD COLUMN retry_count INTEGER DEFAULT 0`,
     );
-    // Backfill: mark existing bot messages that used the content prefix pattern
-    database.prepare(
-      `UPDATE messages SET is_bot_message = 1 WHERE content LIKE ?`,
-    ).run(`${ASSISTANT_NAME}:%`);
   } catch {
     /* column already exists */
   }
-}
+  try {
+    db.exec(
+      `ALTER TABLE scheduled_tasks ADD COLUMN max_retries INTEGER DEFAULT 3`,
+    );
+  } catch {
+    /* column already exists */
+  }
+  try {
+    db.exec(`ALTER TABLE scheduled_tasks ADD COLUMN last_error TEXT`);
+  } catch {
+    /* column already exists */
+  }
 
-export function initDatabase(): void {
-  const dbPath = path.join(STORE_DIR, 'messages.db');
-  fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+  // Memory system tables
+  initMemorySchema(db);
 
-  db = new Database(dbPath);
-  createSchema(db);
+  // Agent Teams tables
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS teams (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL UNIQUE,
+      lead_group TEXT NOT NULL,
+      status TEXT DEFAULT 'active',
+      created_at TEXT NOT NULL
+    );
 
-  // Migrate from JSON files if they exist
-  migrateJsonState();
-}
+    CREATE TABLE IF NOT EXISTS team_members (
+      id TEXT PRIMARY KEY,
+      team_id TEXT NOT NULL,
+      name TEXT NOT NULL,
+      model TEXT DEFAULT 'claude-sonnet-4-20250514',
+      role TEXT DEFAULT 'teammate',
+      status TEXT DEFAULT 'pending',
+      container_id TEXT,
+      session_id TEXT,
+      prompt TEXT,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY (team_id) REFERENCES teams(id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_team_members_team ON team_members(team_id);
 
-/** @internal - for tests only. Creates a fresh in-memory database. */
-export function _initTestDatabase(): void {
-  db = new Database(':memory:');
-  createSchema(db);
+    CREATE TABLE IF NOT EXISTS team_tasks (
+      id TEXT PRIMARY KEY,
+      team_id TEXT NOT NULL,
+      title TEXT NOT NULL,
+      description TEXT,
+      status TEXT DEFAULT 'pending',
+      assigned_to TEXT,
+      depends_on TEXT,
+      priority INTEGER DEFAULT 0,
+      created_at TEXT NOT NULL,
+      completed_at TEXT,
+      FOREIGN KEY (team_id) REFERENCES teams(id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_team_tasks_team ON team_tasks(team_id);
+    CREATE INDEX IF NOT EXISTS idx_team_tasks_status ON team_tasks(status);
+
+    CREATE TABLE IF NOT EXISTS team_messages (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      team_id TEXT NOT NULL,
+      from_member TEXT NOT NULL,
+      to_member TEXT,
+      content TEXT NOT NULL,
+      read INTEGER DEFAULT 0,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY (team_id) REFERENCES teams(id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_team_messages_team ON team_messages(team_id);
+    CREATE INDEX IF NOT EXISTS idx_team_messages_to ON team_messages(to_member);
+  `);
 }
 
 /**
@@ -206,45 +264,25 @@ export function setLastGroupSync(): void {
  * Store a message with full content.
  * Only call this for registered groups where message history is needed.
  */
-export function storeMessage(msg: NewMessage): void {
-  db.prepare(
-    `INSERT OR REPLACE INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me, is_bot_message) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(
-    msg.id,
-    msg.chat_jid,
-    msg.sender,
-    msg.sender_name,
-    msg.content,
-    msg.timestamp,
-    msg.is_from_me ? 1 : 0,
-    msg.is_bot_message ? 1 : 0,
-  );
-}
-
-/**
- * Store a message directly (for non-WhatsApp channels that don't use Baileys proto).
- */
-export function storeMessageDirect(msg: {
+export function storeMessage(params: {
   id: string;
-  chat_jid: string;
+  chatJid: string;
   sender: string;
-  sender_name: string;
+  senderName: string;
   content: string;
   timestamp: string;
-  is_from_me: boolean;
-  is_bot_message?: boolean;
+  isFromMe: boolean;
 }): void {
   db.prepare(
-    `INSERT OR REPLACE INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me, is_bot_message) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT OR REPLACE INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me) VALUES (?, ?, ?, ?, ?, ?, ?)`,
   ).run(
-    msg.id,
-    msg.chat_jid,
-    msg.sender,
-    msg.sender_name,
-    msg.content,
-    msg.timestamp,
-    msg.is_from_me ? 1 : 0,
-    msg.is_bot_message ? 1 : 0,
+    params.id,
+    params.chatJid,
+    params.sender,
+    params.senderName,
+    params.content,
+    params.timestamp,
+    params.isFromMe ? 1 : 0,
   );
 }
 
@@ -256,13 +294,11 @@ export function getNewMessages(
   if (jids.length === 0) return { messages: [], newTimestamp: lastTimestamp };
 
   const placeholders = jids.map(() => '?').join(',');
-  // Filter bot messages using both the is_bot_message flag AND the content
-  // prefix as a backstop for messages written before the migration ran.
+  // Filter out bot's own messages by checking content prefix (not is_from_me, since user shares the account)
   const sql = `
     SELECT id, chat_jid, sender, sender_name, content, timestamp
     FROM messages
-    WHERE timestamp > ? AND chat_jid IN (${placeholders})
-      AND is_bot_message = 0 AND content NOT LIKE ?
+    WHERE timestamp > ? AND chat_jid IN (${placeholders}) AND content NOT LIKE ?
     ORDER BY timestamp
   `;
 
@@ -283,13 +319,11 @@ export function getMessagesSince(
   sinceTimestamp: string,
   botPrefix: string,
 ): NewMessage[] {
-  // Filter bot messages using both the is_bot_message flag AND the content
-  // prefix as a backstop for messages written before the migration ran.
+  // Filter out bot's own messages by checking content prefix
   const sql = `
     SELECT id, chat_jid, sender, sender_name, content, timestamp
     FROM messages
-    WHERE chat_jid = ? AND timestamp > ?
-      AND is_bot_message = 0 AND content NOT LIKE ?
+    WHERE chat_jid = ? AND timestamp > ? AND content NOT LIKE ?
     ORDER BY timestamp
   `;
   return db
@@ -298,12 +332,12 @@ export function getMessagesSince(
 }
 
 export function createTask(
-  task: Omit<ScheduledTask, 'last_run' | 'last_result'>,
+  task: Omit<ScheduledTask, 'last_run' | 'last_result' | 'last_error'>,
 ): void {
   db.prepare(
     `
-    INSERT INTO scheduled_tasks (id, group_folder, chat_jid, prompt, schedule_type, schedule_value, context_mode, next_run, status, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO scheduled_tasks (id, group_folder, chat_jid, prompt, schedule_type, schedule_value, context_mode, next_run, status, created_at, retry_count, max_retries)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `,
   ).run(
     task.id,
@@ -316,6 +350,8 @@ export function createTask(
     task.next_run,
     task.status,
     task.created_at,
+    task.retry_count || 0,
+    task.max_retries || 3,
   );
 }
 
@@ -344,7 +380,14 @@ export function updateTask(
   updates: Partial<
     Pick<
       ScheduledTask,
-      'prompt' | 'schedule_type' | 'schedule_value' | 'next_run' | 'status'
+      | 'prompt'
+      | 'schedule_type'
+      | 'schedule_value'
+      | 'next_run'
+      | 'status'
+      | 'context_mode'
+      | 'max_retries'
+      | 'retry_count'
     >
   >,
 ): void {
@@ -370,6 +413,18 @@ export function updateTask(
   if (updates.status !== undefined) {
     fields.push('status = ?');
     values.push(updates.status);
+  }
+  if (updates.context_mode !== undefined) {
+    fields.push('context_mode = ?');
+    values.push(updates.context_mode);
+  }
+  if (updates.max_retries !== undefined) {
+    fields.push('max_retries = ?');
+    values.push(updates.max_retries);
+  }
+  if (updates.retry_count !== undefined) {
+    fields.push('retry_count = ?');
+    values.push(updates.retry_count);
   }
 
   if (fields.length === 0) return;
@@ -408,10 +463,38 @@ export function updateTaskAfterRun(
   db.prepare(
     `
     UPDATE scheduled_tasks
-    SET next_run = ?, last_run = ?, last_result = ?, status = CASE WHEN ? IS NULL THEN 'completed' ELSE status END
+    SET next_run = ?, last_run = ?, last_result = ?, retry_count = 0, last_error = NULL,
+        status = CASE WHEN ? IS NULL THEN 'completed' ELSE status END
     WHERE id = ?
   `,
   ).run(nextRun, now, lastResult, nextRun, id);
+}
+
+export function updateTaskRetry(
+  id: string,
+  retryCount: number,
+  nextRun: string,
+  lastError: string,
+): void {
+  const now = new Date().toISOString();
+  db.prepare(
+    `
+    UPDATE scheduled_tasks
+    SET retry_count = ?, next_run = ?, last_run = ?, last_error = ?
+    WHERE id = ?
+  `,
+  ).run(retryCount, nextRun, now, lastError, id);
+}
+
+export function markTaskFailed(id: string, lastError: string): void {
+  const now = new Date().toISOString();
+  db.prepare(
+    `
+    UPDATE scheduled_tasks
+    SET status = 'failed', last_run = ?, last_error = ?, next_run = NULL
+    WHERE id = ?
+  `,
+  ).run(now, lastError, id);
 }
 
 export function logTaskRun(log: TaskRunLog): void {
@@ -430,176 +513,275 @@ export function logTaskRun(log: TaskRunLog): void {
   );
 }
 
-// --- Router state accessors ---
-
-export function getRouterState(key: string): string | undefined {
-  const row = db
-    .prepare('SELECT value FROM router_state WHERE key = ?')
-    .get(key) as { value: string } | undefined;
-  return row?.value;
+export function getTaskRunLogs(taskId: string, limit = 10): TaskRunLog[] {
+  return db
+    .prepare(
+      `
+    SELECT task_id, run_at, duration_ms, status, result, error
+    FROM task_run_logs
+    WHERE task_id = ?
+    ORDER BY run_at DESC
+    LIMIT ?
+  `,
+    )
+    .all(taskId, limit) as TaskRunLog[];
 }
 
-export function setRouterState(key: string, value: string): void {
+// ============ Agent Teams CRUD ============
+
+// Teams
+export function createTeam(team: Team): void {
   db.prepare(
-    'INSERT OR REPLACE INTO router_state (key, value) VALUES (?, ?)',
-  ).run(key, value);
+    `INSERT INTO teams (id, name, lead_group, status, created_at)
+     VALUES (?, ?, ?, ?, ?)`,
+  ).run(team.id, team.name, team.lead_group, team.status, team.created_at);
 }
 
-// --- Session accessors ---
-
-export function getSession(groupFolder: string): string | undefined {
-  const row = db
-    .prepare('SELECT session_id FROM sessions WHERE group_folder = ?')
-    .get(groupFolder) as { session_id: string } | undefined;
-  return row?.session_id;
-}
-
-export function setSession(groupFolder: string, sessionId: string): void {
-  db.prepare(
-    'INSERT OR REPLACE INTO sessions (group_folder, session_id) VALUES (?, ?)',
-  ).run(groupFolder, sessionId);
-}
-
-export function getAllSessions(): Record<string, string> {
-  const rows = db
-    .prepare('SELECT group_folder, session_id FROM sessions')
-    .all() as Array<{ group_folder: string; session_id: string }>;
-  const result: Record<string, string> = {};
-  for (const row of rows) {
-    result[row.group_folder] = row.session_id;
-  }
-  return result;
-}
-
-// --- Registered group accessors ---
-
-export function getRegisteredGroup(
-  jid: string,
-): (RegisteredGroup & { jid: string }) | undefined {
-  const row = db
-    .prepare('SELECT * FROM registered_groups WHERE jid = ?')
-    .get(jid) as
-    | {
-        jid: string;
-        name: string;
-        folder: string;
-        trigger_pattern: string;
-        added_at: string;
-        container_config: string | null;
-        requires_trigger: number | null;
-      }
+export function getTeam(id: string): Team | undefined {
+  return db.prepare('SELECT * FROM teams WHERE id = ?').get(id) as
+    | Team
     | undefined;
-  if (!row) return undefined;
-  return {
-    jid: row.jid,
-    name: row.name,
-    folder: row.folder,
-    trigger: row.trigger_pattern,
-    added_at: row.added_at,
-    containerConfig: row.container_config
-      ? JSON.parse(row.container_config)
-      : undefined,
-    requiresTrigger: row.requires_trigger === null ? undefined : row.requires_trigger === 1,
-  };
 }
 
-export function setRegisteredGroup(
-  jid: string,
-  group: RegisteredGroup,
+export function getTeamByName(name: string): Team | undefined {
+  return db.prepare('SELECT * FROM teams WHERE name = ?').get(name) as
+    | Team
+    | undefined;
+}
+
+export function getActiveTeams(): Team[] {
+  return db
+    .prepare("SELECT * FROM teams WHERE status = 'active' ORDER BY created_at DESC")
+    .all() as Team[];
+}
+
+export function updateTeamStatus(
+  id: string,
+  status: Team['status'],
 ): void {
+  db.prepare('UPDATE teams SET status = ? WHERE id = ?').run(status, id);
+}
+
+// Team Members
+export function createTeamMember(member: TeamMember): void {
   db.prepare(
-    `INSERT OR REPLACE INTO registered_groups (jid, name, folder, trigger_pattern, added_at, container_config, requires_trigger)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO team_members (id, team_id, name, model, role, status, container_id, session_id, prompt, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
-    jid,
-    group.name,
-    group.folder,
-    group.trigger,
-    group.added_at,
-    group.containerConfig ? JSON.stringify(group.containerConfig) : null,
-    group.requiresTrigger === undefined ? 1 : group.requiresTrigger ? 1 : 0,
+    member.id,
+    member.team_id,
+    member.name,
+    member.model,
+    member.role,
+    member.status,
+    member.container_id,
+    member.session_id,
+    member.prompt,
+    member.created_at,
   );
 }
 
-export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
-  const rows = db
-    .prepare('SELECT * FROM registered_groups')
-    .all() as Array<{
-    jid: string;
-    name: string;
-    folder: string;
-    trigger_pattern: string;
-    added_at: string;
-    container_config: string | null;
-    requires_trigger: number | null;
-  }>;
-  const result: Record<string, RegisteredGroup> = {};
-  for (const row of rows) {
-    result[row.jid] = {
-      name: row.name,
-      folder: row.folder,
-      trigger: row.trigger_pattern,
-      added_at: row.added_at,
-      containerConfig: row.container_config
-        ? JSON.parse(row.container_config)
-        : undefined,
-      requiresTrigger: row.requires_trigger === null ? undefined : row.requires_trigger === 1,
-    };
-  }
-  return result;
+export function getTeamMember(id: string): TeamMember | undefined {
+  return db.prepare('SELECT * FROM team_members WHERE id = ?').get(id) as
+    | TeamMember
+    | undefined;
 }
 
-// --- JSON migration ---
+export function getTeamMembers(teamId: string): TeamMember[] {
+  return db
+    .prepare('SELECT * FROM team_members WHERE team_id = ? ORDER BY created_at')
+    .all(teamId) as TeamMember[];
+}
 
-function migrateJsonState(): void {
-  const migrateFile = (filename: string) => {
-    const filePath = path.join(DATA_DIR, filename);
-    if (!fs.existsSync(filePath)) return null;
-    try {
-      const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-      fs.renameSync(filePath, `${filePath}.migrated`);
-      return data;
-    } catch {
-      return null;
-    }
-  };
+export function updateTeamMember(
+  id: string,
+  updates: Partial<Pick<TeamMember, 'status' | 'container_id' | 'session_id'>>,
+): void {
+  const fields: string[] = [];
+  const values: unknown[] = [];
 
-  // Migrate router_state.json
-  const routerState = migrateFile('router_state.json') as {
-    last_timestamp?: string;
-    last_agent_timestamp?: Record<string, string>;
-  } | null;
-  if (routerState) {
-    if (routerState.last_timestamp) {
-      setRouterState('last_timestamp', routerState.last_timestamp);
-    }
-    if (routerState.last_agent_timestamp) {
-      setRouterState(
-        'last_agent_timestamp',
-        JSON.stringify(routerState.last_agent_timestamp),
-      );
-    }
+  if (updates.status !== undefined) {
+    fields.push('status = ?');
+    values.push(updates.status);
+  }
+  if (updates.container_id !== undefined) {
+    fields.push('container_id = ?');
+    values.push(updates.container_id);
+  }
+  if (updates.session_id !== undefined) {
+    fields.push('session_id = ?');
+    values.push(updates.session_id);
   }
 
-  // Migrate sessions.json
-  const sessions = migrateFile('sessions.json') as Record<
-    string,
-    string
-  > | null;
-  if (sessions) {
-    for (const [folder, sessionId] of Object.entries(sessions)) {
-      setSession(folder, sessionId);
-    }
+  if (fields.length === 0) return;
+
+  values.push(id);
+  db.prepare(`UPDATE team_members SET ${fields.join(', ')} WHERE id = ?`).run(
+    ...values,
+  );
+}
+
+// Team Tasks
+export function createTeamTask(task: TeamTask): void {
+  db.prepare(
+    `INSERT INTO team_tasks (id, team_id, title, description, status, assigned_to, depends_on, priority, created_at, completed_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    task.id,
+    task.team_id,
+    task.title,
+    task.description,
+    task.status,
+    task.assigned_to,
+    task.depends_on,
+    task.priority,
+    task.created_at,
+    task.completed_at,
+  );
+}
+
+export function getTeamTask(id: string): TeamTask | undefined {
+  return db.prepare('SELECT * FROM team_tasks WHERE id = ?').get(id) as
+    | TeamTask
+    | undefined;
+}
+
+export function getTeamTasks(teamId: string): TeamTask[] {
+  return db
+    .prepare(
+      'SELECT * FROM team_tasks WHERE team_id = ? ORDER BY priority DESC, created_at',
+    )
+    .all(teamId) as TeamTask[];
+}
+
+export function getPendingTeamTasks(teamId: string): TeamTask[] {
+  return db
+    .prepare(
+      `SELECT * FROM team_tasks
+       WHERE team_id = ? AND status = 'pending' AND assigned_to IS NULL
+       ORDER BY priority DESC, created_at`,
+    )
+    .all(teamId) as TeamTask[];
+}
+
+/**
+ * Atomically claim a team task. Returns the task if claimed, null if already taken.
+ */
+export function claimTeamTask(
+  taskId: string,
+  memberId: string,
+): TeamTask | null {
+  const result = db
+    .prepare(
+      `UPDATE team_tasks
+       SET status = 'in_progress', assigned_to = ?
+       WHERE id = ? AND status = 'pending' AND assigned_to IS NULL
+       RETURNING *`,
+    )
+    .get(memberId, taskId) as TeamTask | undefined;
+
+  return result || null;
+}
+
+export function completeTeamTask(taskId: string): void {
+  const now = new Date().toISOString();
+  db.prepare(
+    `UPDATE team_tasks SET status = 'completed', completed_at = ? WHERE id = ?`,
+  ).run(now, taskId);
+}
+
+export function updateTeamTask(
+  id: string,
+  updates: Partial<Pick<TeamTask, 'status' | 'assigned_to' | 'description'>>,
+): void {
+  const fields: string[] = [];
+  const values: unknown[] = [];
+
+  if (updates.status !== undefined) {
+    fields.push('status = ?');
+    values.push(updates.status);
+  }
+  if (updates.assigned_to !== undefined) {
+    fields.push('assigned_to = ?');
+    values.push(updates.assigned_to);
+  }
+  if (updates.description !== undefined) {
+    fields.push('description = ?');
+    values.push(updates.description);
   }
 
-  // Migrate registered_groups.json
-  const groups = migrateFile('registered_groups.json') as Record<
-    string,
-    RegisteredGroup
-  > | null;
-  if (groups) {
-    for (const [jid, group] of Object.entries(groups)) {
-      setRegisteredGroup(jid, group);
-    }
-  }
+  if (fields.length === 0) return;
+
+  values.push(id);
+  db.prepare(`UPDATE team_tasks SET ${fields.join(', ')} WHERE id = ?`).run(
+    ...values,
+  );
+}
+
+// Team Messages
+export function createTeamMessage(
+  message: Omit<TeamMessage, 'id' | 'read'>,
+): number {
+  const result = db
+    .prepare(
+      `INSERT INTO team_messages (team_id, from_member, to_member, content, created_at)
+       VALUES (?, ?, ?, ?, ?)`,
+    )
+    .run(
+      message.team_id,
+      message.from_member,
+      message.to_member,
+      message.content,
+      message.created_at,
+    );
+  return result.lastInsertRowid as number;
+}
+
+export function getUnreadTeamMessages(
+  teamId: string,
+  memberId: string,
+): TeamMessage[] {
+  return db
+    .prepare(
+      `SELECT id, team_id, from_member, to_member, content, read, created_at
+       FROM team_messages
+       WHERE team_id = ? AND read = 0 AND (to_member IS NULL OR to_member = ?)
+       ORDER BY created_at`,
+    )
+    .all(teamId, memberId) as TeamMessage[];
+}
+
+export function getTeamMessages(
+  teamId: string,
+  limit = 50,
+): TeamMessage[] {
+  return db
+    .prepare(
+      `SELECT id, team_id, from_member, to_member, content, read, created_at
+       FROM team_messages
+       WHERE team_id = ?
+       ORDER BY created_at DESC
+       LIMIT ?`,
+    )
+    .all(teamId, limit) as TeamMessage[];
+}
+
+export function markTeamMessagesRead(
+  teamId: string,
+  memberId: string,
+  upToId: number,
+): void {
+  db.prepare(
+    `UPDATE team_messages
+     SET read = 1
+     WHERE team_id = ? AND id <= ? AND (to_member IS NULL OR to_member = ?)`,
+  ).run(teamId, upToId, memberId);
+}
+
+// Cleanup
+export function deleteTeam(teamId: string): void {
+  db.prepare('DELETE FROM team_messages WHERE team_id = ?').run(teamId);
+  db.prepare('DELETE FROM team_tasks WHERE team_id = ?').run(teamId);
+  db.prepare('DELETE FROM team_members WHERE team_id = ?').run(teamId);
+  db.prepare('DELETE FROM teams WHERE id = ?').run(teamId);
 }

@@ -54,7 +54,13 @@ interface SDKUserMessage {
   session_id: string;
 }
 
-const IPC_INPUT_DIR = '/workspace/ipc/input';
+// Resolve workspace paths from environment variables (local-runner on Windows)
+// or fall back to Docker container paths (/workspace/*)
+const GROUP_DIR = process.env.NANOCLAW_GROUP_DIR || '/workspace/group';
+const IPC_BASE_DIR = process.env.NANOCLAW_IPC_DIR || '/workspace/ipc';
+const PROJECT_DIR = process.env.NANOCLAW_PROJECT_DIR || '/workspace/project';
+
+const IPC_INPUT_DIR = path.join(IPC_BASE_DIR, 'input');
 const IPC_INPUT_CLOSE_SENTINEL = path.join(IPC_INPUT_DIR, '_close');
 const IPC_POLL_MS = 500;
 
@@ -165,7 +171,7 @@ function createPreCompactHook(): HookCallback {
       const summary = getSessionSummary(sessionId, transcriptPath);
       const name = summary ? sanitizeFilename(summary) : generateFallbackName();
 
-      const conversationsDir = '/workspace/group/conversations';
+      const conversationsDir = path.join(GROUP_DIR, 'conversations');
       fs.mkdirSync(conversationsDir, { recursive: true });
 
       const date = new Date().toISOString().split('T')[0];
@@ -206,6 +212,90 @@ function createSanitizeBashHook(): HookCallback {
       },
     };
   };
+}
+
+/**
+ * Read a file safely, returning its content or null if not found/error.
+ */
+function readFileSafe(filePath: string, maxChars = 10000): string | null {
+  try {
+    if (!fs.existsSync(filePath)) return null;
+    const content = fs.readFileSync(filePath, 'utf-8').trim();
+    return content ? content.slice(0, maxChars) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Get today's (or yesterday's) daily log path.
+ */
+function getDailyLogPath(groupDir: string, daysAgo = 0): string {
+  const d = new Date();
+  d.setDate(d.getDate() - daysAgo);
+  const dateStr = d.toISOString().split('T')[0];
+  return path.join(groupDir, 'daily', `${dateStr}.md`);
+}
+
+/**
+ * Build memory context from SOUL.md, USER.md, MEMORY.md, and daily log.
+ * Injected into the system prompt so agents start with full context.
+ */
+function buildMemoryContext(groupDir: string): string | null {
+  const parts: string[] = [];
+  let totalChars = 0;
+  const MAX_CONTEXT = 20000;
+
+  const addPart = (label: string, content: string | null) => {
+    if (!content || totalChars >= MAX_CONTEXT) return;
+    const section = `## ${label}\n${content}`;
+    const remaining = MAX_CONTEXT - totalChars;
+    if (section.length > remaining) {
+      parts.push(section.slice(0, remaining));
+      totalChars = MAX_CONTEXT;
+    } else {
+      parts.push(section);
+      totalChars += section.length;
+    }
+  };
+
+  addPart('Soul', readFileSafe(path.join(groupDir, 'SOUL.md')));
+  addPart('User', readFileSafe(path.join(groupDir, 'USER.md')));
+  addPart('Long-Term Memory', readFileSafe(path.join(groupDir, 'MEMORY.md'), 15000));
+
+  // Today's daily log, falling back to yesterday
+  const todayLog = readFileSafe(getDailyLogPath(groupDir, 0), 5000);
+  const yesterdayLog = !todayLog ? readFileSafe(getDailyLogPath(groupDir, 1), 3000) : null;
+  if (todayLog) {
+    addPart('Daily Log (Today)', todayLog);
+  } else if (yesterdayLog) {
+    addPart('Daily Log (Yesterday)', yesterdayLog);
+  }
+
+  if (parts.length === 0) return null;
+
+  return `\n\n# Injected Memory Context\nThe following memory files were loaded from your group directory at session start. Use this context to maintain continuity across sessions.\n\n${parts.join('\n\n')}`;
+}
+
+/**
+ * Append an entry to today's daily log.
+ */
+function appendToDailyLog(groupDir: string, entry: string): void {
+  try {
+    const dailyDir = path.join(groupDir, 'daily');
+    fs.mkdirSync(dailyDir, { recursive: true });
+    const logPath = getDailyLogPath(groupDir, 0);
+
+    // Create file with header if it doesn't exist
+    if (!fs.existsSync(logPath)) {
+      const dateStr = new Date().toISOString().split('T')[0];
+      fs.writeFileSync(logPath, `# Daily Log — ${dateStr}\n\n`);
+    }
+
+    fs.appendFileSync(logPath, entry + '\n\n');
+  } catch (err) {
+    log(`Failed to append to daily log: ${err instanceof Error ? err.message : String(err)}`);
+  }
 }
 
 function sanitizeFilename(summary: string): string {
@@ -391,14 +481,23 @@ async function runQuery(
   let resultCount = 0;
 
   // Load global CLAUDE.md as additional system context (shared across all groups)
-  const globalClaudeMdPath = '/workspace/global/CLAUDE.md';
+  const globalClaudeMdPath = path.join(path.dirname(GROUP_DIR), 'global', 'CLAUDE.md');
   let globalClaudeMd: string | undefined;
   if (!containerInput.isMain && fs.existsSync(globalClaudeMdPath)) {
     globalClaudeMd = fs.readFileSync(globalClaudeMdPath, 'utf-8');
   }
 
-  // Discover additional directories mounted at /workspace/extra/*
-  // These are passed to the SDK so their CLAUDE.md files are loaded automatically
+  // SessionStart: Build memory context from SOUL.md, USER.md, MEMORY.md, daily log
+  const memoryContext = buildMemoryContext(GROUP_DIR);
+  if (memoryContext) {
+    log(`Memory context loaded (${memoryContext.length} chars)`);
+  }
+
+  // Combine global CLAUDE.md + memory context into system prompt append
+  const systemAppend = [globalClaudeMd, memoryContext].filter(Boolean).join('\n\n') || undefined;
+
+  // Discover additional directories mounted at /workspace/extra/* (Docker)
+  // or PROJECT_DIR-relative paths (local runner on Windows)
   const extraDirs: string[] = [];
   const extraBase = '/workspace/extra';
   if (fs.existsSync(extraBase)) {
@@ -416,12 +515,14 @@ async function runQuery(
   for await (const message of query({
     prompt: stream,
     options: {
-      cwd: '/workspace/group',
+      model: 'claude-sonnet-4-6',
+      betas: ['context-1m-2025-08-07'],
+      cwd: GROUP_DIR,
       additionalDirectories: extraDirs.length > 0 ? extraDirs : undefined,
       resume: sessionId,
       resumeSessionAt: resumeAt,
-      systemPrompt: globalClaudeMd
-        ? { type: 'preset' as const, preset: 'claude_code' as const, append: globalClaudeMd }
+      systemPrompt: systemAppend
+        ? { type: 'preset' as const, preset: 'claude_code' as const, append: systemAppend }
         : undefined,
       allowedTools: [
         'Bash',
@@ -518,6 +619,7 @@ async function main(): Promise<void> {
   const mcpServerPath = path.join(__dirname, 'ipc-mcp-stdio.js');
 
   let sessionId = containerInput.sessionId;
+  const sessionStartTime = Date.now();
   fs.mkdirSync(IPC_INPUT_DIR, { recursive: true });
 
   // Clean up stale _close sentinel from previous container runs
@@ -571,9 +673,34 @@ async function main(): Promise<void> {
       log(`Got new message (${nextMessage.length} chars), starting new query`);
       prompt = nextMessage;
     }
+    // SessionEnd: Append session summary to daily log
+    const now = new Date();
+    const timeStr = now.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
+    const durationMin = Math.round((Date.now() - sessionStartTime) / 60000);
+    const isScheduled = containerInput.isScheduledTask ? ' [Scheduled Task]' : '';
+    const promptPreview = containerInput.prompt.slice(0, 120).replace(/\n/g, ' ');
+
+    appendToDailyLog(GROUP_DIR,
+      `## Session @ ${timeStr}${isScheduled}\n` +
+      `- Duration: ${durationMin}min\n` +
+      `- Prompt: ${promptPreview}${containerInput.prompt.length > 120 ? '...' : ''}\n` +
+      `- Status: Completed`
+    );
+    log('Session summary appended to daily log');
+
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
     log(`Agent error: ${errorMessage}`);
+
+    // Log error to daily log
+    const now = new Date();
+    const timeStr = now.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
+    appendToDailyLog(GROUP_DIR,
+      `## Session @ ${timeStr} [ERROR]\n` +
+      `- Error: ${errorMessage.slice(0, 200)}\n` +
+      `- Prompt: ${containerInput.prompt.slice(0, 80).replace(/\n/g, ' ')}...`
+    );
+
     writeOutput({
       status: 'error',
       result: null,
@@ -582,6 +709,12 @@ async function main(): Promise<void> {
     });
     process.exit(1);
   }
+
+  // Force exit: after the query loop ends, the MCP server child process
+  // and SDK internals may keep handles alive, preventing Node from draining
+  // the event loop. In Docker this doesn't matter (container cleanup), but
+  // in local mode the process hangs indefinitely without this.
+  process.exit(0);
 }
 
 main();

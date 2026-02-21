@@ -4,20 +4,27 @@ Personal Claude assistant. See [README.md](README.md) for philosophy and setup. 
 
 ## Quick Context
 
-Single Node.js process that connects to WhatsApp, routes messages to Claude Agent SDK running in Apple Container (Linux VMs). Each group has isolated filesystem and memory.
+Single Node.js process that connects to Telegram (`node-telegram-bot-api`), routes messages to Claude Agent SDK (`@anthropic-ai/claude-agent-sdk` v0.2.34) running as a local Node.js child process on Windows. Each group has isolated filesystem and memory.
+
+**Current setup (this fork):**
+- Channel: Telegram (migrated from WhatsApp on Feb 9, 2026)
+- Execution: Local mode (`EXECUTION_MODE=local`) — no containers
+- Host: Windows (Git Bash / MSYS2)
+- Model: `claude-sonnet-4-6` with 1M context beta
 
 ## Key Files
 
 | File | Purpose |
 |------|---------|
-| `src/index.ts` | Orchestrator: state, message loop, agent invocation |
-| `src/channels/whatsapp.ts` | WhatsApp connection, auth, send/receive |
+| `src/index.ts` | Orchestrator: Telegram bot, message loop, agent invocation |
+| `src/local-runner.ts` | Spawns agent as local Node.js child process |
+| `src/container-runner.ts` | Spawns agent in Docker container (not used in local mode) |
 | `src/ipc.ts` | IPC watcher and task processing |
 | `src/router.ts` | Message formatting and outbound routing |
-| `src/config.ts` | Trigger pattern, paths, intervals |
-| `src/container-runner.ts` | Spawns agent containers with mounts |
+| `src/config.ts` | Trigger pattern, paths, execution mode |
 | `src/task-scheduler.ts` | Runs scheduled tasks |
 | `src/db.ts` | SQLite operations |
+| `container/agent-runner/src/index.ts` | Agent entry point (Claude SDK `query()`) |
 | `groups/{name}/CLAUDE.md` | Per-group memory (isolated) |
 | `container/skills/agent-browser.md` | Browser automation tool (available to all agents via Bash) |
 
@@ -36,16 +43,24 @@ Run commands directly—don't tell the user to run them.
 ```bash
 npm run dev          # Run with hot reload
 npm run build        # Compile TypeScript
+```
+
+### Message Flow (local mode)
+```
+Telegram (node-telegram-bot-api polling)
+  → SQLite (store/messages.db)
+  → Polling loop (src/index.ts)
+  → spawn('node', [agent-runner]) — local child process
+  → Claude Agent SDK query()
+  → Response via stdout sentinel markers
+  → Router → Telegram bot.sendMessage()
+```
+
+### Container Build (only needed if switching to docker mode)
+
+```bash
 ./container/build.sh # Rebuild agent container
 ```
-
-Service management:
-```bash
-launchctl load ~/Library/LaunchAgents/com.nanoclaw.plist
-launchctl unload ~/Library/LaunchAgents/com.nanoclaw.plist
-```
-
-## Container Build Cache
 
 Apple Container's buildkit caches the build context aggressively. `--no-cache` alone does NOT invalidate COPY steps — the builder's volume retains stale files. To force a truly clean rebuild:
 

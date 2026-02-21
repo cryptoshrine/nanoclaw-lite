@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  My personal Claude assistant that runs securely in containers. Lightweight and built to be understood and customized for your own needs.
+  My personal Claude assistant. Lightweight and built to be understood and customized for your own needs.
 </p>
 
 <p align="center">
@@ -34,7 +34,7 @@ Then run `/setup`. Claude Code handles everything: dependencies, authentication,
 
 **Small enough to understand.** One process, a few source files. No microservices, no message queues, no abstraction layers. Have Claude Code walk you through it.
 
-**Secure by isolation.** Agents run in Linux containers (Apple Container on macOS, or Docker). They can only see what's explicitly mounted. Bash access is safe because commands run inside the container, not on your host.
+**Secure by isolation.** Agents can run in Linux containers (Apple Container on macOS, or Docker) where they can only see what's explicitly mounted. In local mode, agents run as isolated child processes on the host.
 
 **Built for one user.** This isn't a framework. It's working software that fits my exact needs. You fork it and have Claude Code make it match your exact needs.
 
@@ -48,30 +48,31 @@ Then run `/setup`. Claude Code handles everything: dependencies, authentication,
 
 ## What It Supports
 
-- **WhatsApp I/O** - Message Claude from your phone
-- **Isolated group context** - Each group has its own `CLAUDE.md` memory, isolated filesystem, and runs in its own container sandbox with only that filesystem mounted
-- **Main channel** - Your private channel (self-chat) for admin control; every other group is completely isolated
+- **Telegram I/O** - Message Claude from your phone via Telegram bot (`node-telegram-bot-api`)
+- **Isolated group context** - Each group has its own `CLAUDE.md` memory and isolated filesystem
+- **Main channel** - Your private chat for admin control; every other group is isolated
 - **Scheduled tasks** - Recurring jobs that run Claude and can message you back
 - **Web access** - Search and fetch content
-- **Container isolation** - Agents sandboxed in Apple Container (macOS) or Docker (macOS/Linux)
+- **Two execution modes** - Local (direct Node.js child process) or Docker/Apple Container for full OS-level isolation
 - **Agent Swarms** - Spin up teams of specialized agents that collaborate on complex tasks (first personal AI assistant to support this)
+- **Browser automation** - agent-browser CLI with Chromium for web scraping and interaction
 - **Optional integrations** - Add Gmail (`/add-gmail`) and more via skills
 
 ## Usage
 
-Talk to your assistant with the trigger word (default: `@Andy`):
+Talk to your assistant with the trigger word (default: `@klaw`):
 
 ```
-@Andy send an overview of the sales pipeline every weekday morning at 9am (has access to my Obsidian vault folder)
-@Andy review the git history for the past week each Friday and update the README if there's drift
-@Andy every Monday at 8am, compile news on AI developments from Hacker News and TechCrunch and message me a briefing
+@klaw send an overview of the sales pipeline every weekday morning at 9am
+@klaw review the git history for the past week each Friday and update the README if there's drift
+@klaw every Monday at 8am, compile news on AI developments from Hacker News and TechCrunch and message me a briefing
 ```
 
-From the main channel (your self-chat), you can manage groups and tasks:
+From the main channel (your private chat), you can manage groups and tasks:
 ```
-@Andy list all scheduled tasks across groups
-@Andy pause the Monday briefing task
-@Andy join the Family Chat group
+@klaw list all scheduled tasks across groups
+@klaw pause the Monday briefing task
+@klaw add the Ball-AI Dev group
 ```
 
 ## Customizing
@@ -112,39 +113,48 @@ Skills we'd love to see:
 
 ## Requirements
 
-- macOS or Linux
+- Windows, macOS, or Linux
 - Node.js 20+
 - [Claude Code](https://claude.ai/download)
-- [Apple Container](https://github.com/apple/container) (macOS) or [Docker](https://docker.com/products/docker-desktop) (macOS/Linux)
+- Optional: [Apple Container](https://github.com/apple/container) (macOS) or [Docker](https://docker.com/products/docker-desktop) for container isolation
 
 ## Architecture
 
 ```
-WhatsApp (baileys) --> SQLite --> Polling loop --> Container (Claude Agent SDK) --> Response
+Telegram (node-telegram-bot-api) --> SQLite --> Polling loop --> Agent (Claude Agent SDK) --> Response
 ```
 
-Single Node.js process. Agents execute in isolated Linux containers with mounted directories. Per-group message queue with concurrency control. IPC via filesystem.
+Single Node.js process. Two execution modes:
+- **Local mode** (`EXECUTION_MODE=local`): Agents run as direct Node.js child processes. No containers needed. Works on Windows, macOS, Linux.
+- **Docker mode** (`EXECUTION_MODE=docker`): Agents run in isolated Linux containers with mounted directories. Full OS-level sandboxing.
+
+Per-group message queue with concurrency control. IPC via filesystem.
 
 Key files:
-- `src/index.ts` - Orchestrator: state, message loop, agent invocation
-- `src/channels/whatsapp.ts` - WhatsApp connection, auth, send/receive
+- `src/index.ts` - Orchestrator: Telegram bot, message loop, agent invocation
+- `src/local-runner.ts` - Spawns agent as local Node.js child process
+- `src/container-runner.ts` - Spawns agent in Docker container
+- `container/agent-runner/src/index.ts` - Agent entry point (Claude SDK `query()`)
 - `src/ipc.ts` - IPC watcher and task processing
 - `src/router.ts` - Message formatting and outbound routing
 - `src/group-queue.ts` - Per-group queue with global concurrency limit
-- `src/container-runner.ts` - Spawns streaming agent containers
 - `src/task-scheduler.ts` - Runs scheduled tasks
 - `src/db.ts` - SQLite operations (messages, groups, sessions, state)
 - `groups/*/CLAUDE.md` - Per-group memory
 
 ## FAQ
 
-**Why WhatsApp and not Telegram/Signal/etc?**
+**Why Telegram?**
 
-Because I use WhatsApp. Fork it and run a skill to change it. That's the whole point.
+This fork uses Telegram via `node-telegram-bot-api`. The upstream project originally used WhatsApp (Baileys). The channel is swappable via skills — run `/add-telegram` or `/add-whatsapp` to change it. That's the whole point of the skills approach.
 
-**Why Apple Container instead of Docker?**
+**What's local mode vs Docker mode?**
 
-On macOS, Apple Container is lightweight, fast, and optimized for Apple silicon. But Docker is also fully supported—during `/setup`, you can choose which runtime to use. On Linux, Docker is used automatically.
+Local mode (`EXECUTION_MODE=local`) spawns agents as direct Node.js child processes — no Docker needed, works on any OS. Docker mode spawns agents inside Linux containers for full OS-level isolation. Choose based on your security needs and platform.
+
+**Can I run this on Windows?**
+
+Yes. This fork runs on Windows with Git Bash. Use local mode (no containers needed) or install Docker Desktop for container isolation.
 
 **Can I run this on Linux?**
 
@@ -152,7 +162,7 @@ Yes. Run `/setup` and it will automatically configure Docker as the container ru
 
 **Is this secure?**
 
-Agents run in containers, not behind application-level permission checks. They can only access explicitly mounted directories. You should still review what you're running, but the codebase is small enough that you actually can. See [docs/SECURITY.md](docs/SECURITY.md) for the full security model.
+In Docker mode, agents run in containers with OS-level isolation — they can only access explicitly mounted directories. In local mode, agents run as child processes with inherited permissions. You should still review what you're running, but the codebase is small enough that you actually can. See [docs/SECURITY.md](docs/SECURITY.md) for the full security model.
 
 **Why no configuration files?**
 

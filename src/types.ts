@@ -1,6 +1,6 @@
 export interface AdditionalMount {
   hostPath: string; // Absolute path on host (supports ~ for home)
-  containerPath?: string; // Optional — defaults to basename of hostPath. Mounted at /workspace/extra/{value}
+  containerPath: string; // Path inside container (under /workspace/extra/)
   readonly?: boolean; // Default: true for safety
 }
 
@@ -30,6 +30,7 @@ export interface AllowedRoot {
 export interface ContainerConfig {
   additionalMounts?: AdditionalMount[];
   timeout?: number; // Default: 300000 (5 minutes)
+  env?: Record<string, string>;
 }
 
 export interface RegisteredGroup {
@@ -38,7 +39,10 @@ export interface RegisteredGroup {
   trigger: string;
   added_at: string;
   containerConfig?: ContainerConfig;
-  requiresTrigger?: boolean; // Default: true for groups, false for solo chats
+}
+
+export interface Session {
+  [folder: string]: string;
 }
 
 export interface NewMessage {
@@ -48,8 +52,6 @@ export interface NewMessage {
   sender_name: string;
   content: string;
   timestamp: string;
-  is_from_me?: boolean;
-  is_bot_message?: boolean;
 }
 
 export interface ScheduledTask {
@@ -63,8 +65,12 @@ export interface ScheduledTask {
   next_run: string | null;
   last_run: string | null;
   last_result: string | null;
-  status: 'active' | 'paused' | 'completed';
+  status: 'active' | 'paused' | 'completed' | 'failed';
   created_at: string;
+  // Retry fields
+  retry_count: number;
+  max_retries: number;
+  last_error: string | null;
 }
 
 export interface TaskRunLog {
@@ -76,23 +82,48 @@ export interface TaskRunLog {
   error: string | null;
 }
 
-// --- Channel abstraction ---
+// ============ Agent Teams ============
 
-export interface Channel {
+export interface Team {
+  id: string;
   name: string;
-  connect(): Promise<void>;
-  sendMessage(jid: string, text: string): Promise<void>;
-  isConnected(): boolean;
-  ownsJid(jid: string): boolean;
-  disconnect(): Promise<void>;
-  // Optional: typing indicator. Channels that support it implement it.
-  setTyping?(jid: string, isTyping: boolean): Promise<void>;
+  lead_group: string;
+  status: 'active' | 'completed' | 'cancelled';
+  created_at: string;
 }
 
-// Callback type that channels use to deliver inbound messages
-export type OnInboundMessage = (chatJid: string, message: NewMessage) => void;
+export interface TeamMember {
+  id: string;
+  team_id: string;
+  name: string;
+  model: string;
+  role: 'lead' | 'teammate';
+  status: 'pending' | 'active' | 'completed' | 'failed';
+  container_id: string | null;
+  session_id: string | null;
+  prompt: string | null;
+  created_at: string;
+}
 
-// Callback for chat metadata discovery.
-// name is optional — channels that deliver names inline (Telegram) pass it here;
-// channels that sync names separately (WhatsApp syncGroupMetadata) omit it.
-export type OnChatMetadata = (chatJid: string, timestamp: string, name?: string) => void;
+export interface TeamTask {
+  id: string;
+  team_id: string;
+  title: string;
+  description: string | null;
+  status: 'pending' | 'in_progress' | 'completed' | 'blocked';
+  assigned_to: string | null;
+  depends_on: string | null;
+  priority: number;
+  created_at: string;
+  completed_at: string | null;
+}
+
+export interface TeamMessage {
+  id: number;
+  team_id: string;
+  from_member: string;
+  to_member: string | null;
+  content: string;
+  read: boolean;
+  created_at: string;
+}

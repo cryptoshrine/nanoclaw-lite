@@ -67,19 +67,19 @@ The project currently uses Apple Container (macOS-only). We need:
 
 ## Vision
 
-A personal Claude assistant accessible via WhatsApp, with minimal custom code.
+A personal Claude assistant accessible via messaging, with minimal custom code.
 
 **Core components:**
-- **Claude Agent SDK** as the core agent
-- **Apple Container** for isolated agent execution (Linux VMs)
-- **WhatsApp** as the primary I/O channel
+- **Claude Agent SDK** (`@anthropic-ai/claude-agent-sdk` v0.2.34) as the core agent
+- **Two execution modes**: Local (Node.js child process) or Docker/Apple Container for OS-level isolation
+- **Telegram** as the primary I/O channel (via `node-telegram-bot-api`; originally WhatsApp via Baileys)
 - **Persistent memory** per conversation and globally
 - **Scheduled tasks** that run Claude and can message back
 - **Web access** for search and browsing
-- **Browser automation** via agent-browser
+- **Browser automation** via agent-browser with Chromium
 
 **Implementation approach:**
-- Use existing tools (WhatsApp connector, Claude Agent SDK, MCP servers)
+- Use existing tools (Telegram bot API, Claude Agent SDK, MCP servers)
 - Minimal glue code
 - File-based systems where possible (CLAUDE.md for memory, folders for groups)
 
@@ -88,9 +88,9 @@ A personal Claude assistant accessible via WhatsApp, with minimal custom code.
 ## Architecture Decisions
 
 ### Message Routing
-- A router listens to WhatsApp and routes messages based on configuration
-- Only messages from registered groups are processed
-- Trigger: `@Andy` prefix (case insensitive), configurable via `ASSISTANT_NAME` env var
+- A router listens to Telegram (via `node-telegram-bot-api` polling) and routes messages based on configuration
+- Only messages from registered groups/chats are processed
+- Trigger: `@klaw` prefix (case insensitive), configurable via `ASSISTANT_NAME` env var
 - Unregistered groups are ignored completely
 
 ### Memory System
@@ -103,12 +103,12 @@ A personal Claude assistant accessible via WhatsApp, with minimal custom code.
 - Each group maintains a conversation session (via Claude Agent SDK)
 - Sessions auto-compact when context gets too long, preserving critical information
 
-### Container Isolation
-- All agents run inside Apple Container (lightweight Linux VMs)
-- Each agent invocation spawns a container with mounted directories
-- Containers provide filesystem isolation - agents can only see mounted paths
-- Bash access is safe because commands run inside the container, not on the host
-- Browser automation via agent-browser with Chromium in the container
+### Agent Execution
+- Two modes controlled by `EXECUTION_MODE` env var:
+  - **Local mode** (`local`): Agent spawned via `spawn('node', [AGENT_RUNNER_ENTRY])` as a direct child process. No containers. Works on Windows, macOS, Linux.
+  - **Docker mode** (`docker`): Agent runs inside Docker/Apple Container with mounted directories. Full OS-level isolation.
+- In both modes, the agent-runner uses Claude Agent SDK `query()` with the same tools and MCP server
+- Browser automation via agent-browser with Chromium
 
 ### Scheduled Tasks
 - Users can ask Claude to schedule recurring or one-time tasks from any group
@@ -137,18 +137,19 @@ A personal Claude assistant accessible via WhatsApp, with minimal custom code.
 
 ## Integration Points
 
-### WhatsApp
-- Using baileys library for WhatsApp Web connection
+### Telegram
+- Using `node-telegram-bot-api` library with long-polling
 - Messages stored in SQLite, polled by router
-- QR code authentication during setup
+- Bot token authentication via `TELEGRAM_BOT_TOKEN` env var
+- Originally WhatsApp (Baileys); migrated to Telegram Feb 9, 2026
 
 ### Scheduler
-- Built-in scheduler runs on the host, spawns containers for task execution
+- Built-in scheduler runs on the host, spawns agents for task execution (local or container mode)
 - Custom `nanoclaw` MCP server (inside container) provides scheduling tools
 - Tools: `schedule_task`, `list_tasks`, `pause_task`, `resume_task`, `cancel_task`, `send_message`
 - Tasks stored in SQLite with run history
 - Scheduler loop checks for due tasks every minute
-- Tasks execute Claude Agent SDK in containerized group context
+- Tasks execute Claude Agent SDK in the group's context (local or container mode)
 
 ### Web Access
 - Built-in WebSearch and WebFetch tools
@@ -171,23 +172,28 @@ A personal Claude assistant accessible via WhatsApp, with minimal custom code.
 - Each user gets a custom setup matching their exact needs
 
 ### Skills
-- `/setup` - Install dependencies, authenticate WhatsApp, configure scheduler, start services
-- `/customize` - General-purpose skill for adding capabilities (new channels like Telegram, new integrations, behavior changes)
+- `/setup` - Install dependencies, authenticate channel, configure scheduler, start services
+- `/customize` - General-purpose skill for adding capabilities (new channels, new integrations, behavior changes)
 
 ### Deployment
-- Runs on local Mac via launchd
-- Single Node.js process handles everything
+- Runs as a single Node.js process
+- Windows: direct execution or Task Scheduler
+- macOS: launchd (`~/Library/LaunchAgents/com.nanoclaw.plist`)
+- Linux: systemd or similar
 
 ---
 
 ## Personal Configuration (Reference)
 
-These are the creator's settings, stored here for reference:
+Current settings for this fork:
 
-- **Trigger**: `@Andy` (case insensitive)
-- **Response prefix**: `Andy:`
-- **Persona**: Default Claude (no custom personality)
-- **Main channel**: Self-chat (messaging yourself in WhatsApp)
+- **Trigger**: `@klaw` (case insensitive)
+- **Assistant name**: `klaw`
+- **Channel**: Telegram (bot: @Iron_Klaw_bot)
+- **Execution mode**: Local (no containers)
+- **Host**: Windows (DESKTOP-7DA45A4)
+- **Main channel**: CryptoShrine (private Telegram chat)
+- **Model**: `claude-sonnet-4-6` with 1M context beta
 
 ---
 
