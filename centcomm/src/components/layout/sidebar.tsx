@@ -12,6 +12,7 @@ import {
   Radio,
   TrendingUp,
   BookOpen,
+  Inbox,
   ChevronLeft,
   ChevronRight,
 } from "lucide-react";
@@ -28,6 +29,7 @@ const navItems = [
   { href: "/council", label: "Council", icon: Swords },
   { href: "/betting", label: "Bet Finder", icon: TrendingUp },
   { href: "/docs", label: "Docs", icon: BookOpen },
+  { href: "/inbox", label: "Agent Inbox", icon: Inbox },
 ];
 
 export function Sidebar() {
