@@ -59,6 +59,7 @@ interface SDKUserMessage {
 const GROUP_DIR = process.env.NANOCLAW_GROUP_DIR || '/workspace/group';
 const IPC_BASE_DIR = process.env.NANOCLAW_IPC_DIR || '/workspace/ipc';
 const PROJECT_DIR = process.env.NANOCLAW_PROJECT_DIR || '/workspace/project';
+const MODEL = process.env.NANOCLAW_MODEL || 'claude-sonnet-4-6';
 
 const IPC_INPUT_DIR = path.join(IPC_BASE_DIR, 'input');
 const IPC_INPUT_CLOSE_SENTINEL = path.join(IPC_INPUT_DIR, '_close');
@@ -579,7 +580,7 @@ async function runQuery(
   for await (const message of query({
     prompt: stream,
     options: {
-      model: 'claude-sonnet-4-6',
+      model: MODEL,
       betas: ['context-1m-2025-08-07'],
       cwd: GROUP_DIR,
       additionalDirectories: extraDirs.length > 0 ? extraDirs : undefined,

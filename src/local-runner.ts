@@ -123,6 +123,7 @@ export async function runLocalAgent(
     NANOCLAW_IPC_DIR: groupIpcDir,
     NANOCLAW_GROUP_DIR: groupDir,
     NANOCLAW_PROJECT_DIR: PROJECT_ROOT,
+    NANOCLAW_MODEL: process.env.NANOCLAW_MODEL,
     HOME: groupSessionsDir,
     USERPROFILE: groupSessionsDir,
   };
