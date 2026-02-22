@@ -27,6 +27,30 @@ import {
 } from './hybrid.js';
 import { MemoryChunk, MemorySearchResult } from './types.js';
 
+const BUSY_RETRY_COUNT = 3;
+const BUSY_RETRY_DELAY_MS = 500;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function withBusyRetry<T>(fn: () => T): Promise<T> {
+  for (let attempt = 0; attempt < BUSY_RETRY_COUNT; attempt++) {
+    try {
+      return fn();
+    } catch (err: unknown) {
+      const isBusy =
+        err instanceof Error &&
+        'code' in err &&
+        (err as { code: string }).code === 'SQLITE_BUSY';
+      if (!isBusy || attempt === BUSY_RETRY_COUNT - 1) throw err;
+      logger.debug({ attempt: attempt + 1 }, 'SQLite busy, retrying');
+      await sleep(BUSY_RETRY_DELAY_MS * (attempt + 1));
+    }
+  }
+  throw new Error('unreachable');
+}
+
 export class MemoryManager {
   private db: Database.Database;
   private embedder: EmbeddingClient;
@@ -78,7 +102,7 @@ export class MemoryManager {
     // Remove stale entries (files that no longer exist)
     for (const [indexedPath] of indexed) {
       if (!currentPaths.has(indexedPath)) {
-        this.removeFile(groupFolder, indexedPath);
+        await this.removeFile(groupFolder, indexedPath);
       }
     }
 
@@ -425,7 +449,7 @@ export class MemoryManager {
         );
     });
 
-    txn();
+    await withBusyRetry(() => txn());
 
     logger.debug(
       { groupFolder, path: relativePath, chunks: chunks.length },
@@ -433,7 +457,7 @@ export class MemoryManager {
     );
   }
 
-  private removeFile(groupFolder: string, relativePath: string): void {
+  private async removeFile(groupFolder: string, relativePath: string): Promise<void> {
     const txn = this.db.transaction(() => {
       const oldChunks = this.db
         .prepare(
@@ -459,7 +483,7 @@ export class MemoryManager {
         .run(relativePath, groupFolder);
     });
 
-    txn();
+    await withBusyRetry(() => txn());
 
     logger.debug({ groupFolder, path: relativePath }, 'File removed from index');
   }
