@@ -916,6 +916,119 @@ Returns the most relevant text snippets with their source file and line numbers.
           }
         }
       ),
+      // ============ Agent-to-Agent Messaging Tools ============
+
+      tool(
+        'send_agent_message',
+        `Send a message directly to another agent (another registered group).
+The message will appear in their inbox at the start of their next run.
+
+Use this to:
+- Delegate tasks to specialist agents (e.g., "ball-ai-dev", "ball-ai-analytics")
+- Share information across groups without going through Telegram
+- Reply to messages you received in your inbox
+
+The receiving agent will see the message in their "Agent Inbox" section.
+They can reply using the same tool with your group folder as the target.`,
+        {
+          target_group: z.string().describe('Target group folder name (e.g., "ball-ai-dev", "ball-ai-analytics", "main")'),
+          message: z.string().describe('Message body to send to the agent'),
+          subject: z.string().optional().describe('Optional subject line for the message'),
+          in_reply_to: z.string().optional().describe('Message ID this is replying to (from inbox)'),
+        },
+        async (args) => {
+          const data = {
+            type: 'agent_message',
+            targetGroup: args.target_group,
+            message: args.message,
+            subject: args.subject || '',
+            inReplyTo: args.in_reply_to || null,
+            from: groupFolder,
+            timestamp: new Date().toISOString(),
+          };
+
+          const filename = writeIpcFile(TASKS_DIR, data);
+
+          return {
+            content: [{
+              type: 'text',
+              text: `Message queued for delivery to agent "${args.target_group}" (${filename})`
+            }]
+          };
+        }
+      ),
+
+      tool(
+        'read_agent_inbox',
+        `Read pending messages in your agent inbox — messages sent by other agents.
+
+Messages are automatically injected into your context at the start of each run,
+but use this tool to check for new messages that arrived during the current session.
+
+Messages are marked as read once retrieved.`,
+        {},
+        async () => {
+          const inboxDir = path.join(IPC_DIR, 'agent-inbox');
+
+          try {
+            if (!fs.existsSync(inboxDir)) {
+              return {
+                content: [{ type: 'text', text: 'Inbox is empty.' }]
+              };
+            }
+
+            const files = fs.readdirSync(inboxDir).filter(f => f.endsWith('.json'));
+
+            if (files.length === 0) {
+              return {
+                content: [{ type: 'text', text: 'Inbox is empty.' }]
+              };
+            }
+
+            const processedDir = path.join(inboxDir, 'processed');
+            fs.mkdirSync(processedDir, { recursive: true });
+
+            const messages: string[] = [];
+            for (const file of files) {
+              const filePath = path.join(inboxDir, file);
+              try {
+                const msg = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+                const replyInfo = msg.inReplyTo ? `\n**Re:** ${msg.inReplyTo}` : '';
+                const subjectLine = msg.subject ? `\n**Subject:** ${msg.subject}` : '';
+                messages.push(
+                  `**ID:** ${msg.id}\n**From:** ${msg.from}${subjectLine}\n**Time:** ${msg.timestamp}${replyInfo}\n\n${msg.message}`
+                );
+                // Mark as read
+                fs.renameSync(filePath, path.join(processedDir, file));
+              } catch {
+                // Skip corrupt files
+              }
+            }
+
+            if (messages.length === 0) {
+              return {
+                content: [{ type: 'text', text: 'Inbox is empty.' }]
+              };
+            }
+
+            return {
+              content: [{
+                type: 'text',
+                text: `Agent inbox (${messages.length} message${messages.length !== 1 ? 's' : ''}):\n\n${messages.join('\n\n---\n\n')}`
+              }]
+            };
+          } catch (err) {
+            return {
+              content: [{
+                type: 'text',
+                text: `Error reading inbox: ${err instanceof Error ? err.message : String(err)}`
+              }],
+              isError: true
+            };
+          }
+        }
+      ),
+
       ...createXTools({ groupFolder, isMain })
     ]
   });

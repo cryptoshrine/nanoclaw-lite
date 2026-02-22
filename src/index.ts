@@ -711,6 +711,11 @@ async function processTaskIpc(
     folder?: string;
     trigger?: string;
     containerConfig?: RegisteredGroup['containerConfig'];
+    // For agent_message
+    targetGroup?: string;
+    message?: string;
+    subject?: string;
+    inReplyTo?: string;
     // For team operations
     teamId?: string;
     teamName?: string;
@@ -928,6 +933,50 @@ async function processTaskIpc(
           { data },
           'Invalid register_group request - missing required fields',
         );
+      }
+      break;
+
+    // ============ Agent-to-Agent Messaging ============
+
+    case 'agent_message':
+      if (data.targetGroup && data.message) {
+        // Verify target group is registered
+        const targetGroupEntry = Object.values(registeredGroups).find(
+          (g) => g.folder === data.targetGroup,
+        );
+        if (!targetGroupEntry) {
+          logger.warn(
+            { from: sourceGroup, targetGroup: data.targetGroup },
+            'agent_message: target group not registered, dropping',
+          );
+          break;
+        }
+
+        const inboxDir = path.join(DATA_DIR, 'ipc', data.targetGroup as string, 'agent-inbox');
+        fs.mkdirSync(inboxDir, { recursive: true });
+
+        const msgId = `amsg-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+        const payload = {
+          id: msgId,
+          from: sourceGroup,
+          to: data.targetGroup,
+          subject: data.subject || '',
+          message: data.message,
+          inReplyTo: data.inReplyTo || null,
+          timestamp: new Date().toISOString(),
+        };
+
+        const msgPath = path.join(inboxDir, `${msgId}.json`);
+        const tmpPath = `${msgPath}.tmp`;
+        fs.writeFileSync(tmpPath, JSON.stringify(payload, null, 2));
+        fs.renameSync(tmpPath, msgPath);
+
+        logger.info(
+          { from: sourceGroup, to: data.targetGroup, msgId },
+          'Agent message routed to inbox',
+        );
+      } else {
+        logger.warn({ data }, 'agent_message: missing targetGroup or message');
       }
       break;
 

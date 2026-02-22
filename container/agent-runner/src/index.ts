@@ -278,6 +278,50 @@ function buildMemoryContext(groupDir: string): string | null {
 }
 
 /**
+ * Read pending agent inbox messages and mark them as processed.
+ * Returns formatted context string to inject into system prompt, or null if empty.
+ */
+function readAgentInboxContext(ipcBaseDir: string): string | null {
+  const inboxDir = path.join(ipcBaseDir, 'agent-inbox');
+  if (!fs.existsSync(inboxDir)) return null;
+
+  const files = fs.readdirSync(inboxDir).filter((f) => f.endsWith('.json'));
+  if (files.length === 0) return null;
+
+  const processedDir = path.join(inboxDir, 'processed');
+  fs.mkdirSync(processedDir, { recursive: true });
+
+  const messages: string[] = [];
+  for (const file of files) {
+    const filePath = path.join(inboxDir, file);
+    try {
+      const msg = JSON.parse(fs.readFileSync(filePath, 'utf-8')) as {
+        id: string;
+        from: string;
+        subject?: string;
+        message: string;
+        inReplyTo?: string | null;
+        timestamp: string;
+      };
+      const subjectLine = msg.subject ? `\n**Subject:** ${msg.subject}` : '';
+      const replyLine = msg.inReplyTo ? `\n**Re:** ${msg.inReplyTo}` : '';
+      messages.push(
+        `**ID:** ${msg.id}\n**From:** ${msg.from}${subjectLine}\n**Time:** ${msg.timestamp}${replyLine}\n\n${msg.message}`,
+      );
+      // Mark as read by moving to processed/
+      fs.renameSync(filePath, path.join(processedDir, file));
+    } catch {
+      // Skip corrupt files
+    }
+  }
+
+  if (messages.length === 0) return null;
+
+  const header = `\n\n# Agent Inbox\nYou have ${messages.length} pending message${messages.length !== 1 ? 's' : ''} from other agents. Reply using the \`send_agent_message\` tool.`;
+  return `${header}\n\n${messages.join('\n\n---\n\n')}`;
+}
+
+/**
  * Append an entry to today's daily log.
  */
 function appendToDailyLog(groupDir: string, entry: string): void {
@@ -507,8 +551,14 @@ async function runQuery(
     log(`Memory context loaded (${memoryContext.length} chars)`);
   }
 
-  // Combine global CLAUDE.md + memory context into system prompt append
-  const systemAppend = [globalClaudeMd, memoryContext].filter(Boolean).join('\n\n') || undefined;
+  // Inject pending agent inbox messages (from other agents)
+  const inboxContext = readAgentInboxContext(IPC_BASE_DIR);
+  if (inboxContext) {
+    log(`Agent inbox injected (${inboxContext.length} chars)`);
+  }
+
+  // Combine global CLAUDE.md + memory context + inbox into system prompt append
+  const systemAppend = [globalClaudeMd, memoryContext, inboxContext].filter(Boolean).join('\n\n') || undefined;
 
   // Discover additional directories mounted at /workspace/extra/* (Docker)
   // or PROJECT_DIR-relative paths (local runner on Windows)
