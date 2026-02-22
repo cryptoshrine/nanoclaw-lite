@@ -7,22 +7,42 @@
 
 import fs from 'fs';
 import path from 'path';
-import TelegramBot from 'node-telegram-bot-api';
+import type { Bot, Context } from 'grammy';
+import type { Voice } from 'grammy/types';
 
 import { logger } from './logger.js';
 
 const FALLBACK = '[Voice Message - transcription unavailable]';
 
 /**
+ * Download a file from Telegram using grammy's getFile + HTTPS fetch.
+ */
+async function downloadTelegramFile(bot: Bot<Context>, fileId: string, destDir: string): Promise<string> {
+  const file = await bot.api.getFile(fileId);
+  const filePath = file.file_path;
+  if (!filePath) throw new Error('Telegram returned no file_path');
+
+  const token = bot.token;
+  const url = `https://api.telegram.org/file/bot${token}/${filePath}`;
+  const destPath = path.join(destDir, path.basename(filePath));
+
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error(`Download failed: ${resp.status}`);
+  const buffer = Buffer.from(await resp.arrayBuffer());
+  fs.writeFileSync(destPath, buffer);
+  return destPath;
+}
+
+/**
  * Transcribe a Telegram voice message using OpenAI Whisper.
  *
- * @param bot - Telegram bot instance (for downloading the file).
+ * @param bot - grammy Bot instance (for downloading the file).
  * @param voice - The voice message metadata from Telegram.
  * @returns Transcribed text, or a fallback string on failure.
  */
 export async function transcribeVoiceMessage(
-  bot: TelegramBot,
-  voice: TelegramBot.Voice,
+  bot: Bot<Context>,
+  voice: Voice,
 ): Promise<string> {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
@@ -32,14 +52,13 @@ export async function transcribeVoiceMessage(
 
   let tempPath = '';
   try {
-    // Download the voice file from Telegram to a temp directory
     const tmpDir = path.join(
       process.env.HOME || process.env.USERPROFILE || '/tmp',
       '.nanoclaw-tmp',
     );
     fs.mkdirSync(tmpDir, { recursive: true });
 
-    tempPath = await bot.downloadFile(voice.file_id, tmpDir);
+    tempPath = await downloadTelegramFile(bot, voice.file_id, tmpDir);
     const fileSize = fs.statSync(tempPath).size;
     logger.info(
       { fileId: voice.file_id, duration: voice.duration, bytes: fileSize },

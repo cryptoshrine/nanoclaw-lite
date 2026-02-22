@@ -3,7 +3,7 @@ import fs from 'fs';
 import https from 'https';
 import path from 'path';
 
-import TelegramBot from 'node-telegram-bot-api';
+import { Bot, InputFile } from 'grammy';
 
 import { GROUPS_DIR } from './config.js';
 
@@ -62,7 +62,7 @@ import { NewMessage, RegisteredGroup, Session, TeamTask } from './types.js';
 import { loadJson, saveJson } from './utils.js';
 import { logger } from './logger.js';
 
-let bot: TelegramBot;
+let bot: Bot;
 let botUserId: number | undefined;
 let lastTimestamp = '';
 let sessions: Session = {};
@@ -81,7 +81,7 @@ let processedMessageIds: Set<string> = new Set();
 
 /**
  * Track Telegram messages we've already seen in this session (format: "messageId:chatId").
- * When polling reconnects after an EFATAL error, the library may re-deliver
+ * When polling reconnects after an error, the library may re-deliver
  * the same messages. By tracking what we've seen we prevent duplicate storage
  * and downstream duplicate processing.
  */
@@ -190,9 +190,6 @@ async function processMessage(msg: NewMessage): Promise<void> {
   const group = registeredGroups[msg.chat_jid];
   if (!group) return;
 
-  // Respond to ALL messages (no trigger prefix needed)
-  // Get messages since last agent interaction, but cap the lookback window
-  // to avoid replaying days of history when the agent has been offline.
   const agentTs = lastAgentTimestamp[msg.chat_jid] || '';
   const historyFloor = new Date(Date.now() - MAX_HISTORY_AGE_MS).toISOString();
   const sinceTimestamp = agentTs > historyFloor ? agentTs : historyFloor;
@@ -203,7 +200,6 @@ async function processMessage(msg: NewMessage): Promise<void> {
   );
 
   const lines = missedMessages.map((m) => {
-    // Escape XML special characters in content
     const escapeXml = (s: string) =>
       s
         .replace(/&/g, '&amp;')
@@ -238,7 +234,6 @@ async function runAgent(
   const isMain = group.folder === MAIN_GROUP_FOLDER;
   const sessionId = sessions[group.folder];
 
-  // Update tasks snapshot for container to read (filtered by group)
   const tasks = getAllTasks();
   writeTasksSnapshot(
     group.folder,
@@ -254,7 +249,6 @@ async function runAgent(
     })),
   );
 
-  // Update available groups snapshot (main group only can see all groups)
   const availableGroups = getAvailableGroups();
   writeGroupsSnapshot(
     group.folder,
@@ -263,7 +257,6 @@ async function runAgent(
     new Set(Object.keys(registeredGroups)),
   );
 
-  // Sync memory index before running agent (picks up any new .md files)
   try {
     await memoryManager.sync(group.folder);
   } catch (err) {
@@ -279,7 +272,6 @@ async function runAgent(
       isMain,
     });
 
-    // If agent-runner had to clear a corrupt session and start fresh, log it
     if (output.sessionCleared) {
       logger.warn(
         { group: group.name, oldSessionId: sessionId },
@@ -297,8 +289,6 @@ async function runAgent(
         { group: group.name, error: output.error },
         'Container agent error',
       );
-      // Clear the session so next message gets a fresh start
-      // instead of retrying the same broken session forever
       if (sessions[group.folder]) {
         logger.info(
           { group: group.name, sessionId: sessions[group.folder] },
@@ -313,7 +303,6 @@ async function runAgent(
     return output.result;
   } catch (err) {
     logger.error({ group: group.name, err }, 'Agent error');
-    // Clear session on unexpected errors too
     if (sessions[group.folder]) {
       logger.info(
         { group: group.name, sessionId: sessions[group.folder] },
@@ -329,7 +318,7 @@ async function runAgent(
 async function sendTyping(jid: string): Promise<void> {
   try {
     const chatId = jidToChatId(jid);
-    await bot.sendChatAction(chatId, 'typing');
+    await bot.api.sendChatAction(chatId, 'typing');
   } catch (err) {
     logger.debug({ jid, err }, 'Failed to send typing action');
   }
@@ -349,17 +338,13 @@ function splitMessage(text: string, maxLength: number): string[] {
       break;
     }
 
-    // Try to split at paragraph break
     let splitIndex = remaining.lastIndexOf('\n\n', maxLength);
-    // Fall back to line break
     if (splitIndex < maxLength / 2) {
       splitIndex = remaining.lastIndexOf('\n', maxLength);
     }
-    // Fall back to space
     if (splitIndex < maxLength / 2) {
       splitIndex = remaining.lastIndexOf(' ', maxLength);
     }
-    // Hard split if no good break point
     if (splitIndex < maxLength / 2) {
       splitIndex = maxLength;
     }
@@ -380,13 +365,13 @@ async function sendMessage(jid: string, text: string): Promise<void> {
     let lastError: Error | null = null;
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       try {
-        await bot.sendMessage(chatId, chunk);
+        await bot.api.sendMessage(chatId, chunk);
         lastError = null;
         break;
       } catch (err) {
         lastError = err as Error;
         logger.warn({ jid, attempt, maxRetries }, 'Send failed, retrying...');
-        await new Promise((r) => setTimeout(r, 1000 * attempt)); // backoff
+        await new Promise((r) => setTimeout(r, 1000 * attempt));
       }
     }
     if (lastError) {
@@ -397,12 +382,34 @@ async function sendMessage(jid: string, text: string): Promise<void> {
   logger.info({ jid, length: text.length, chunks: chunks.length }, 'Message sent');
 }
 
+/**
+ * Download a file from Telegram to a local directory.
+ * Replacement for node-telegram-bot-api's bot.downloadFile().
+ */
+async function downloadTelegramFile(fileId: string, destDir: string): Promise<string> {
+  const file = await bot.api.getFile(fileId);
+  const token = process.env.TELEGRAM_BOT_TOKEN!;
+  const url = `https://api.telegram.org/file/bot${token}/${file.file_path}`;
+  const ext = path.extname(file.file_path || '');
+  const destPath = path.join(destDir, `${fileId}${ext}`);
+
+  return new Promise((resolve, reject) => {
+    const dest = fs.createWriteStream(destPath);
+    https.get(url, (res) => {
+      res.pipe(dest);
+      dest.on('finish', () => dest.close(() => resolve(destPath)));
+    }).on('error', (err) => {
+      fs.unlink(destPath, () => {});
+      reject(err);
+    });
+  });
+}
+
 function startIpcWatcher(): void {
   const ipcBaseDir = path.join(DATA_DIR, 'ipc');
   fs.mkdirSync(ipcBaseDir, { recursive: true });
 
   const processIpcFiles = async () => {
-    // Scan all group IPC directories (identity determined by directory)
     let groupFolders: string[];
     try {
       groupFolders = fs.readdirSync(ipcBaseDir).filter((f) => {
@@ -415,7 +422,7 @@ function startIpcWatcher(): void {
       return;
     }
 
-    // Also process teammate IPC directories
+    // Process teammate IPC directories
     const teammatesDir = path.join(ipcBaseDir, 'teammates');
     if (fs.existsSync(teammatesDir)) {
       try {
@@ -433,7 +440,6 @@ function startIpcWatcher(): void {
               const filePath = path.join(teammateTasksDir, file);
               try {
                 const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-                // Teammates can only do team-related IPC
                 await processTaskIpc(data, `teammate:${memberId}`, false);
                 fs.unlinkSync(filePath);
               } catch (err) {
@@ -456,7 +462,7 @@ function startIpcWatcher(): void {
       const tasksDir = path.join(ipcBaseDir, sourceGroup, 'tasks');
       const memoryDir = path.join(ipcBaseDir, sourceGroup, 'memory');
 
-      // Process messages from this group's IPC directory
+      // Process messages
       try {
         if (fs.existsSync(messagesDir)) {
           const messageFiles = fs
@@ -467,7 +473,6 @@ function startIpcWatcher(): void {
             try {
               const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
               if (data.type === 'message' && data.chatJid && data.text) {
-                // Authorization: verify this group can send to this chatJid
                 const targetGroup = registeredGroups[data.chatJid];
                 if (
                   isMain ||
@@ -478,10 +483,8 @@ function startIpcWatcher(): void {
                   const messageId = `ipc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
                   const timestamp = data.timestamp || new Date().toISOString();
 
-                  // Send to Telegram
                   await sendMessage(data.chatJid, messageText);
 
-                  // Store in database so agents see it on their next turn
                   storeMessage({
                     id: messageId,
                     chatJid: data.chatJid,
@@ -503,7 +506,6 @@ function startIpcWatcher(): void {
                   );
                 }
               } else if (data.type === 'photo' && data.chatJid && data.filePath) {
-                // Photo/image sending via IPC
                 const targetGroup = registeredGroups[data.chatJid];
                 if (
                   isMain ||
@@ -512,8 +514,6 @@ function startIpcWatcher(): void {
                   const chatId = jidToChatId(data.chatJid);
                   let photoPath = data.filePath as string;
 
-                  // Translate container paths to host paths
-                  // Container: /workspace/group/... → Host: groups/<sourceGroup>/...
                   if (photoPath.startsWith('/workspace/group/')) {
                     photoPath = path.join(
                       GROUPS_DIR,
@@ -527,9 +527,7 @@ function startIpcWatcher(): void {
                       photoPath.slice('/workspace/project/'.length),
                     );
                   }
-                  // If it's already an absolute host path (e.g., C:\...), use as-is
 
-                  // Verify file exists on the host
                   if (!fs.existsSync(photoPath)) {
                     logger.error(
                       { chatJid: data.chatJid, filePath: photoPath, originalPath: data.filePath, sourceGroup },
@@ -537,7 +535,7 @@ function startIpcWatcher(): void {
                     );
                   } else {
                     try {
-                      await bot.sendPhoto(chatId, photoPath, {
+                      await bot.api.sendPhoto(chatId, new InputFile(photoPath), {
                         caption: data.caption || undefined,
                       });
                       logger.info(
@@ -580,7 +578,7 @@ function startIpcWatcher(): void {
         );
       }
 
-      // Process tasks from this group's IPC directory
+      // Process tasks
       try {
         if (fs.existsSync(tasksDir)) {
           const taskFiles = fs
@@ -590,7 +588,6 @@ function startIpcWatcher(): void {
             const filePath = path.join(tasksDir, file);
             try {
               const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-              // Pass source group identity to processTaskIpc for authorization
               await processTaskIpc(data, sourceGroup, isMain);
               fs.unlinkSync(filePath);
             } catch (err) {
@@ -611,7 +608,7 @@ function startIpcWatcher(): void {
         logger.error({ err, sourceGroup }, 'Error reading IPC tasks directory');
       }
 
-      // Process memory IPC requests (request-response pattern)
+      // Process memory IPC requests
       try {
         if (fs.existsSync(memoryDir)) {
           const reqFiles = fs
@@ -658,20 +655,16 @@ function startIpcWatcher(): void {
                 };
               }
 
-              // Write response file
               const resPath = path.join(memoryDir, `res-${reqId}.json`);
               const tmpPath = `${resPath}.tmp`;
               fs.writeFileSync(tmpPath, JSON.stringify(res));
               fs.renameSync(tmpPath, resPath);
-
-              // Remove request file
               fs.unlinkSync(filePath);
             } catch (err) {
               logger.error(
                 { file, sourceGroup, err },
                 'Error processing memory IPC request',
               );
-              // Try to clean up the request file to avoid repeated failures
               try {
                 fs.unlinkSync(filePath);
               } catch { /* ignore */ }
@@ -732,10 +725,9 @@ async function processTaskIpc(
     priority?: number;
     dependsOn?: string;
   },
-  sourceGroup: string, // Verified identity from IPC directory
-  isMain: boolean, // Verified from directory path
+  sourceGroup: string,
+  isMain: boolean,
 ): Promise<void> {
-  // Import db functions dynamically to avoid circular deps
   const {
     createTask,
     updateTask,
@@ -752,12 +744,10 @@ async function processTaskIpc(
         data.schedule_value &&
         (data.targetJid || data.groupFolder)
       ) {
-        // Resolve target from either targetJid (stdio MCP) or groupFolder (agent SDK MCP)
         let targetJid: string;
         let targetGroup: string;
 
         if (data.targetJid) {
-          // stdio MCP path: has targetJid, look up folder
           targetJid = data.targetJid as string;
           const targetGroupEntry = registeredGroups[targetJid];
           if (!targetGroupEntry) {
@@ -769,7 +759,6 @@ async function processTaskIpc(
           }
           targetGroup = targetGroupEntry.folder;
         } else {
-          // agent SDK MCP path: has groupFolder, look up JID
           targetGroup = data.groupFolder as string;
           const matchingEntry = Object.entries(registeredGroups).find(
             ([, group]) => group.folder === targetGroup,
@@ -784,7 +773,6 @@ async function processTaskIpc(
           targetJid = matchingEntry[0];
         }
 
-        // Authorization: non-main groups can only schedule for themselves
         if (!isMain && targetGroup !== sourceGroup) {
           logger.warn(
             { sourceGroup, targetGroup },
@@ -862,15 +850,9 @@ async function processTaskIpc(
         const task = getTask(data.taskId);
         if (task && (isMain || task.group_folder === sourceGroup)) {
           updateTask(data.taskId, { status: 'paused' });
-          logger.info(
-            { taskId: data.taskId, sourceGroup },
-            'Task paused via IPC',
-          );
+          logger.info({ taskId: data.taskId, sourceGroup }, 'Task paused via IPC');
         } else {
-          logger.warn(
-            { taskId: data.taskId, sourceGroup },
-            'Unauthorized task pause attempt',
-          );
+          logger.warn({ taskId: data.taskId, sourceGroup }, 'Unauthorized task pause attempt');
         }
       }
       break;
@@ -880,15 +862,9 @@ async function processTaskIpc(
         const task = getTask(data.taskId);
         if (task && (isMain || task.group_folder === sourceGroup)) {
           updateTask(data.taskId, { status: 'active' });
-          logger.info(
-            { taskId: data.taskId, sourceGroup },
-            'Task resumed via IPC',
-          );
+          logger.info({ taskId: data.taskId, sourceGroup }, 'Task resumed via IPC');
         } else {
-          logger.warn(
-            { taskId: data.taskId, sourceGroup },
-            'Unauthorized task resume attempt',
-          );
+          logger.warn({ taskId: data.taskId, sourceGroup }, 'Unauthorized task resume attempt');
         }
       }
       break;
@@ -898,26 +874,16 @@ async function processTaskIpc(
         const task = getTask(data.taskId);
         if (task && (isMain || task.group_folder === sourceGroup)) {
           deleteTask(data.taskId);
-          logger.info(
-            { taskId: data.taskId, sourceGroup },
-            'Task cancelled via IPC',
-          );
+          logger.info({ taskId: data.taskId, sourceGroup }, 'Task cancelled via IPC');
         } else {
-          logger.warn(
-            { taskId: data.taskId, sourceGroup },
-            'Unauthorized task cancel attempt',
-          );
+          logger.warn({ taskId: data.taskId, sourceGroup }, 'Unauthorized task cancel attempt');
         }
       }
       break;
 
     case 'register_group':
-      // Only main group can register new groups
       if (!isMain) {
-        logger.warn(
-          { sourceGroup },
-          'Unauthorized register_group attempt blocked',
-        );
+        logger.warn({ sourceGroup }, 'Unauthorized register_group attempt blocked');
         break;
       }
       if (data.jid && data.name && data.folder && data.trigger) {
@@ -929,18 +895,12 @@ async function processTaskIpc(
           containerConfig: data.containerConfig,
         });
       } else {
-        logger.warn(
-          { data },
-          'Invalid register_group request - missing required fields',
-        );
+        logger.warn({ data }, 'Invalid register_group request - missing required fields');
       }
       break;
 
-    // ============ Agent-to-Agent Messaging ============
-
     case 'agent_message':
       if (data.targetGroup && data.message) {
-        // Verify target group is registered
         const targetGroupEntry = Object.values(registeredGroups).find(
           (g) => g.folder === data.targetGroup,
         );
@@ -980,10 +940,7 @@ async function processTaskIpc(
       }
       break;
 
-    // ============ Team IPC handlers ============
-
     case 'create_team':
-      // Only main group can create teams
       if (!isMain) {
         logger.warn({ sourceGroup }, 'Unauthorized create_team attempt');
         break;
@@ -999,7 +956,6 @@ async function processTaskIpc(
       break;
 
     case 'spawn_teammate':
-      // Only main group can spawn teammates
       if (!isMain) {
         logger.warn({ sourceGroup }, 'Unauthorized spawn_teammate attempt');
         break;
@@ -1085,15 +1041,9 @@ async function processTaskIpc(
       if (data.taskId && data.memberId) {
         const claimed = claimTeamTask(data.taskId, data.memberId);
         if (claimed) {
-          logger.info(
-            { taskId: data.taskId, memberId: data.memberId },
-            'Team task claimed',
-          );
+          logger.info({ taskId: data.taskId, memberId: data.memberId }, 'Team task claimed');
         } else {
-          logger.debug(
-            { taskId: data.taskId, memberId: data.memberId },
-            'Team task already taken',
-          );
+          logger.debug({ taskId: data.taskId, memberId: data.memberId }, 'Team task already taken');
         }
       }
       break;
@@ -1129,65 +1079,19 @@ function connectTelegram(): void {
     process.exit(1);
   }
 
-  bot = new TelegramBot(token, {
-    polling: {
-      interval: 300,
-      autoStart: true,
-      params: {
-        timeout: 10, // shorter timeout to avoid connection resets
-      },
-    },
-    request: {
-      timeout: 15000, // kill any HTTP request hanging longer than 15s
-      forever: false, // disable keep-alive — stale connections cause ECONNRESET
-    } as any,
-  });
+  bot = new Bot(token);
 
-  let pollingRetryCount = 0;
-  const MAX_POLLING_RETRIES = 10;
-  const BASE_RETRY_DELAY = 5000;
+  bot.on('message', async (ctx) => {
+    const msg = ctx.message;
 
-  bot.on('polling_error', (err: Error & { code?: string }) => {
-    logger.error({ err }, 'Telegram polling error');
-    // Restart polling on fatal errors with exponential backoff
-    if (err.code === 'EFATAL') {
-      pollingRetryCount++;
-      if (pollingRetryCount > MAX_POLLING_RETRIES) {
-        logger.error(
-          `Telegram polling failed ${MAX_POLLING_RETRIES} times in a row — giving up. Check if another bot instance is using the same token.`,
-        );
-        return;
-      }
-      const delay = Math.min(BASE_RETRY_DELAY * Math.pow(2, pollingRetryCount - 1), 300000); // max 5 min
-      logger.info(`Restarting Telegram polling after fatal error (attempt ${pollingRetryCount}/${MAX_POLLING_RETRIES}, retry in ${delay / 1000}s)...`);
-      setTimeout(() => {
-        bot.stopPolling().then(() => {
-          bot.startPolling();
-        });
-      }, delay);
-    }
-  });
-
-  bot.on('message', () => {
-    // Reset retry counter on successful message receipt
-    pollingRetryCount = 0;
-  });
-
-  bot.on('message', async (msg) => {
-    // --- Telegram message dedup at intake ---
-    // When polling reconnects after EFATAL, the library may re-deliver messages
-    // we already stored. The node-telegram-bot-api library emits just the Message
-    // (not the full Update), so we use message_id + chat.id as the dedup key.
-    // message_id is unique per-chat, so the combo is globally unique.
+    // Dedup at intake — grammy may re-deliver messages on reconnect
     const intakeKey = `${msg.message_id}:${msg.chat.id}`;
     if (seenUpdateIds.has(intakeKey)) {
       logger.debug({ messageId: msg.message_id, chatId: msg.chat.id }, 'Skipping duplicate Telegram message at intake');
       return;
     }
     seenUpdateIds.add(intakeKey);
-    // Bound the set to prevent unbounded memory growth
     if (seenUpdateIds.size > MAX_SEEN_UPDATES) {
-      // Remove oldest entries (first inserted)
       const iterator = seenUpdateIds.values();
       const toRemove = seenUpdateIds.size - MAX_SEEN_UPDATES;
       for (let i = 0; i < toRemove; i++) {
@@ -1200,13 +1104,11 @@ function connectTelegram(): void {
     const jid = chatIdToJid(chatId);
     const timestamp = new Date((msg.date || 0) * 1000).toISOString();
 
-    // Determine chat name
     const chatName =
       msg.chat.title ||
       [msg.chat.first_name, msg.chat.last_name].filter(Boolean).join(' ') ||
       String(chatId);
 
-    // Always store chat metadata for discovery
     storeChatMetadata(jid, timestamp, chatName);
 
     // Auto-register: if no groups registered yet, register this chat as main
@@ -1217,38 +1119,33 @@ function connectTelegram(): void {
         trigger: `@${ASSISTANT_NAME}`,
         added_at: new Date().toISOString(),
       });
-      logger.info(
-        { jid, chatName },
-        'Auto-registered first chat as main group',
-      );
-      bot.sendMessage(
+      logger.info({ jid, chatName }, 'Auto-registered first chat as main group');
+      await bot.api.sendMessage(
         chatId,
         `Registered this chat as the main channel. Send any message and ${ASSISTANT_NAME} will respond.`,
       );
     }
 
-    // Handle document uploads
     let content = msg.text || '';
+
+    // Handle document uploads
     if (msg.document && registeredGroups[jid]) {
       const group = registeredGroups[jid];
       const fileName = msg.document.file_name || `file-${msg.document.file_id}`;
       const caption = msg.caption || '';
 
       try {
-        // Create uploads directory if it doesn't exist
         const uploadsDir = path.join(GROUPS_DIR, group.folder, 'uploads');
         fs.mkdirSync(uploadsDir, { recursive: true });
 
-        const downloadedPath = await bot.downloadFile(
+        const downloadedPath = await downloadTelegramFile(
           msg.document.file_id,
           uploadsDir,
         );
 
-        // Rename to original filename
         const finalPath = path.join(uploadsDir, fileName);
         fs.renameSync(downloadedPath, finalPath);
 
-        // For text-based files, include content in the message
         const ext = path.extname(fileName).toLowerCase();
         const textExtensions = ['.md', '.txt', '.json', '.yaml', '.yml', '.csv', '.xml', '.html', '.css', '.js', '.ts', '.py', '.sh', '.env', '.toml', '.ini', '.cfg'];
 
@@ -1266,10 +1163,8 @@ function connectTelegram(): void {
       }
     }
 
-    // Skip if no content (no text and no document)
     if (!content) return;
 
-    // Store full message content for registered groups
     if (registeredGroups[jid]) {
       const senderName =
         [msg.from?.first_name, msg.from?.last_name].filter(Boolean).join(' ') ||
@@ -1288,21 +1183,23 @@ function connectTelegram(): void {
     }
   });
 
-  // Wait for bot info to be available, then start loops
-  bot.getMe().then((botInfo) => {
-    botUserId = botInfo.id;
-    logger.info(
-      { username: botInfo.username, id: botInfo.id },
-      'Connected to Telegram',
-    );
+  // grammy's bot.start() handles reconnection automatically — no manual retry logic needed
+  bot.start({
+    onStart: async (botInfo) => {
+      botUserId = botInfo.id;
+      logger.info(
+        { username: botInfo.username, id: botInfo.id },
+        'Connected to Telegram',
+      );
 
-    startSchedulerLoop({
-      sendMessage,
-      registeredGroups: () => registeredGroups,
-      getSessions: () => sessions,
-    });
-    startIpcWatcher();
-    startMessageLoop();
+      startSchedulerLoop({
+        sendMessage,
+        registeredGroups: () => registeredGroups,
+        getSessions: () => sessions,
+      });
+      startIpcWatcher();
+      startMessageLoop();
+    },
   });
 }
 
@@ -1317,20 +1214,17 @@ async function startMessageLoop(): Promise<void> {
       if (messages.length > 0)
         logger.info({ count: messages.length }, 'New messages');
       for (const msg of messages) {
-        // Dedup guard: skip messages already processed (survives crash/restart)
         const dedupKey = `${msg.id}:${msg.chat_jid}`;
         if (processedMessageIds.has(dedupKey)) {
           logger.debug(
             { msgId: msg.id, chatJid: msg.chat_jid },
             'Skipping already-processed message (dedup)',
           );
-          // Still advance timestamp so we don't re-fetch this message forever
           lastTimestamp = msg.timestamp;
           saveState();
           continue;
         }
 
-        // In-flight guard: skip if this message is currently being processed by an agent
         if (inFlightMessages.has(dedupKey)) {
           logger.debug(
             { msgId: msg.id, chatJid: msg.chat_jid },
@@ -1342,7 +1236,6 @@ async function startMessageLoop(): Promise<void> {
         try {
           inFlightMessages.add(dedupKey);
           await processMessage(msg);
-          // Mark as processed and advance timestamp
           processedMessageIds.add(dedupKey);
           lastTimestamp = msg.timestamp;
           saveState();
@@ -1351,7 +1244,6 @@ async function startMessageLoop(): Promise<void> {
             { err, msg: msg.id },
             'Error processing message, will retry',
           );
-          // Stop processing this batch - failed message will be retried next loop
           break;
         } finally {
           inFlightMessages.delete(dedupKey);
@@ -1433,11 +1325,9 @@ async function main(): Promise<void> {
   initDatabase();
   logger.info('Database initialized');
 
-  // Initialize memory system
   memoryManager = new MemoryManager(getDb());
   logger.info('Memory system initialized');
 
-  // Start file watchers for registered groups
   loadState();
 
   for (const group of Object.values(registeredGroups)) {
