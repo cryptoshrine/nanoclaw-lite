@@ -18,6 +18,7 @@ import fs from 'fs';
 import path from 'path';
 import { query, HookCallback, PreCompactHookInput, PreToolUseHookInput } from '@anthropic-ai/claude-agent-sdk';
 import { fileURLToPath } from 'url';
+import { loadExternalMcpServers } from './load-mcp-servers.js';
 
 interface ContainerInput {
   prompt: string;
@@ -262,7 +263,13 @@ function buildMemoryContext(groupDir: string): string | null {
 
   addPart('Soul', readFileSafe(path.join(groupDir, 'SOUL.md')));
   addPart('User', readFileSafe(path.join(groupDir, 'USER.md')));
-  addPart('Long-Term Memory', readFileSafe(path.join(groupDir, 'MEMORY.md'), 15000));
+  // Prefer knowledge/_index.md (PARA structured) over flat MEMORY.md
+  const knowledgeIndex = readFileSafe(path.join(groupDir, 'knowledge', '_index.md'));
+  if (knowledgeIndex) {
+    addPart('Knowledge Index', knowledgeIndex);
+  } else {
+    addPart('Long-Term Memory', readFileSafe(path.join(groupDir, 'MEMORY.md'), 15000));
+  }
 
   // Today's daily log, falling back to yesterday
   const todayLog = readFileSafe(getDailyLogPath(groupDir, 0), 5000);
@@ -577,6 +584,14 @@ async function runQuery(
     log(`Additional directories: ${extraDirs.join(', ')}`);
   }
 
+  // Load external MCP servers from MCPorter config (config/mcporter.json)
+  const externalMcpServers = await loadExternalMcpServers(
+    process.env.NANOCLAW_PROJECT_DIR
+  );
+  const externalMcpToolPatterns = Object.keys(externalMcpServers).map(
+    (name) => `mcp__${name}__*`
+  );
+
   for await (const message of query({
     prompt: stream,
     options: {
@@ -597,7 +612,8 @@ async function runQuery(
         'TeamCreate', 'TeamDelete', 'SendMessage',
         'TodoWrite', 'ToolSearch', 'Skill',
         'NotebookEdit',
-        'mcp__nanoclaw__*'
+        'mcp__nanoclaw__*',
+        ...externalMcpToolPatterns,
       ],
       env: sdkEnv,
       permissionMode: 'bypassPermissions',
@@ -613,6 +629,7 @@ async function runQuery(
             NANOCLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
           },
         },
+        ...externalMcpServers,
       },
       hooks: {
         PreCompact: [{ hooks: [createPreCompactHook()] }],
