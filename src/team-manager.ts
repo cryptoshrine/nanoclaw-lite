@@ -95,8 +95,9 @@ export async function spawnTeammate(params: {
   prompt: string;
   model?: string;
   leadGroup: string;
+  chatJid?: string;
 }): Promise<TeamMember> {
-  const { teamId, name, prompt, model, leadGroup } = params;
+  const { teamId, name, prompt, model, leadGroup, chatJid } = params;
   const now = new Date().toISOString();
 
   const team = getTeam(teamId);
@@ -127,7 +128,7 @@ export async function spawnTeammate(params: {
   logger.info({ memberId, teamId, name }, 'Spawning teammate');
 
   // Start the container asynchronously
-  const containerPromise = runTeammateInContainer(member, leadGroup);
+  const containerPromise = runTeammateInContainer(member, leadGroup, chatJid);
 
   activeTeammates.set(memberId, {
     memberId,
@@ -149,6 +150,7 @@ export async function spawnTeammate(params: {
 async function runTeammateInContainer(
   member: TeamMember,
   leadGroup: string,
+  chatJid?: string,
 ): Promise<void> {
   try {
     const output = await runTeammateDispatch({
@@ -158,6 +160,7 @@ async function runTeammateInContainer(
       prompt: member.prompt || '',
       model: member.model,
       leadGroup,
+      chatJid,
     });
 
     if (output.status === 'error') {

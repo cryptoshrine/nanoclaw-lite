@@ -61,6 +61,8 @@ import {
 import { NewMessage, RegisteredGroup, Session, TeamTask } from './types.js';
 import { loadJson, saveJson } from './utils.js';
 import { logger } from './logger.js';
+import { startDiscordPipeline } from './discord-pipeline.js';
+import { wireDiscordCallbacks } from './discord-callbacks.js';
 
 let bot: Bot;
 let botUserId: number | undefined;
@@ -94,6 +96,18 @@ const MAX_SEEN_UPDATES = 1000;
  * while its agent container is still running.
  */
 const inFlightMessages: Set<string> = new Set();
+
+/**
+ * Per-group agent lock. Only one agent runs per group at a time,
+ * but different groups can run in parallel (cross-group parallelism).
+ */
+const activeGroups: Set<string> = new Set();
+
+/**
+ * Per-group message queue. Messages arriving while a group's agent
+ * is busy get queued here for processing when the current run finishes.
+ */
+const pendingGroupMessages: Map<string, NewMessage[]> = new Map();
 
 function loadState(): void {
   const statePath = path.join(DATA_DIR, 'router_state.json');
@@ -431,6 +445,7 @@ function startIpcWatcher(): void {
           return stat.isDirectory();
         });
         for (const memberId of teammateIds) {
+          // Process teammate task IPC files
           const teammateTasksDir = path.join(teammatesDir, memberId, 'tasks');
           if (fs.existsSync(teammateTasksDir)) {
             const taskFiles = fs
@@ -447,6 +462,59 @@ function startIpcWatcher(): void {
                 const errorDir = path.join(ipcBaseDir, 'errors');
                 fs.mkdirSync(errorDir, { recursive: true });
                 fs.renameSync(filePath, path.join(errorDir, `teammate-${memberId}-${file}`));
+              }
+            }
+          }
+
+          // Process teammate message IPC files (send_message from specialists)
+          const teammateMessagesDir = path.join(teammatesDir, memberId, 'messages');
+          if (fs.existsSync(teammateMessagesDir)) {
+            const messageFiles = fs
+              .readdirSync(teammateMessagesDir)
+              .filter((f) => f.endsWith('.json'));
+            for (const file of messageFiles) {
+              const filePath = path.join(teammateMessagesDir, file);
+              try {
+                const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+                if (data.type === 'message' && data.text) {
+                  // Resolve chatJid: from message data, or fall back to main group
+                  let targetJid = data.chatJid;
+                  if (!targetJid) {
+                    const mainEntry = Object.entries(registeredGroups).find(
+                      ([, g]) => g.folder === MAIN_GROUP_FOLDER,
+                    );
+                    targetJid = mainEntry?.[0];
+                  }
+                  if (targetJid) {
+                    const senderLabel = data.sender || `teammate:${memberId}`;
+                    const messageText = `${ASSISTANT_NAME}: ${data.text}`;
+                    const messageId = `teammate-${memberId}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+                    const timestamp = data.timestamp || new Date().toISOString();
+
+                    await sendMessage(targetJid, messageText);
+                    storeMessage({
+                      id: messageId,
+                      chatJid: targetJid,
+                      sender: senderLabel,
+                      senderName: senderLabel,
+                      content: messageText,
+                      timestamp,
+                      isFromMe: true,
+                    });
+                    logger.info(
+                      { memberId, chatJid: targetJid, sender: senderLabel },
+                      'Teammate message sent to Telegram',
+                    );
+                  }
+                }
+                fs.unlinkSync(filePath);
+              } catch (err) {
+                logger.error({ file, memberId, err }, 'Error processing teammate message');
+                try {
+                  const errorDir = path.join(ipcBaseDir, 'errors');
+                  fs.mkdirSync(errorDir, { recursive: true });
+                  fs.renameSync(filePath, path.join(errorDir, `teammate-msg-${memberId}-${file}`));
+                } catch { /* ignore cleanup errors */ }
               }
             }
           }
@@ -962,12 +1030,21 @@ async function processTaskIpc(
       }
       if (data.teamId && data.teammateName && data.teammatePrompt) {
         try {
+          // Resolve chatJid: use IPC data, or find the main group's JID
+          let teammateChatJid = data.chatJid;
+          if (!teammateChatJid) {
+            const mainJid = Object.entries(registeredGroups).find(
+              ([, g]) => g.folder === MAIN_GROUP_FOLDER,
+            );
+            teammateChatJid = mainJid?.[0] || '';
+          }
           await spawnTeammate({
             teamId: data.teamId,
             name: data.teammateName,
             prompt: data.teammatePrompt,
             model: data.teammateModel,
             leadGroup: sourceGroup,
+            chatJid: teammateChatJid,
           });
           logger.info(
             { teamId: data.teamId, name: data.teammateName },
@@ -1203,6 +1280,105 @@ function connectTelegram(): void {
   });
 }
 
+/**
+ * Process a single message and handle post-processing state updates.
+ * Extracted to share between direct dispatch and queue drain.
+ */
+async function dispatchMessage(msg: NewMessage): Promise<void> {
+  const dedupKey = `${msg.id}:${msg.chat_jid}`;
+  try {
+    inFlightMessages.add(dedupKey);
+    await processMessage(msg);
+    processedMessageIds.add(dedupKey);
+    lastTimestamp = msg.timestamp;
+    saveState();
+  } catch (err) {
+    logger.error(
+      { err, msg: msg.id },
+      'Error processing message',
+    );
+  } finally {
+    inFlightMessages.delete(dedupKey);
+  }
+}
+
+/**
+ * Drain queued messages for a group after its agent finishes.
+ * Processes all queued messages as a single batch (agent sees full context).
+ */
+async function drainGroupQueue(groupFolder: string): Promise<void> {
+  const queued = pendingGroupMessages.get(groupFolder);
+  if (!queued || queued.length === 0) {
+    pendingGroupMessages.delete(groupFolder);
+    activeGroups.delete(groupFolder);
+    return;
+  }
+
+  // Take the latest message — agent will pick up full history via getMessagesSince
+  const latest = queued[queued.length - 1];
+  // Mark all queued as processed (they'll be in the agent's context window)
+  for (const m of queued) {
+    const dk = `${m.id}:${m.chat_jid}`;
+    processedMessageIds.add(dk);
+    if (m.timestamp > lastTimestamp) {
+      lastTimestamp = m.timestamp;
+    }
+  }
+  pendingGroupMessages.set(groupFolder, []);
+  saveState();
+
+  // Process the latest message (agent reads full history)
+  await dispatchMessage(latest);
+
+  // Recurse to drain any messages that arrived during this run
+  await drainGroupQueue(groupFolder);
+}
+
+/**
+ * Write a system status snapshot to the IPC directory for agents to read.
+ * Shows currently running agents, queued messages, and active teams.
+ */
+function writeStatusSnapshot(): void {
+  const statusFile = path.join(DATA_DIR, 'ipc', 'main', 'system_status.json');
+  const now = Date.now();
+
+  const activeAgentsList = Array.from(activeGroups).map((groupFolder) => {
+    const group = Object.values(registeredGroups).find(
+      (g) => g.folder === groupFolder,
+    );
+    return {
+      group: groupFolder,
+      name: group?.name || groupFolder,
+    };
+  });
+
+  const queuedMessagesList = Array.from(pendingGroupMessages.entries()).map(
+    ([groupFolder, msgs]) => ({
+      group: groupFolder,
+      count: msgs.length,
+    }),
+  );
+
+  const status = {
+    timestamp: new Date().toISOString(),
+    activeAgents: activeAgentsList,
+    queuedMessages: queuedMessagesList,
+    totalActiveAgents: activeAgentsList.length,
+    totalQueuedMessages: queuedMessagesList.reduce(
+      (sum, q) => sum + q.count,
+      0,
+    ),
+  };
+
+  try {
+    const dir = path.dirname(statusFile);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(statusFile, JSON.stringify(status, null, 2));
+  } catch {
+    // Non-critical — don't log on every poll
+  }
+}
+
 async function startMessageLoop(): Promise<void> {
   logger.info(`NanoClaw running on Telegram (assistant: ${ASSISTANT_NAME})`);
 
@@ -1213,6 +1389,7 @@ async function startMessageLoop(): Promise<void> {
 
       if (messages.length > 0)
         logger.info({ count: messages.length }, 'New messages');
+
       for (const msg of messages) {
         const dedupKey = `${msg.id}:${msg.chat_jid}`;
         if (processedMessageIds.has(dedupKey)) {
@@ -1233,25 +1410,40 @@ async function startMessageLoop(): Promise<void> {
           continue;
         }
 
-        try {
-          inFlightMessages.add(dedupKey);
-          await processMessage(msg);
-          processedMessageIds.add(dedupKey);
+        // Resolve group folder for per-group locking
+        const group = registeredGroups[msg.chat_jid];
+        const groupFolder = group?.folder || msg.chat_jid;
+
+        if (activeGroups.has(groupFolder)) {
+          // Group agent is busy — queue this message
+          logger.info(
+            { group: groupFolder, msgId: msg.id },
+            'Agent busy, queuing message',
+          );
+          if (!pendingGroupMessages.has(groupFolder)) {
+            pendingGroupMessages.set(groupFolder, []);
+          }
+          pendingGroupMessages.get(groupFolder)!.push(msg);
+          // Advance timestamp so we don't re-fetch this message next poll
           lastTimestamp = msg.timestamp;
           saveState();
-        } catch (err) {
-          logger.error(
-            { err, msg: msg.id },
-            'Error processing message, will retry',
-          );
-          break;
-        } finally {
-          inFlightMessages.delete(dedupKey);
+          continue;
         }
+
+        // Lock group and dispatch without awaiting (fire-and-forget)
+        activeGroups.add(groupFolder);
+        dispatchMessage(msg)
+          .then(() => drainGroupQueue(groupFolder))
+          .catch((err) => {
+            logger.error({ err, group: groupFolder }, 'Fatal error in group dispatch');
+            activeGroups.delete(groupFolder);
+            pendingGroupMessages.delete(groupFolder);
+          });
       }
     } catch (err) {
       logger.error({ err }, 'Error in message loop');
     }
+    writeStatusSnapshot();
     await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL));
   }
 }
@@ -1336,6 +1528,12 @@ async function main(): Promise<void> {
 
   startTeamWatcher();
   connectTelegram();
+
+  // Wire Discord pipeline callbacks then start the pipeline
+  wireDiscordCallbacks();
+  startDiscordPipeline().catch((err) => {
+    logger.error({ err }, 'Discord pipeline failed to start (non-fatal)');
+  });
 }
 
 main().catch((err) => {

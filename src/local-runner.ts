@@ -355,6 +355,7 @@ export async function runLocalTeammate(
     NANOCLAW_GROUP_DIR: leadGroupDir,
     NANOCLAW_TEAM_DIR: teamDir,
     NANOCLAW_PROJECT_DIR: PROJECT_ROOT,
+    NANOCLAW_CHAT_JID: input.chatJid || '',
     HOME: teammateSessionsDir,
     USERPROFILE: teammateSessionsDir,
   };
@@ -363,7 +364,7 @@ export async function runLocalTeammate(
   const childInput = {
     prompt: input.prompt,
     groupFolder: input.leadGroup,
-    chatJid: '', // Teammates don't send to chat directly
+    chatJid: input.chatJid || '', // Pass chatJid so teammate can send messages to originating chat
     isMain: false,
     isTeammate: true,
     teamId: input.teamId,

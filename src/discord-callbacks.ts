@@ -1,18 +1,20 @@
 /**
- * Discord Pipeline Callbacks — v2 (Claude-powered)
+ * Discord Pipeline Callbacks — v3 (Claude-powered + Ball-AI viz)
  *
  * Wires the 4 callback hooks in discord-pipeline.ts:
  *   1. X Search (Scout) — Twitter API v2 recent search
  *   2. Research (Researcher) — Claude-powered narrative research (Opus 4.6)
- *   3. Content Creation (Klaw) — Claude-powered tweet drafting (Opus 4.6)
+ *   3. Content Creation (Klaw) — Claude-powered tweet drafting + Ball-AI viz generation
  *   4. Publish — Posts approved tweets via tweet-with-media.mjs
  *
- * v2: Callbacks 2 & 3 use direct Anthropic API calls for intelligent
- * research and content generation. Falls back to v1 template logic
- * if CLAUDE_CODE_OAUTH_TOKEN is not set or API calls fail.
+ * v3: Content callback outputs structured JSON with viz commands. When a
+ * visualization is requested, shells out to Ball-AI Python tools to generate
+ * charts/images and attaches them to the ContentDraft.
+ * Falls back to v2 (text-only) or v1 (template) if anything fails.
  */
 
 import { execFile } from 'child_process';
+import { writeFile, mkdir } from 'fs/promises';
 import { resolve } from 'path';
 import { TwitterApi } from 'twitter-api-v2';
 import { logger } from './logger.js';
@@ -115,7 +117,11 @@ Given a tweet from football analytics Twitter, you must:
    - Season stats: team performance trends, league tables by xG
    - Set piece analysis, pressing stats, chance creation maps
 
-6. **Content Angles** — Suggest 2-3 specific reactive tweet angles:
+6. **StatsBomb Match ID** — If you can identify the specific match being discussed, include its StatsBomb match ID if known. This is critical for generating visualizations. Format: **Match ID:** 3999676 (or "Unknown" if you can't determine it). Common recent IDs:
+   - Tottenham vs Arsenal (Feb 23, 2025): 3999676
+   - If you don't know the ID, say "Unknown — content creator should look this up"
+
+7. **Content Angles** — Suggest 2-3 specific reactive tweet angles:
    - Counter-take: How could Ball-AI data challenge or nuance this tweet's premise?
    - Data amplification: How could Ball-AI data strengthen the point with evidence?
    - Comparison: What player/team comparison would this audience find compelling?
@@ -265,10 +271,10 @@ function createResearchCallback() {
 
 // ── Callback 3: Content Creation (Klaw) ──────────────────────────────────────
 //
-// v2: Claude-powered tweet drafting from research context.
-// Uses Ball-AI X playbook voice: spicy, data-backed, opinionated.
-// Falls back to v1 template logic if token is missing or API call fails.
-// No image generation yet — imagePath is undefined (v3 upgrade).
+// v3: Claude-powered tweet drafting + Ball-AI visualization generation.
+// Claude outputs structured JSON with tweet text and optional viz command.
+// If viz is requested, shells out to Ball-AI Python tools to generate images.
+// Falls back to v2 (text-only Claude) or v1 (template) if anything fails.
 
 const CONTENT_SYSTEM_PROMPT = `You are Ball-AI's tweet writer. You craft reactive tweets for the @Ball_AI_Agent X account.
 
@@ -290,32 +296,46 @@ YES: "Arsenal's pressing numbers are genuinely terrifying. The data behind why t
 NO: "In this analysis we examine the pressing metrics of Arsenal FC..."
 NO: "Here are some interesting stats about the Premier League! 😊"
 
-## Output Format
+## Output Format — STRICT JSON
 
-You must output ONLY the tweet text. No commentary, no "here's my draft", no explanation.
+You MUST output valid JSON only. No markdown, no commentary, no backticks.
 
-### For a single tweet:
-- Must be under 280 characters
-- Just output the tweet text directly
+{
+  "tweetText": "The tweet text here",
+  "visualization": {
+    "vizType": "shot_map",
+    "matchId": 3999676,
+    "team": "Arsenal",
+    "player": null
+  }
+}
 
-### For a thread (when the research warrants deeper analysis):
-- Output each tweet on its own line, separated by ---
-- First tweet should hook the reader (under 280 chars)
-- Each subsequent tweet under 280 chars
-- Max 6 tweets in a thread
-- Format:
-  Tweet 1 text here
-  ---
-  Tweet 2 text here
-  ---
-  Tweet 3 text here
+### tweetText rules:
+- Single tweet: under 280 characters
+- Thread: separate tweets with --- (each under 280 chars, max 6 tweets)
+- If including a visualization, write the tweet to reference it: "Here's what that looks like ↓" or "The data speaks for itself" etc.
+
+### visualization field:
+- Include this when the research brief mentions a specific match ID and a viz would strengthen the tweet
+- Set to null if no visualization is appropriate (e.g., general debate, no specific match data)
+- vizType options: "shot_map", "xg_timeline", "pass_network", "heatmap", "shot_freeze_frame", "pitch_control", "corner_attack_heatmap"
+- matchId: StatsBomb match ID (MUST be a number from the research brief)
+- team: team name filter (required for pass_network, heatmap; optional for others)
+- player: player name filter (optional)
+
+### When to include visualization:
+- ALWAYS include a viz when a specific match ID is available in the research brief
+- Prefer xg_timeline for match narrative tweets
+- Prefer shot_map for shooting/finishing discussion
+- Prefer pass_network for tactical/build-up discussion
+- Skip viz if no match ID is available or the tweet is purely opinion-based
 
 ## Content Templates to Draw From
 
 - **Hot take:** Provocative statement + 2-3 data points + strong conclusion
 - **Data drop:** Clean stat presentation + brief interpretation
 - **Debate entry:** "Interesting debate. Let me add some data:" + key stats + opinion
-- **Thread:** Hook tweet + data points + visualizations mentions + conclusion with CTA
+- **Thread:** Hook tweet + data points + mention attached viz + conclusion with CTA
 
 ## Ball-AI CTA (Use Sparingly)
 
@@ -332,10 +352,138 @@ Do NOT force the CTA. If it doesn't fit naturally, skip it.
 3. Emoji use: minimal. One per tweet max. Skip entirely if it doesn't add anything
 4. Hashtags: skip entirely. They look desperate
 5. Be reactive to the source tweet — don't write in a vacuum
-6. If the research brief suggests specific data points, reference them specifically`;
+6. If the research brief suggests specific data points, reference them specifically
+7. Output MUST be valid JSON — no markdown fences, no explanation text`;
+
+// ── Ball-AI Viz Generation ──────────────────────────────────────────────────
+
+interface VizCommand {
+  vizType: string;
+  matchId: number;
+  team?: string | null;
+  player?: string | null;
+}
+
+const BALL_AI_PROJECT = resolve(
+  PROJECT_ROOT,
+  'groups',
+  'main',
+  'BALL-AI-2',
+);
+
+/**
+ * Shell out to Ball-AI Python tools to generate a visualization.
+ * Returns the absolute file path of the generated image, or null on failure.
+ * Uses the Ball-AI project's venv Python directly (no uv dependency at runtime).
+ */
+function generateVisualization(viz: VizCommand): Promise<string | null> {
+  const scriptPath = resolve(BALL_AI_PROJECT, 'scripts', 'discord_viz.py');
+  const pythonPath = resolve(BALL_AI_PROJECT, '.venv', 'Scripts', 'python.exe');
+
+  const args = [
+    scriptPath,
+    '--match-id', String(viz.matchId),
+    '--viz-type', viz.vizType,
+    '--platform', 'twitter',
+    '--format', 'png',
+  ];
+  if (viz.team) {
+    args.push('--team', viz.team);
+  }
+  if (viz.player) {
+    args.push('--player', viz.player);
+  }
+
+  logger.info({ viz }, 'Klaw (v3): generating Ball-AI visualization');
+
+  return new Promise((res) => {
+    execFile(
+      pythonPath,
+      args,
+      {
+        timeout: 120_000,
+        cwd: BALL_AI_PROJECT,
+        env: process.env as Record<string, string>,
+      },
+      (error, stdout, stderr) => {
+        if (error) {
+          logger.error(
+            { err: error, stderr: stderr?.slice(0, 500) },
+            'Klaw (v3): viz generation failed',
+          );
+          res(null);
+          return;
+        }
+
+        // Parse JSON output from discord_viz.py
+        try {
+          // Find the last JSON line in stdout (script may print progress before JSON)
+          const lines = stdout.trim().split('\n');
+          let jsonLine = '';
+          for (let i = lines.length - 1; i >= 0; i--) {
+            const trimmed = lines[i].trim();
+            if (trimmed.startsWith('{')) {
+              jsonLine = trimmed;
+              break;
+            }
+          }
+
+          if (!jsonLine) {
+            logger.warn({ stdout: stdout.slice(0, 500) }, 'Klaw (v3): no JSON in viz output');
+            res(null);
+            return;
+          }
+
+          const result = JSON.parse(jsonLine);
+          if (result.success && result.file_path) {
+            const filePath = result.file_path as string;
+
+            // If the file_path is a URL (cloud storage), download it locally
+            if (filePath.startsWith('http://') || filePath.startsWith('https://')) {
+              const localDir = resolve(PROJECT_ROOT, 'output', 'discord-pipeline');
+              const localFile = resolve(localDir, `${viz.matchId}_${viz.vizType}_${Date.now()}.png`);
+
+              fetch(filePath)
+                .then(async (r) => {
+                  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+                  const buffer = Buffer.from(await r.arrayBuffer());
+                  await mkdir(localDir, { recursive: true });
+                  await writeFile(localFile, buffer);
+                  logger.info(
+                    { localFile, cloudUrl: filePath, duration: result.duration_seconds },
+                    'Klaw (v3): viz downloaded from cloud to local',
+                  );
+                  res(localFile);
+                })
+                .catch((dlErr) => {
+                  logger.error({ err: dlErr, url: filePath }, 'Klaw (v3): failed to download viz from cloud');
+                  res(null);
+                });
+            } else {
+              // Local file path — resolve relative to Ball-AI project
+              const absPath = resolve(BALL_AI_PROJECT, filePath);
+              logger.info(
+                { filePath: absPath, duration: result.duration_seconds },
+                'Klaw (v3): viz generated (local)',
+              );
+              res(absPath);
+            }
+          } else {
+            logger.warn({ error: result.error }, 'Klaw (v3): viz generation returned error');
+            res(null);
+          }
+        } catch {
+          logger.warn({ stdout: stdout.slice(0, 500) }, 'Klaw (v3): could not parse viz output');
+          res(null);
+        }
+      },
+    );
+  });
+}
+
+// ── Content fallbacks ───────────────────────────────────────────────────────
 
 function contentFallbackV1(research: string): ContentDraft {
-  const sourceMatch = research.match(/\*\*Source Tweet:\*\*\n(.+?)(?:\n\n|$)/s);
   const teamsMatch = research.match(/\*\*Teams Mentioned:\*\* (.+)/);
   const teams = teamsMatch?.[1] ?? '';
   const topicsMatch = research.match(/\*\*Detected Topics:\*\* (.+)/);
@@ -381,8 +529,12 @@ function createContentCallback() {
   }
 
   return async (research: string): Promise<ContentDraft> => {
-    logger.info('Klaw (v2): calling Claude for tweet draft');
+    logger.info('Klaw (v3): calling Claude for tweet draft + viz command');
 
+    let tweetText = '';
+    let vizCommand: VizCommand | null = null;
+
+    // Step 1: Get structured JSON from Claude
     try {
       const res = await fetch('https://api.anthropic.com/v1/messages', {
         method: 'POST',
@@ -399,7 +551,7 @@ function createContentCallback() {
           messages: [
             {
               role: 'user' as const,
-              content: `Based on this research brief, craft a reactive tweet (or thread if warranted) for @Ball_AI_Agent:\n\n${research}`,
+              content: `Based on this research brief, craft a reactive tweet (or thread) with visualization for @Ball_AI_Agent:\n\n${research}`,
             },
           ],
         }),
@@ -407,7 +559,7 @@ function createContentCallback() {
 
       if (!res.ok) {
         const errText = await res.text();
-        logger.error({ status: res.status, body: errText.slice(0, 500) }, 'Klaw (v2): Anthropic API error, falling back to v1');
+        logger.error({ status: res.status, body: errText.slice(0, 500) }, 'Klaw (v3): Anthropic API error, falling back to v1');
         return contentFallbackV1(research);
       }
 
@@ -417,32 +569,82 @@ function createContentCallback() {
       };
 
       const textBlock = data.content?.find((b) => b.type === 'text');
-      let tweetText = textBlock?.text?.trim() || '';
+      const rawOutput = textBlock?.text?.trim() || '';
 
-      if (!tweetText) {
-        logger.warn('Klaw (v2): empty response from Claude, falling back to v1');
+      if (!rawOutput) {
+        logger.warn('Klaw (v3): empty response from Claude, falling back to v1');
         return contentFallbackV1(research);
       }
 
-      // If it's a single tweet (no thread separator), enforce 280 char limit
-      if (!tweetText.includes('---') && tweetText.length > 280) {
-        tweetText = tweetText.slice(0, 277) + '...';
-      }
-
-      const draft: ContentDraft = {
-        tweetText,
-        researchContext: research,
-      };
-
       logger.info(
-        { outputTokens: data.usage?.output_tokens, charCount: tweetText.length, isThread: tweetText.includes('---') },
-        'Klaw (v2): Claude draft complete',
+        { outputTokens: data.usage?.output_tokens, charCount: rawOutput.length },
+        'Klaw (v3): Claude response received',
       );
-      return draft;
+
+      // Parse the structured JSON response
+      try {
+        // Strip markdown fences if Claude wraps in ```json ... ```
+        const cleaned = rawOutput.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
+        const parsed = JSON.parse(cleaned) as {
+          tweetText?: string;
+          visualization?: VizCommand | null;
+        };
+
+        tweetText = parsed.tweetText?.trim() || '';
+        vizCommand = parsed.visualization || null;
+
+        if (!tweetText) {
+          logger.warn('Klaw (v3): parsed JSON has no tweetText, falling back to v1');
+          return contentFallbackV1(research);
+        }
+      } catch {
+        // Claude might output raw tweet text instead of JSON — treat as v2 text-only
+        logger.info('Klaw (v3): response is not JSON, treating as v2 text-only draft');
+        tweetText = rawOutput;
+        vizCommand = null;
+      }
     } catch (err) {
-      logger.error({ err }, 'Klaw (v2): API call failed, falling back to v1');
+      logger.error({ err }, 'Klaw (v3): API call failed, falling back to v1');
       return contentFallbackV1(research);
     }
+
+    // If it's a single tweet (no thread separator), enforce 280 char limit
+    if (!tweetText.includes('---') && tweetText.length > 280) {
+      tweetText = tweetText.slice(0, 277) + '...';
+    }
+
+    // Step 2: Generate visualization if requested
+    let imagePath: string | undefined;
+    if (vizCommand && vizCommand.matchId && vizCommand.vizType) {
+      try {
+        const result = await generateVisualization(vizCommand);
+        if (result) {
+          imagePath = result;
+          logger.info({ imagePath }, 'Klaw (v3): viz attached to draft');
+        } else {
+          logger.warn('Klaw (v3): viz generation returned null, proceeding without image');
+        }
+      } catch (err) {
+        logger.error({ err }, 'Klaw (v3): viz generation threw, proceeding without image');
+      }
+    }
+
+    const draft: ContentDraft = {
+      tweetText,
+      imagePath,
+      researchContext: research,
+    };
+
+    logger.info(
+      {
+        charCount: tweetText.length,
+        isThread: tweetText.includes('---'),
+        hasImage: !!imagePath,
+        vizType: vizCommand?.vizType,
+      },
+      'Klaw (v3): draft complete',
+    );
+    return draft;
   };
 }
 
@@ -541,7 +743,7 @@ export function wireDiscordCallbacks(): void {
   logger.info(`Discord callback wired: Research (Researcher) [${hasOAuthToken ? 'v2 Claude' : 'v1 fallback'}]`);
 
   setContentCallback(createContentCallback());
-  logger.info(`Discord callback wired: Content Creation (Klaw) [${hasOAuthToken ? 'v2 Claude' : 'v1 fallback'}]`);
+  logger.info(`Discord callback wired: Content Creation (Klaw) [${hasOAuthToken ? 'v3 Claude+Viz' : 'v1 fallback'}]`);
 
   setPublishCallback(createPublishCallback());
   logger.info('Discord callback wired: Publish');

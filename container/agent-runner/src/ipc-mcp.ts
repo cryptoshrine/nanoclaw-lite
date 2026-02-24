@@ -471,6 +471,7 @@ Teammates run with sonnet by default for cost efficiency. Use opus for complex r
             teammateName: args.name,
             teammatePrompt: args.prompt,
             teammateModel: args.model,
+            chatJid,
             timestamp: new Date().toISOString()
           };
 
@@ -1026,6 +1027,94 @@ Messages are marked as read once retrieved.`,
               isError: true
             };
           }
+        }
+      ),
+
+      // ============ System Status Tool ============
+
+      tool(
+        'system_status',
+        `Get current system status: running agents, queued messages, active teams, and scheduled tasks.
+Use this when the user asks "what's running?", "status", or you need to check system state.`,
+        {},
+        async () => {
+          const parts: string[] = [];
+
+          // Running agents & queued messages
+          const statusFile = path.join(IPC_DIR, 'system_status.json');
+          try {
+            if (fs.existsSync(statusFile)) {
+              const status = JSON.parse(fs.readFileSync(statusFile, 'utf-8'));
+
+              if (status.activeAgents?.length > 0) {
+                const agents = status.activeAgents.map(
+                  (a: { name: string; group: string }) => `  • ${a.name} (${a.group})`
+                ).join('\n');
+                parts.push(`*Running Agents:* ${status.totalActiveAgents}\n${agents}`);
+              } else {
+                parts.push('*Running Agents:* None');
+              }
+
+              if (status.totalQueuedMessages > 0) {
+                const queues = status.queuedMessages
+                  .filter((q: { count: number }) => q.count > 0)
+                  .map((q: { group: string; count: number }) => `  • ${q.group}: ${q.count} messages`)
+                  .join('\n');
+                parts.push(`*Queued Messages:* ${status.totalQueuedMessages}\n${queues}`);
+              } else {
+                parts.push('*Queued Messages:* None');
+              }
+
+              parts.push(`_Status as of: ${status.timestamp}_`);
+            } else {
+              parts.push('*System status:* No data available (status file not found)');
+            }
+          } catch (err) {
+            parts.push(`*System status error:* ${err instanceof Error ? err.message : String(err)}`);
+          }
+
+          // Active teams
+          try {
+            const teamFiles = fs.readdirSync(IPC_DIR).filter(
+              f => f.startsWith('team-') && f.endsWith('.json') && !f.includes('-messages') && !f.includes('-tasks')
+            );
+            if (teamFiles.length > 0) {
+              const teams = teamFiles.map(f => {
+                try {
+                  const data = JSON.parse(fs.readFileSync(path.join(IPC_DIR, f), 'utf-8'));
+                  const memberCount = data.members?.length || 0;
+                  const activeMembers = data.members?.filter((m: { status: string }) => m.status === 'active').length || 0;
+                  return `  • ${data.team?.name} — ${activeMembers}/${memberCount} active`;
+                } catch {
+                  return null;
+                }
+              }).filter(Boolean);
+              parts.push(`*Active Teams:* ${teamFiles.length}\n${teams.join('\n')}`);
+            }
+          } catch {
+            // Ignore team listing errors
+          }
+
+          // Scheduled tasks summary
+          const tasksFile = path.join(IPC_DIR, 'current_tasks.json');
+          try {
+            if (fs.existsSync(tasksFile)) {
+              const allTasks = JSON.parse(fs.readFileSync(tasksFile, 'utf-8'));
+              const active = allTasks.filter((t: { status: string }) => t.status === 'active');
+              const paused = allTasks.filter((t: { status: string }) => t.status === 'paused');
+              const failed = allTasks.filter((t: { status: string }) => t.status === 'failed');
+              parts.push(`*Scheduled Tasks:* ${active.length} active, ${paused.length} paused, ${failed.length} failed`);
+            }
+          } catch {
+            // Ignore task listing errors
+          }
+
+          return {
+            content: [{
+              type: 'text',
+              text: parts.join('\n\n')
+            }]
+          };
         }
       ),
 

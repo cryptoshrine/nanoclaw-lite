@@ -521,6 +521,7 @@ export interface TeammateContainerInput {
   prompt: string;
   model: string;
   leadGroup: string;
+  chatJid?: string;
 }
 
 function buildTeammateMounts(input: TeammateContainerInput): VolumeMount[] {
