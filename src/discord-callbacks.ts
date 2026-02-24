@@ -1,20 +1,23 @@
 /**
- * Discord Pipeline Callbacks — v3 (Claude-powered + Ball-AI viz)
+ * Discord Pipeline Callbacks — v4 (Claude-powered + Ball-AI social graphics)
  *
  * Wires the 4 callback hooks in discord-pipeline.ts:
  *   1. X Search (Scout) — Twitter API v2 recent search
  *   2. Research (Researcher) — Claude-powered narrative research (Opus 4.6)
- *   3. Content Creation (Klaw) — Claude-powered tweet drafting + Ball-AI viz generation
+ *   3. Content Creation (Klaw) — Claude-powered tweet drafting + social graphic generation
  *   4. Publish — Posts approved tweets via tweet-with-media.mjs
  *
- * v3: Content callback outputs structured JSON with viz commands. When a
- * visualization is requested, shells out to Ball-AI Python tools to generate
- * charts/images and attaches them to the ContentDraft.
- * Falls back to v2 (text-only) or v1 (template) if anything fails.
+ * v4: Generates social graphics by spinning up Ball-AI's backend + frontend,
+ * then using agent-browser to navigate the chat UI, request a social graphic,
+ * and download the rendered PNG. Produces EA FC-style branded graphics with
+ * real team crests, stat gauges, and stadium backdrop.
+ * Falls back to v3 (mplsoccer charts), v2 (text-only), or v1 (template).
  */
 
-import { execFile } from 'child_process';
+import { exec, execFile } from 'child_process';
+import { promisify } from 'util';
 import { writeFile, mkdir } from 'fs/promises';
+import { existsSync, readFileSync } from 'fs';
 import { resolve } from 'path';
 import { TwitterApi } from 'twitter-api-v2';
 import { logger } from './logger.js';
@@ -355,7 +358,9 @@ Do NOT force the CTA. If it doesn't fit naturally, skip it.
 6. If the research brief suggests specific data points, reference them specifically
 7. Output MUST be valid JSON — no markdown fences, no explanation text`;
 
-// ── Ball-AI Viz Generation ──────────────────────────────────────────────────
+// ── Ball-AI Social Graphic Generation ───────────────────────────────────────
+
+const execAsync = promisify(exec);
 
 interface VizCommand {
   vizType: string;
@@ -371,12 +376,274 @@ const BALL_AI_PROJECT = resolve(
   'BALL-AI-2',
 );
 
+const BALL_AI_FRONTEND = resolve(BALL_AI_PROJECT, 'frontend');
+const BALL_AI_BACKEND_PORT = 8123;
+const BALL_AI_FRONTEND_PORT = 5173;
+const BALL_AI_FRONTEND_URL = `http://localhost:${BALL_AI_FRONTEND_PORT}`;
+
+// Test credentials for Ball-AI chat UI (loaded from .env at startup)
+let ballAiTestEmail = '';
+let ballAiTestPassword = '';
+
 /**
- * Shell out to Ball-AI Python tools to generate a visualization.
- * Returns the absolute file path of the generated image, or null on failure.
- * Uses the Ball-AI project's venv Python directly (no uv dependency at runtime).
+ * Check if a port is in use (i.e., server is running).
  */
-function generateVisualization(viz: VizCommand): Promise<string | null> {
+async function isPortInUse(port: number): Promise<boolean> {
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/`, { signal: AbortSignal.timeout(2000) });
+    return res.ok || res.status < 500;
+  } catch {
+    try {
+      const res = await fetch(`http://localhost:${port}/`, { signal: AbortSignal.timeout(2000) });
+      return res.ok || res.status < 500;
+    } catch {
+      return false;
+    }
+  }
+}
+
+/**
+ * Start the Ball-AI backend (uvicorn on port 8123) if not already running.
+ * Returns true if server is available.
+ */
+async function ensureBallAiBackend(): Promise<boolean> {
+  if (await isPortInUse(BALL_AI_BACKEND_PORT)) {
+    logger.info('Ball-AI backend already running on port 8123');
+    return true;
+  }
+
+  logger.info('Starting Ball-AI backend...');
+  const pythonPath = resolve(BALL_AI_PROJECT, '.venv', 'Scripts', 'python.exe');
+
+  // Fire and forget — the server runs in the background
+  const child = exec(
+    `"${pythonPath}" -m uvicorn app.main:app --port ${BALL_AI_BACKEND_PORT} --host 127.0.0.1`,
+    { cwd: BALL_AI_PROJECT },
+  );
+  child.unref();
+
+  // Wait for the server to be ready (up to 60s)
+  for (let i = 0; i < 30; i++) {
+    await new Promise((r) => setTimeout(r, 2000));
+    try {
+      const res = await fetch(`http://127.0.0.1:${BALL_AI_BACKEND_PORT}/health`, {
+        signal: AbortSignal.timeout(2000),
+      });
+      if (res.ok) {
+        logger.info('Ball-AI backend is ready');
+        return true;
+      }
+    } catch { /* still starting */ }
+  }
+
+  logger.error('Ball-AI backend failed to start within 60s');
+  return false;
+}
+
+/**
+ * Start the Ball-AI frontend (vite dev on port 5173) if not already running.
+ * Returns true if server is available.
+ */
+async function ensureBallAiFrontend(): Promise<boolean> {
+  if (await isPortInUse(BALL_AI_FRONTEND_PORT)) {
+    logger.info('Ball-AI frontend already running on port 5173');
+    return true;
+  }
+
+  logger.info('Starting Ball-AI frontend...');
+
+  const child = exec('npm run dev', { cwd: BALL_AI_FRONTEND });
+  child.unref();
+
+  // Wait for vite to be ready (up to 30s)
+  for (let i = 0; i < 15; i++) {
+    await new Promise((r) => setTimeout(r, 2000));
+    if (await isPortInUse(BALL_AI_FRONTEND_PORT)) {
+      logger.info('Ball-AI frontend is ready');
+      return true;
+    }
+  }
+
+  logger.error('Ball-AI frontend failed to start within 30s');
+  return false;
+}
+
+/**
+ * Run an agent-browser command and return stdout.
+ * All commands run from the group/main directory for consistent session state.
+ */
+async function browser(cmd: string, timeoutMs = 30_000): Promise<string> {
+  const { stdout } = await execAsync(`agent-browser ${cmd}`, {
+    timeout: timeoutMs,
+    cwd: resolve(PROJECT_ROOT, 'groups', 'main'),
+  });
+  return stdout.trim();
+}
+
+/**
+ * Generate a social graphic using Ball-AI's frontend chat UI.
+ *
+ * Flow:
+ * 1. Ensure backend + frontend are running
+ * 2. Open browser → login → start new chat
+ * 3. Ask Ball-AI to generate a social graphic for the match
+ * 4. Wait for the graphic to render (poll for Download button)
+ * 5. Download the PNG
+ * 6. Close browser
+ *
+ * Returns the absolute file path of the downloaded PNG, or null on failure.
+ */
+async function generateSocialGraphic(viz: VizCommand): Promise<string | null> {
+  const outputDir = resolve(PROJECT_ROOT, 'output', 'discord-pipeline');
+  await mkdir(outputDir, { recursive: true });
+  const outputPath = resolve(outputDir, `social_${viz.matchId}_${viz.vizType}_${Date.now()}.png`);
+
+  logger.info({ viz }, 'Klaw (v4): generating social graphic via Ball-AI frontend');
+
+  try {
+    // Step 1: Ensure servers are running
+    const [backendOk, frontendOk] = await Promise.all([
+      ensureBallAiBackend(),
+      ensureBallAiFrontend(),
+    ]);
+
+    if (!backendOk || !frontendOk) {
+      logger.error('Klaw (v4): Ball-AI servers not available, falling back to v3');
+      return null;
+    }
+
+    // Step 2: Open browser and login
+    await browser(`open ${BALL_AI_FRONTEND_URL}/login`);
+    await new Promise((r) => setTimeout(r, 2000));
+
+    // Find and fill login form
+    const snapshot1 = await browser('snapshot -i');
+
+    // Extract refs for email, password, and sign-in button
+    const emailRef = extractRef(snapshot1, 'textbox', 'email');
+    const passwordRef = extractRef(snapshot1, 'textbox', '***');
+    const signInRef = extractRef(snapshot1, 'button', 'Sign In', true);
+
+    if (!emailRef || !passwordRef || !signInRef) {
+      logger.error({ snapshot: snapshot1.slice(0, 500) }, 'Klaw (v4): could not find login form elements');
+      await browser('close').catch(() => {});
+      return null;
+    }
+
+    await browser(`fill ${emailRef} "${ballAiTestEmail}"`);
+    await browser(`fill ${passwordRef} "${ballAiTestPassword}"`);
+    await browser(`click ${signInRef}`);
+    await new Promise((r) => setTimeout(r, 3000));
+
+    // Step 3: Navigate to chat and send request
+    await browser(`open ${BALL_AI_FRONTEND_URL}/chat`);
+    await new Promise((r) => setTimeout(r, 2000));
+
+    const snapshot2 = await browser('snapshot -i');
+    const chatInputRef = extractRef(snapshot2, 'textbox', 'football analysis');
+
+    if (!chatInputRef) {
+      logger.error('Klaw (v4): could not find chat input');
+      await browser('close').catch(() => {});
+      return null;
+    }
+
+    const teamLabel = viz.team || '';
+    const prompt = `Generate a match stats social graphic for ${teamLabel} (match ID ${viz.matchId})`;
+    await browser(`fill ${chatInputRef} "${prompt}"`);
+
+    // Find and click send button
+    await new Promise((r) => setTimeout(r, 500));
+    const snapshot3 = await browser('snapshot -i');
+    const sendRef = extractRef(snapshot3, 'button', 'Send', false, false);
+
+    if (!sendRef) {
+      logger.error('Klaw (v4): could not find Send button');
+      await browser('close').catch(() => {});
+      return null;
+    }
+
+    await browser(`click ${sendRef}`);
+    logger.info({ prompt }, 'Klaw (v4): social graphic request sent to Ball-AI');
+
+    // Step 4: Wait for the graphic to render (poll for Download button, up to 90s)
+    let downloadRef: string | null = null;
+    for (let i = 0; i < 18; i++) {
+      await new Promise((r) => setTimeout(r, 5000));
+      try {
+        const snap = await browser('snapshot -i');
+        downloadRef = extractRef(snap, 'button', 'Download');
+        if (downloadRef) break;
+      } catch { /* still rendering */ }
+    }
+
+    if (!downloadRef) {
+      logger.error('Klaw (v4): Download button did not appear within 90s');
+      await browser('close').catch(() => {});
+      return null;
+    }
+
+    // Step 5: Download the PNG
+    logger.info({ downloadRef, outputPath }, 'Klaw (v4): downloading social graphic');
+    await browser(`download ${downloadRef} "${outputPath}"`, 30_000);
+
+    // Verify the file exists and has content
+    await new Promise((r) => setTimeout(r, 2000));
+    if (!existsSync(outputPath)) {
+      logger.error('Klaw (v4): downloaded file not found at expected path');
+      await browser('close').catch(() => {});
+      return null;
+    }
+
+    logger.info({ outputPath }, 'Klaw (v4): social graphic downloaded successfully');
+
+    // Step 6: Close browser
+    await browser('close').catch(() => {});
+
+    return outputPath;
+  } catch (err) {
+    logger.error({ err }, 'Klaw (v4): social graphic generation failed');
+    await browser('close').catch(() => {});
+    return null;
+  }
+}
+
+/**
+ * Extract a ref (e.g. "e4") from an agent-browser snapshot for a given element type and text hint.
+ */
+function extractRef(
+  snapshot: string,
+  elementType: string,
+  textHint: string,
+  lastMatch = false,
+  skipDisabled = true,
+): string | null {
+  const lines = snapshot.split('\n');
+  const matches: string[] = [];
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    // Match lines like: - button "Sign In" [ref=e7] [nth=1]
+    // or: - textbox "you@example.com" [ref=e4]
+    if (!trimmed.includes(elementType)) continue;
+    if (textHint && !trimmed.toLowerCase().includes(textHint.toLowerCase())) continue;
+    if (skipDisabled && trimmed.includes('[disabled]')) continue;
+
+    const refMatch = trimmed.match(/\[ref=(e\d+)\]/);
+    if (refMatch) {
+      matches.push(refMatch[1]);
+    }
+  }
+
+  if (matches.length === 0) return null;
+  return lastMatch ? matches[matches.length - 1] : matches[0];
+}
+
+/**
+ * Legacy v3 visualization: Shell out to Ball-AI Python tools.
+ * Used as fallback when social graphic generation fails.
+ */
+function generateVisualizationV3(viz: VizCommand): Promise<string | null> {
   const scriptPath = resolve(BALL_AI_PROJECT, 'scripts', 'discord_viz.py');
   const pythonPath = resolve(BALL_AI_PROJECT, '.venv', 'Scripts', 'python.exe');
 
@@ -387,14 +654,10 @@ function generateVisualization(viz: VizCommand): Promise<string | null> {
     '--platform', 'twitter',
     '--format', 'png',
   ];
-  if (viz.team) {
-    args.push('--team', viz.team);
-  }
-  if (viz.player) {
-    args.push('--player', viz.player);
-  }
+  if (viz.team) args.push('--team', viz.team);
+  if (viz.player) args.push('--player', viz.player);
 
-  logger.info({ viz }, 'Klaw (v3): generating Ball-AI visualization');
+  logger.info({ viz }, 'Klaw (v3 fallback): generating mplsoccer visualization');
 
   return new Promise((res) => {
     execFile(
@@ -407,38 +670,25 @@ function generateVisualization(viz: VizCommand): Promise<string | null> {
       },
       (error, stdout, stderr) => {
         if (error) {
-          logger.error(
-            { err: error, stderr: stderr?.slice(0, 500) },
-            'Klaw (v3): viz generation failed',
-          );
+          logger.error({ err: error, stderr: stderr?.slice(0, 500) }, 'v3 fallback: viz generation failed');
           res(null);
           return;
         }
 
-        // Parse JSON output from discord_viz.py
         try {
-          // Find the last JSON line in stdout (script may print progress before JSON)
           const lines = stdout.trim().split('\n');
           let jsonLine = '';
           for (let i = lines.length - 1; i >= 0; i--) {
             const trimmed = lines[i].trim();
-            if (trimmed.startsWith('{')) {
-              jsonLine = trimmed;
-              break;
-            }
+            if (trimmed.startsWith('{')) { jsonLine = trimmed; break; }
           }
 
-          if (!jsonLine) {
-            logger.warn({ stdout: stdout.slice(0, 500) }, 'Klaw (v3): no JSON in viz output');
-            res(null);
-            return;
-          }
+          if (!jsonLine) { res(null); return; }
 
           const result = JSON.parse(jsonLine);
           if (result.success && result.file_path) {
             const filePath = result.file_path as string;
 
-            // If the file_path is a URL (cloud storage), download it locally
             if (filePath.startsWith('http://') || filePath.startsWith('https://')) {
               const localDir = resolve(PROJECT_ROOT, 'output', 'discord-pipeline');
               const localFile = resolve(localDir, `${viz.matchId}_${viz.vizType}_${Date.now()}.png`);
@@ -449,31 +699,16 @@ function generateVisualization(viz: VizCommand): Promise<string | null> {
                   const buffer = Buffer.from(await r.arrayBuffer());
                   await mkdir(localDir, { recursive: true });
                   await writeFile(localFile, buffer);
-                  logger.info(
-                    { localFile, cloudUrl: filePath, duration: result.duration_seconds },
-                    'Klaw (v3): viz downloaded from cloud to local',
-                  );
                   res(localFile);
                 })
-                .catch((dlErr) => {
-                  logger.error({ err: dlErr, url: filePath }, 'Klaw (v3): failed to download viz from cloud');
-                  res(null);
-                });
+                .catch(() => res(null));
             } else {
-              // Local file path — resolve relative to Ball-AI project
-              const absPath = resolve(BALL_AI_PROJECT, filePath);
-              logger.info(
-                { filePath: absPath, duration: result.duration_seconds },
-                'Klaw (v3): viz generated (local)',
-              );
-              res(absPath);
+              res(resolve(BALL_AI_PROJECT, filePath));
             }
           } else {
-            logger.warn({ error: result.error }, 'Klaw (v3): viz generation returned error');
             res(null);
           }
         } catch {
-          logger.warn({ stdout: stdout.slice(0, 500) }, 'Klaw (v3): could not parse viz output');
           res(null);
         }
       },
@@ -529,7 +764,7 @@ function createContentCallback() {
   }
 
   return async (research: string): Promise<ContentDraft> => {
-    logger.info('Klaw (v3): calling Claude for tweet draft + viz command');
+    logger.info('Klaw (v4): calling Claude for tweet draft + viz command');
 
     let tweetText = '';
     let vizCommand: VizCommand | null = null;
@@ -613,19 +848,28 @@ function createContentCallback() {
       tweetText = tweetText.slice(0, 277) + '...';
     }
 
-    // Step 2: Generate visualization if requested
+    // Step 2: Generate social graphic (v4) or fall back to mplsoccer chart (v3)
     let imagePath: string | undefined;
     if (vizCommand && vizCommand.matchId && vizCommand.vizType) {
       try {
-        const result = await generateVisualization(vizCommand);
+        // v4: Social graphic via Ball-AI frontend + agent-browser
+        const result = await generateSocialGraphic(vizCommand);
         if (result) {
           imagePath = result;
-          logger.info({ imagePath }, 'Klaw (v3): viz attached to draft');
+          logger.info({ imagePath }, 'Klaw (v4): social graphic attached to draft');
         } else {
-          logger.warn('Klaw (v3): viz generation returned null, proceeding without image');
+          // v3 fallback: mplsoccer chart via Python CLI
+          logger.info('Klaw (v4): social graphic failed, trying v3 mplsoccer fallback');
+          const fallback = await generateVisualizationV3(vizCommand);
+          if (fallback) {
+            imagePath = fallback;
+            logger.info({ imagePath }, 'Klaw (v3 fallback): mplsoccer viz attached');
+          } else {
+            logger.warn('Klaw: all viz generation failed, proceeding without image');
+          }
         }
       } catch (err) {
-        logger.error({ err }, 'Klaw (v3): viz generation threw, proceeding without image');
+        logger.error({ err }, 'Klaw (v4): viz generation threw, proceeding without image');
       }
     }
 
@@ -721,13 +965,30 @@ export function wireDiscordCallbacks(): void {
   logger.info('Wiring Discord pipeline callbacks...');
 
   // Load OAuth token from .env for Claude-powered callbacks.
-  // readEnvFile doesn't pollute process.env — we set it explicitly here
-  // so the v2 callbacks can read it via process.env.
   if (!process.env.CLAUDE_CODE_OAUTH_TOKEN) {
     const envVars = readEnvFile(['CLAUDE_CODE_OAUTH_TOKEN']);
     if (envVars.CLAUDE_CODE_OAUTH_TOKEN) {
       process.env.CLAUDE_CODE_OAUTH_TOKEN = envVars.CLAUDE_CODE_OAUTH_TOKEN;
       logger.info('Loaded CLAUDE_CODE_OAUTH_TOKEN from .env for Discord callbacks');
+    }
+  }
+
+  // Load Ball-AI test credentials for social graphic generation (v4)
+  const ballAiEnvPath = resolve(BALL_AI_PROJECT, '.env');
+  if (existsSync(ballAiEnvPath)) {
+    try {
+      const envContent = readFileSync(ballAiEnvPath, 'utf-8');
+      const emailMatch = envContent.match(/^TEST_USER_EMAIL=(.+)$/m);
+      const passMatch = envContent.match(/^TEST_USER_PASSWORD=(.+)$/m);
+      ballAiTestEmail = emailMatch?.[1]?.trim() || '';
+      ballAiTestPassword = passMatch?.[1]?.trim() || '';
+      if (ballAiTestEmail && ballAiTestPassword) {
+        logger.info('Loaded Ball-AI test credentials for v4 social graphics');
+      } else {
+        logger.warn('Ball-AI test credentials not found in .env — v4 social graphics will fall back to v3');
+      }
+    } catch {
+      logger.warn('Could not read Ball-AI .env — v4 social graphics will fall back to v3');
     }
   }
 
@@ -738,12 +999,13 @@ export function wireDiscordCallbacks(): void {
   }
 
   const hasOAuthToken = !!process.env.CLAUDE_CODE_OAUTH_TOKEN;
+  const hasBallAiCreds = !!ballAiTestEmail && !!ballAiTestPassword;
 
   setResearchCallback(createResearchCallback());
   logger.info(`Discord callback wired: Research (Researcher) [${hasOAuthToken ? 'v2 Claude' : 'v1 fallback'}]`);
 
   setContentCallback(createContentCallback());
-  logger.info(`Discord callback wired: Content Creation (Klaw) [${hasOAuthToken ? 'v3 Claude+Viz' : 'v1 fallback'}]`);
+  logger.info(`Discord callback wired: Content Creation (Klaw) [${hasOAuthToken ? (hasBallAiCreds ? 'v4 Social Graphics' : 'v3 Claude+Viz') : 'v1 fallback'}]`);
 
   setPublishCallback(createPublishCallback());
   logger.info('Discord callback wired: Publish');
