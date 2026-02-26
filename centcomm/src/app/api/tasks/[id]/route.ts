@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { getTaskRunLogs } from "@/lib/db";
-import { pauseTask, resumeTask, cancelTask } from "@/lib/ipc";
+import { pauseTask, resumeTask, cancelTask, editTask } from "@/lib/ipc";
 
 export async function GET(
   _request: Request,
@@ -25,7 +25,7 @@ export async function PATCH(
   const { id } = await params;
   try {
     const body = await request.json();
-    const { action } = body;
+    const { action, prompt, schedule_type, schedule_value, context_mode } = body;
 
     let filePath: string;
     switch (action) {
@@ -38,9 +38,18 @@ export async function PATCH(
       case "cancel":
         filePath = cancelTask(id);
         break;
+      case "edit":
+        filePath = editTask({
+          task_id: id,
+          prompt,
+          schedule_type,
+          schedule_value,
+          context_mode,
+        });
+        break;
       default:
         return NextResponse.json(
-          { error: "Invalid action. Use: pause, resume, cancel" },
+          { error: "Invalid action. Use: pause, resume, cancel, edit" },
           { status: 400 }
         );
     }

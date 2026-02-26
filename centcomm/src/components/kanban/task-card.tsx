@@ -11,6 +11,7 @@ import {
   Timer,
   Repeat,
   Trash2,
+  Pencil,
 } from "lucide-react";
 
 export interface KanbanTask {
@@ -88,9 +89,10 @@ interface TaskCardProps {
   task: KanbanTask;
   onClick: () => void;
   onAction?: (taskId: string, action: "pause" | "resume" | "cancel") => void;
+  onEdit?: (task: KanbanTask) => void;
 }
 
-export function TaskCard({ task, onClick, onAction }: TaskCardProps) {
+export function TaskCard({ task, onClick, onAction, onEdit }: TaskCardProps) {
   const config = statusConfig[task.status] || statusConfig.active;
 
   return (
@@ -141,9 +143,22 @@ export function TaskCard({ task, onClick, onAction }: TaskCardProps) {
       </button>
 
       {/* Quick actions — show on hover */}
-      {onAction && (task.status === "active" || task.status === "paused") && (
+      {(onAction || onEdit) && (task.status === "active" || task.status === "paused") && (
         <div className="mt-2 flex items-center gap-1.5 opacity-0 group-hover:opacity-100 transition-opacity">
-          {task.status === "active" && (
+          {onEdit && (
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                onEdit(task);
+              }}
+              className="flex items-center gap-1 rounded-md border border-electric/20 bg-electric/5 px-2 py-1 text-[10px] text-electric hover:bg-electric/15 transition-colors"
+              title="Edit task"
+            >
+              <Pencil className="h-2.5 w-2.5" />
+              Edit
+            </button>
+          )}
+          {onAction && task.status === "active" && (
             <button
               onClick={(e) => {
                 e.stopPropagation();
@@ -156,7 +171,7 @@ export function TaskCard({ task, onClick, onAction }: TaskCardProps) {
               Pause
             </button>
           )}
-          {task.status === "paused" && (
+          {onAction && task.status === "paused" && (
             <button
               onClick={(e) => {
                 e.stopPropagation();
@@ -169,17 +184,19 @@ export function TaskCard({ task, onClick, onAction }: TaskCardProps) {
               Resume
             </button>
           )}
-          <button
-            onClick={(e) => {
-              e.stopPropagation();
-              onAction(task.id, "cancel");
-            }}
-            className="flex items-center gap-1 rounded-md border border-alert/20 bg-alert/5 px-2 py-1 text-[10px] text-alert hover:bg-alert/15 transition-colors"
-            title="Cancel task"
-          >
-            <Trash2 className="h-2.5 w-2.5" />
-            Cancel
-          </button>
+          {onAction && (
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                onAction(task.id, "cancel");
+              }}
+              className="flex items-center gap-1 rounded-md border border-alert/20 bg-alert/5 px-2 py-1 text-[10px] text-alert hover:bg-alert/15 transition-colors"
+              title="Cancel task"
+            >
+              <Trash2 className="h-2.5 w-2.5" />
+              Cancel
+            </button>
+          )}
         </div>
       )}
     </div>

@@ -129,3 +129,42 @@ export function readGroupFile(folder: string, filePath: string): string | null {
     return null;
   }
 }
+
+export function writeGroupFile(
+  folder: string,
+  filePath: string,
+  content: string
+): { success: boolean; error?: string; backupPath?: string } {
+  // Security: ensure path stays within the group folder
+  const groupPath = path.join(PATHS.groups, folder);
+  const fullPath = path.resolve(groupPath, filePath);
+  if (!fullPath.startsWith(groupPath)) {
+    return { success: false, error: "Path outside group folder" };
+  }
+
+  // Only allow editing md, json, txt files
+  const ext = path.extname(fullPath).toLowerCase();
+  if (![".md", ".json", ".txt"].includes(ext)) {
+    return { success: false, error: `File type ${ext} not editable` };
+  }
+
+  try {
+    // Create backup before saving
+    let backupPath: string | undefined;
+    if (fs.existsSync(fullPath)) {
+      backupPath = `${fullPath}.bak`;
+      fs.copyFileSync(fullPath, backupPath);
+    }
+
+    // Ensure parent directory exists
+    const dir = path.dirname(fullPath);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+
+    fs.writeFileSync(fullPath, content, "utf-8");
+    return { success: true, backupPath };
+  } catch (err) {
+    return { success: false, error: String(err) };
+  }
+}

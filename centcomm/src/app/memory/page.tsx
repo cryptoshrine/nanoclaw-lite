@@ -12,6 +12,12 @@ import {
   ChevronRight,
   ChevronDown,
   Loader2,
+  Pencil,
+  Eye,
+  Save,
+  X,
+  CheckCircle2,
+  AlertTriangle,
 } from "lucide-react";
 
 interface GroupInfo {
@@ -45,6 +51,12 @@ export default function MemoryPage() {
   const [loadingContent, setLoadingContent] = useState(false);
   const [expandedDirs, setExpandedDirs] = useState<Set<string>>(new Set());
 
+  // Editor state
+  const [editing, setEditing] = useState(false);
+  const [editContent, setEditContent] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [saveStatus, setSaveStatus] = useState<"idle" | "success" | "error">("idle");
+
   // Load groups on mount
   useEffect(() => {
     async function loadGroups() {
@@ -67,6 +79,7 @@ export default function MemoryPage() {
     setLoadingFiles(true);
     setActiveFile(null);
     setFileContent("");
+    setEditing(false);
     setExpandedDirs(new Set());
     try {
       const res = await fetch(`/api/groups/${folder}`);
@@ -90,6 +103,8 @@ export default function MemoryPage() {
   async function loadFile(folder: string, filePath: string) {
     setActiveFile(filePath);
     setLoadingContent(true);
+    setEditing(false);
+    setSaveStatus("idle");
     try {
       const res = await fetch(
         `/api/groups/${folder}/files?path=${encodeURIComponent(filePath)}`
@@ -97,6 +112,7 @@ export default function MemoryPage() {
       if (res.ok) {
         const json = await res.json();
         setFileContent(json.content);
+        setEditContent(json.content);
       } else {
         setFileContent("Failed to load file");
       }
@@ -104,6 +120,34 @@ export default function MemoryPage() {
       setFileContent("Error loading file");
     } finally {
       setLoadingContent(false);
+    }
+  }
+
+  // Save file
+  async function saveFile() {
+    if (!selectedGroup || !activeFile) return;
+    setSaving(true);
+    setSaveStatus("idle");
+    try {
+      const res = await fetch(`/api/groups/${selectedGroup}/files`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path: activeFile, content: editContent }),
+      });
+      if (res.ok) {
+        setFileContent(editContent);
+        setSaveStatus("success");
+        setEditing(false);
+        setTimeout(() => setSaveStatus("idle"), 3000);
+      } else {
+        const data = await res.json();
+        setSaveStatus("error");
+        console.error("Save failed:", data.error);
+      }
+    } catch {
+      setSaveStatus("error");
+    } finally {
+      setSaving(false);
     }
   }
 
@@ -220,13 +264,14 @@ export default function MemoryPage() {
   }
 
   const tree = buildFileTree();
+  const hasChanges = editing && editContent !== fileContent;
 
   return (
     <div className="space-y-6">
       <div>
         <h2 className="text-2xl font-bold text-foreground">Memory Vault</h2>
         <p className="text-sm text-muted-foreground">
-          Browse and search agent knowledge across all groups
+          Browse, search, and edit agent knowledge across all groups
         </p>
       </div>
 
@@ -304,42 +349,116 @@ export default function MemoryPage() {
           )}
         </div>
 
-        {/* Right: File content viewer */}
+        {/* Right: File content viewer/editor */}
         <Card className="border-border bg-card lg:col-span-3">
           <CardHeader className="pb-3">
-            <CardTitle className="flex items-center gap-2 text-sm font-medium text-muted-foreground">
-              <FileText className="h-4 w-4" />
-              {activeFile ? (
-                <span className="font-mono">
-                  {selectedGroup}/{activeFile}
-                </span>
-              ) : (
-                "Select a file to view"
+            <CardTitle className="flex items-center justify-between">
+              <span className="flex items-center gap-2 text-sm font-medium text-muted-foreground">
+                <FileText className="h-4 w-4" />
+                {activeFile ? (
+                  <span className="font-mono">
+                    {selectedGroup}/{activeFile}
+                  </span>
+                ) : (
+                  "Select a file to view"
+                )}
+              </span>
+
+              {/* Editor controls */}
+              {activeFile && (
+                <div className="flex items-center gap-2">
+                  {/* Save status indicator */}
+                  {saveStatus === "success" && (
+                    <span className="flex items-center gap-1 text-[10px] text-success">
+                      <CheckCircle2 className="h-3 w-3" />
+                      Saved
+                    </span>
+                  )}
+                  {saveStatus === "error" && (
+                    <span className="flex items-center gap-1 text-[10px] text-alert">
+                      <AlertTriangle className="h-3 w-3" />
+                      Save failed
+                    </span>
+                  )}
+
+                  {editing ? (
+                    <>
+                      <button
+                        onClick={() => {
+                          setEditing(false);
+                          setEditContent(fileContent);
+                        }}
+                        className="flex items-center gap-1 rounded-md border border-border px-2 py-1 text-[10px] text-muted-foreground hover:bg-muted transition-colors"
+                      >
+                        <X className="h-3 w-3" />
+                        Cancel
+                      </button>
+                      <button
+                        onClick={saveFile}
+                        disabled={saving || !hasChanges}
+                        className="flex items-center gap-1 rounded-md border border-electric/20 bg-electric/10 px-2 py-1 text-[10px] text-electric hover:bg-electric/20 transition-colors disabled:opacity-50"
+                      >
+                        {saving ? (
+                          <Loader2 className="h-3 w-3 animate-spin" />
+                        ) : (
+                          <Save className="h-3 w-3" />
+                        )}
+                        Save
+                      </button>
+                    </>
+                  ) : (
+                    <>
+                      <button
+                        onClick={() => {
+                          setEditing(true);
+                          setEditContent(fileContent);
+                        }}
+                        className="flex items-center gap-1 rounded-md border border-electric/20 bg-electric/5 px-2 py-1 text-[10px] text-electric hover:bg-electric/15 transition-colors"
+                      >
+                        <Pencil className="h-3 w-3" />
+                        Edit
+                      </button>
+                      <span className="flex items-center gap-1 text-[10px] text-muted-foreground">
+                        <Eye className="h-3 w-3" />
+                        View
+                      </span>
+                    </>
+                  )}
+                </div>
               )}
             </CardTitle>
           </CardHeader>
           <CardContent className="p-0">
-            <ScrollArea className="h-[600px]">
-              {loadingContent ? (
-                <div className="flex items-center justify-center py-12">
-                  <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
-                </div>
-              ) : activeFile ? (
-                <pre className="p-6 text-sm text-foreground whitespace-pre-wrap font-mono leading-relaxed">
-                  {fileContent}
-                </pre>
+            {loadingContent ? (
+              <div className="flex items-center justify-center py-12">
+                <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
+              </div>
+            ) : activeFile ? (
+              editing ? (
+                <textarea
+                  value={editContent}
+                  onChange={(e) => setEditContent(e.target.value)}
+                  className="w-full h-[600px] p-6 bg-transparent text-sm text-foreground font-mono leading-relaxed resize-none border-0 focus:outline-none focus:ring-0"
+                  spellCheck={false}
+                />
               ) : (
-                <div className="flex flex-col items-center justify-center py-12 text-muted-foreground">
-                  <Brain className="h-12 w-12 mb-4 opacity-30" />
-                  <p className="text-sm">
-                    Select a group and file to view its contents
-                  </p>
-                  <p className="text-xs mt-1 opacity-60">
-                    Or use the search above to find specific information
-                  </p>
-                </div>
-              )}
-            </ScrollArea>
+                <ScrollArea className="h-[600px]">
+                  <pre className="p-6 text-sm text-foreground whitespace-pre-wrap font-mono leading-relaxed">
+                    {fileContent}
+                  </pre>
+                </ScrollArea>
+              )
+            ) : (
+              <div className="flex flex-col items-center justify-center py-12 text-muted-foreground">
+                <Brain className="h-12 w-12 mb-4 opacity-30" />
+                <p className="text-sm">
+                  Select a group and file to view its contents
+                </p>
+                <p className="text-xs mt-1 opacity-60">
+                  Or use the search above to find specific information
+                </p>
+              </div>
+            )}
           </CardContent>
         </Card>
       </div>

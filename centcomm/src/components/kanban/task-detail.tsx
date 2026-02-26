@@ -17,6 +17,7 @@ import {
   CheckCircle2,
   AlertTriangle,
   Loader2,
+  Pencil,
 } from "lucide-react";
 import type { KanbanTask } from "./task-card";
 
@@ -35,9 +36,10 @@ interface TaskDetailProps {
   open: boolean;
   onClose: () => void;
   onAction: (taskId: string, action: "pause" | "resume" | "cancel") => void;
+  onEdit?: (task: KanbanTask) => void;
 }
 
-export function TaskDetail({ task, open, onClose, onAction }: TaskDetailProps) {
+export function TaskDetail({ task, open, onClose, onAction, onEdit }: TaskDetailProps) {
   const [logs, setLogs] = useState<TaskRunLog[]>([]);
   const [loadingLogs, setLoadingLogs] = useState(false);
 
@@ -108,6 +110,18 @@ export function TaskDetail({ task, open, onClose, onAction }: TaskDetailProps) {
 
           {/* Actions */}
           <div className="flex gap-2">
+            {onEdit && (task.status === "active" || task.status === "paused") && (
+              <button
+                onClick={() => {
+                  onClose();
+                  onEdit(task);
+                }}
+                className="flex items-center gap-1.5 rounded-md bg-electric/10 border border-electric/20 px-3 py-1.5 text-sm text-electric hover:bg-electric/20 transition-colors"
+              >
+                <Pencil className="h-3.5 w-3.5" />
+                Edit
+              </button>
+            )}
             {task.status === "active" && (
               <button
                 onClick={() => onAction(task.id, "pause")}

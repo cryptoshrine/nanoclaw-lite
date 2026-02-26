@@ -103,6 +103,24 @@ export function cancelTask(taskId: string, groupFolder = "main"): string {
   return writeGroupIpcFile(groupFolder, "tasks", filename, data);
 }
 
+export interface EditTaskParams {
+  task_id: string;
+  prompt?: string;
+  schedule_type?: "cron" | "interval" | "once";
+  schedule_value?: string;
+  context_mode?: "group" | "isolated";
+}
+
+export function editTask(params: EditTaskParams, groupFolder = "main"): string {
+  const filename = `edit_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.json`;
+  const data = {
+    type: "edit_task",
+    ...params,
+    created_at: new Date().toISOString(),
+  };
+  return writeGroupIpcFile(groupFolder, "tasks", filename, data);
+}
+
 // ── Message operations ──────────────────────────────────────────────────
 
 export interface SendMessageParams {
