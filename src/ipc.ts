@@ -193,6 +193,8 @@ export async function processTaskIpc(
     groupFolder?: string;
     chatJid?: string;
     targetJid?: string;
+    // For edit_task
+    task_id?: string;
     // For register_group
     jid?: string;
     name?: string;
@@ -371,6 +373,77 @@ export async function processTaskIpc(
         }
       }
       break;
+
+    case 'edit_task': {
+      const editTaskId = data.taskId || data.task_id;
+      if (editTaskId) {
+        const task = getTaskById(editTaskId);
+        if (task && (isMain || task.group_folder === sourceGroup)) {
+          const updates: Parameters<typeof updateTask>[1] = {};
+
+          if (data.prompt !== undefined) updates.prompt = data.prompt;
+          if (data.context_mode !== undefined) updates.context_mode = data.context_mode;
+
+          // Handle schedule changes — recalculate next_run
+          const newScheduleType = data.schedule_type || task.schedule_type;
+          const newScheduleValue = data.schedule_value || task.schedule_value;
+          const scheduleChanged = data.schedule_type !== undefined || data.schedule_value !== undefined;
+
+          if (data.schedule_type !== undefined) updates.schedule_type = data.schedule_type;
+          if (data.schedule_value !== undefined) updates.schedule_value = data.schedule_value;
+
+          if (scheduleChanged && task.status === 'active') {
+            // Recalculate next_run based on new schedule
+            if (newScheduleType === 'cron') {
+              try {
+                const interval = CronExpressionParser.parse(newScheduleValue, {
+                  tz: TIMEZONE,
+                });
+                updates.next_run = interval.next().toISOString();
+              } catch {
+                logger.warn(
+                  { scheduleValue: newScheduleValue, taskId: editTaskId },
+                  'Invalid cron expression in edit_task',
+                );
+                break;
+              }
+            } else if (newScheduleType === 'interval') {
+              const ms = parseInt(newScheduleValue, 10);
+              if (isNaN(ms) || ms <= 0) {
+                logger.warn(
+                  { scheduleValue: newScheduleValue, taskId: editTaskId },
+                  'Invalid interval in edit_task',
+                );
+                break;
+              }
+              updates.next_run = new Date(Date.now() + ms).toISOString();
+            } else if (newScheduleType === 'once') {
+              const scheduled = new Date(newScheduleValue);
+              if (isNaN(scheduled.getTime())) {
+                logger.warn(
+                  { scheduleValue: newScheduleValue, taskId: editTaskId },
+                  'Invalid timestamp in edit_task',
+                );
+                break;
+              }
+              updates.next_run = scheduled.toISOString();
+            }
+          }
+
+          updateTask(editTaskId, updates);
+          logger.info(
+            { taskId: editTaskId, sourceGroup, updates: Object.keys(updates) },
+            'Task edited via IPC',
+          );
+        } else {
+          logger.warn(
+            { taskId: editTaskId, sourceGroup },
+            'Unauthorized task edit attempt',
+          );
+        }
+      }
+      break;
+    }
 
     case 'refresh_groups':
       // Only main group can request a refresh
