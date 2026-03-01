@@ -28,6 +28,7 @@ import { SortableTask } from "@/components/kanban/sortable-task";
 import { TaskCard, type KanbanTask } from "@/components/kanban/task-card";
 import { TaskDetail } from "@/components/kanban/task-detail";
 import { CreateTaskDialog } from "@/components/kanban/create-task-dialog";
+import { EditTaskDialog } from "@/components/kanban/edit-task-dialog";
 import {
   DevTaskCard,
   type DevTask,
@@ -163,6 +164,8 @@ export default function KanbanPage() {
   const [detailOpen, setDetailOpen] = useState(false);
   const [devDetailOpen, setDevDetailOpen] = useState(false);
   const [createOpen, setCreateOpen] = useState(false);
+  const [editTask, setEditTask] = useState<KanbanTask | null>(null);
+  const [editOpen, setEditOpen] = useState(false);
   const [groupFilter, setGroupFilter] = useState("all");
   const [filters, setFilters] = useState<SearchFiltersState>(defaultFilters);
 
@@ -244,6 +247,26 @@ export default function KanbanPage() {
       toast(`Task ${actionLabels[action]}`, "success");
     } catch {
       toast("Failed to update task", "error");
+    }
+  }
+
+  // ── Edit scheduled task ──
+  function handleEdit(task: KanbanTask) {
+    setEditTask(task);
+    setEditOpen(true);
+  }
+
+  async function handleEditSave(taskId: string, updates: Record<string, string>) {
+    try {
+      await fetch(`/api/tasks/${taskId}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "edit", ...updates }),
+      });
+      toast("Task edit submitted", "success");
+      setTimeout(loadData, 2000);
+    } catch {
+      toast("Failed to edit task", "error");
     }
   }
 
@@ -602,6 +625,7 @@ export default function KanbanPage() {
                             setDetailOpen(true);
                           }}
                           onAction={handleAction}
+                          onEdit={handleEdit}
                         />
                       </SortableTask>
                     ) : (
@@ -613,6 +637,7 @@ export default function KanbanPage() {
                             setDetailOpen(true);
                           }}
                           onAction={handleAction}
+                          onEdit={handleEdit}
                         />
                       </div>
                     );
@@ -652,6 +677,7 @@ export default function KanbanPage() {
           setSelectedTask(null);
         }}
         onAction={handleAction}
+        onEdit={handleEdit}
       />
 
       {/* Dev task detail dialog */}
@@ -706,6 +732,17 @@ export default function KanbanPage() {
         onCreated={() => {
           setTimeout(loadData, 2000);
         }}
+      />
+
+      {/* Edit task dialog */}
+      <EditTaskDialog
+        task={editTask}
+        open={editOpen}
+        onClose={() => {
+          setEditOpen(false);
+          setEditTask(null);
+        }}
+        onSave={handleEditSave}
       />
     </div>
   );

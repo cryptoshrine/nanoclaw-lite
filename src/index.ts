@@ -61,8 +61,19 @@ import {
 import { NewMessage, RegisteredGroup, Session, TeamTask } from './types.js';
 import { loadJson, saveJson } from './utils.js';
 import { logger } from './logger.js';
-import { startDiscordPipeline } from './discord-pipeline.js';
+import {
+  startDiscordPipeline,
+  getKlawClient,
+  setDirectLineCallback,
+  setGeneralOpsChannel,
+  addInteractiveChannels,
+  sendToGeneralOps,
+  sendToDiscordChannel,
+  getActiveDiscordChannelId,
+} from './discord-pipeline.js';
 import { wireDiscordCallbacks } from './discord-callbacks.js';
+import { initExtendedChannels, postToAgentLine, type AgentLine } from './discord-channels.js';
+import { transcribeVoiceMessage } from './transcription.js';
 
 let bot: Bot;
 let botUserId: number | undefined;
@@ -236,7 +247,19 @@ async function processMessage(msg: NewMessage): Promise<void> {
 
   if (response) {
     lastAgentTimestamp[msg.chat_jid] = msg.timestamp;
-    await sendMessage(msg.chat_jid, `${ASSISTANT_NAME}: ${response}`);
+    const fullResponse = `${ASSISTANT_NAME}: ${response}`;
+    await sendMessage(msg.chat_jid, fullResponse);
+    // Store agent response in DB so CENTCOMM chat can see it
+    // (Telegram private chats don't echo bot's own messages back)
+    storeMessage({
+      id: `agent-resp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      chatJid: msg.chat_jid,
+      sender: ASSISTANT_NAME,
+      senderName: ASSISTANT_NAME,
+      content: fullResponse,
+      timestamp: new Date().toISOString(),
+      isFromMe: true,
+    });
   }
 }
 
@@ -244,6 +267,7 @@ async function runAgent(
   group: RegisteredGroup,
   prompt: string,
   chatJid: string,
+  options?: { sourceChannel?: 'telegram' | 'discord' },
 ): Promise<string | null> {
   const isMain = group.folder === MAIN_GROUP_FOLDER;
   const sessionId = sessions[group.folder];
@@ -284,6 +308,7 @@ async function runAgent(
       groupFolder: group.folder,
       chatJid,
       isMain,
+      sourceChannel: options?.sourceChannel,
     });
 
     if (output.sessionCleared) {
@@ -505,6 +530,22 @@ function startIpcWatcher(): void {
                       { memberId, chatJid: targetJid, sender: senderLabel },
                       'Teammate message sent to Telegram',
                     );
+
+                    // Route to Discord agent line channel
+                    const agentLineMap: Record<string, AgentLine> = {
+                      'dev': 'dev-agent',
+                      'research': 'research-agent',
+                      'copywriter': 'copywriter-agent',
+                    };
+                    const senderLower = senderLabel.toLowerCase();
+                    for (const [keyword, agentLine] of Object.entries(agentLineMap)) {
+                      if (senderLower.includes(keyword)) {
+                        postToAgentLine(agentLine, data.text, true).catch((err) =>
+                          logger.error({ err, agentLine }, 'Failed to post to Discord agent line'),
+                        );
+                        break;
+                      }
+                    }
                   }
                 }
                 fs.unlinkSync(filePath);
@@ -547,11 +588,22 @@ function startIpcWatcher(): void {
                   (targetGroup && targetGroup.folder === sourceGroup)
                 ) {
                   const isSteering = data.source === 'centcomm-steering';
+                  const isDiscord = data.sourceChannel === 'discord';
                   const messageText = isSteering ? data.text : `${ASSISTANT_NAME}: ${data.text}`;
                   const messageId = `ipc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
                   const timestamp = data.timestamp || new Date().toISOString();
 
-                  await sendMessage(data.chatJid, messageText);
+                  if (isDiscord) {
+                    // Route to the Discord channel that triggered this session
+                    const targetChannelId = data.discordChannelId || getActiveDiscordChannelId();
+                    await sendToDiscordChannel(data.text, targetChannelId || undefined);
+                    logger.info(
+                      { chatJid: data.chatJid, sourceGroup, discordChannel: targetChannelId },
+                      'IPC message routed to Discord',
+                    );
+                  } else {
+                    await sendMessage(data.chatJid, messageText);
+                  }
 
                   storeMessage({
                     id: messageId,
@@ -564,7 +616,7 @@ function startIpcWatcher(): void {
                   });
 
                   logger.info(
-                    { chatJid: data.chatJid, sourceGroup, stored: true, isSteering },
+                    { chatJid: data.chatJid, sourceGroup, stored: true, isSteering, isDiscord },
                     'IPC message sent and stored',
                   );
                 } else {
@@ -1240,6 +1292,24 @@ function connectTelegram(): void {
       }
     }
 
+    // Handle voice messages
+    if (msg.voice && registeredGroups[jid]) {
+      try {
+        const transcript = await transcribeVoiceMessage(bot, msg.voice);
+        const caption = msg.caption || '';
+        content = caption
+          ? `${caption}\n\n[Voice: ${transcript}]`
+          : `[Voice: ${transcript}]`;
+        logger.info(
+          { chatId, duration: msg.voice.duration, chars: transcript.length },
+          'Voice message transcribed',
+        );
+      } catch (err) {
+        logger.error({ err, chatId }, 'Voice transcription failed');
+        content = '[Voice Message - transcription failed]';
+      }
+    }
+
     if (!content) return;
 
     if (registeredGroups[jid]) {
@@ -1531,9 +1601,90 @@ async function main(): Promise<void> {
 
   // Wire Discord pipeline callbacks then start the pipeline
   wireDiscordCallbacks();
-  startDiscordPipeline().catch((err) => {
-    logger.error({ err }, 'Discord pipeline failed to start (non-fatal)');
-  });
+
+  // Wire direct line: interactive Discord channels → agent → Discord response
+  const generalOpsId = process.env.DISCORD_CHANNEL_GENERAL;
+  if (generalOpsId) {
+    setGeneralOpsChannel(generalOpsId);
+
+    // Register Ideas channels as interactive (two-way)
+    const ideasChannels = [
+      process.env.DISCORD_CHANNEL_PIKA_TAMAGOTCHI,
+      process.env.DISCORD_CHANNEL_SPORTS_PERP,
+    ].filter(Boolean) as string[];
+    if (ideasChannels.length > 0) {
+      addInteractiveChannels(ideasChannels);
+      logger.info({ ideasChannels }, 'Ideas channels registered as interactive');
+    }
+
+    setDirectLineCallback(async (text: string, author: string, _channelId: string) => {
+      // Find the main group
+      const mainEntry = Object.entries(registeredGroups).find(
+        ([, g]) => g.folder === MAIN_GROUP_FOLDER,
+      );
+      if (!mainEntry) return null;
+      const [mainJid, mainGroup] = mainEntry;
+
+      // Store the Discord message in our DB so it shows in history
+      const msgId = `discord-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const timestamp = new Date().toISOString();
+      storeMessage({
+        id: msgId,
+        chatJid: mainJid,
+        sender: author,
+        senderName: author,
+        content: text,
+        timestamp,
+        isFromMe: false,
+      });
+
+      // Mark as processed so the message loop doesn't pick it up and send to Telegram
+      const dedupKey = `${msgId}:${mainJid}`;
+      processedMessageIds.add(dedupKey);
+      inFlightMessages.add(dedupKey);
+
+      // Format and run through the agent (same as Telegram message processing)
+      const prompt = `<messages>\n<message sender="${author}" time="${timestamp}">${text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</message>\n</messages>`;
+      const rawResponse = await runAgent(mainGroup, prompt, mainJid, { sourceChannel: 'discord' });
+
+      // Strip <internal> and <handoff> tags — only return user-facing content
+      const response = rawResponse
+        ? rawResponse
+            .replace(/<internal>[\s\S]*?<\/internal>/g, '')
+            .replace(/<handoff>[\s\S]*?<\/handoff>/g, '')
+            .trim()
+        : null;
+
+      // Store the response
+      if (rawResponse) {
+        storeMessage({
+          id: `discord-resp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          chatJid: mainJid,
+          sender: ASSISTANT_NAME,
+          senderName: ASSISTANT_NAME,
+          content: rawResponse,
+          timestamp: new Date().toISOString(),
+          isFromMe: true,
+        });
+      }
+
+      inFlightMessages.delete(dedupKey);
+      return response || null;
+    });
+    logger.info('Discord direct line wired: #general-ops → agent');
+  }
+
+  startDiscordPipeline()
+    .then(() => {
+      // Initialize extended channels using the Klaw bot client
+      const klawClient = getKlawClient();
+      if (klawClient) {
+        initExtendedChannels(klawClient);
+      }
+    })
+    .catch((err) => {
+      logger.error({ err }, 'Discord pipeline failed to start (non-fatal)');
+    });
 }
 
 main().catch((err) => {

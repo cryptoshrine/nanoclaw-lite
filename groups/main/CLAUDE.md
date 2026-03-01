@@ -43,6 +43,48 @@ DELIVER: Use send_message to report results. Save detailed output to files.
 - `specialists/ball-ai-research.md` — Research & analysis
 - `specialists/ball-ai-marketing.md` — Marketing strategy
 - `specialists/ball-ai-copywriter.md` — Content creation
+- `specialists/adversarial-review.md` — Adversarial code review specialist
+
+**Context files** (specialists auto-load these):
+- `specialists/ball-ai-context.md` — Project constitution (tech stack, ADRs, conventions)
+
+**Step-file workflows** (for complex delegated tasks):
+- `specialists/workflows/complex-feature.md` — Research → Plan → Implement → Test → Review
+- `specialists/workflows/bug-investigation.md` — Reproduce → Diagnose → Fix → Verify → Document
+- `specialists/workflows/README.md` — When and how to use workflows
+
+### Step-File Workflows (For Complex Tasks)
+
+When a coding task is complex (3+ files, unknown root cause, architectural changes), include a step-file workflow in the specialist prompt. This forces disciplined execution instead of ad-hoc coding.
+
+**When to use:**
+- Complex features → `specialists/workflows/complex-feature.md`
+- Bugs with unknown root cause → `specialists/workflows/bug-investigation.md`
+- Simple bug fixes with known cause → Skip workflow, use direct PIV loop
+
+**How to include in prompt:**
+```
+Read the specialist profile at specialists/ball-ai-dev.md first.
+Read the project context at specialists/ball-ai-context.md.
+Follow the step-file workflow at specialists/workflows/complex-feature.md.
+
+TASK: [specific task]
+```
+
+The specialist will execute one step at a time and report progress via `send_message`.
+
+### Adversarial Code Review
+
+For important changes (new features, security-sensitive code, architectural changes), spawn an adversarial reviewer after the dev specialist finishes:
+
+```
+Read specialists/adversarial-review.md.
+
+REVIEW: [commit hash or file list]
+CONTEXT: [what was changed and why]
+```
+
+The reviewer's job is to FIND PROBLEMS, not approve. They must find at least 3 actionable items or explicitly justify why the code is clean.
 
 ### Error Handling
 
@@ -141,6 +183,70 @@ When you learn something important:
 - Create files for structured data (e.g., `customers.md`, `preferences.md`)
 - Split files larger than 500 lines into folders
 - Keep an index in your memory for the files you create
+
+## Session Handoff (MANDATORY)
+
+Every session — Telegram, Discord, scheduled task — MUST end with a `<handoff>` block. This is how you pass context to your future self across sessions and channels. Without it, the next session starts blind.
+
+**At the END of every response (your final output), include:**
+
+```
+<handoff>
+topic: [2-5 word summary of what this session was about]
+status: [completed | in-progress | blocked]
+summary: [1-2 sentences of what happened]
+pending: [what still needs to be done, if anything]
+next_step: [the very next action to take]
+active_threads: [list any active/ files created or updated]
+</handoff>
+```
+
+**Rules:**
+1. ALWAYS include this block. No exceptions. Even for quick one-line answers.
+2. The system parses this automatically — it gets written to the daily log so your next session has full context.
+3. Keep it concise but specific. "Working on stuff" is useless. "Recording demo videos for X — backend needs restart, then record 4 queries" is useful.
+4. For quick Q&A sessions, the handoff can be minimal: `topic: quick question | status: completed | summary: Answered timezone question | pending: none | next_step: none`
+
+## Active Work Threads
+
+For multi-step work that spans sessions, use the `active/` folder. Files here are loaded into your context at session start.
+
+**When to create/update:**
+- Starting a multi-step project (not a quick question)
+- Making decisions that future sessions need to know
+- When work is in-progress and will continue next session
+
+**When to delete:**
+- When the work is complete and there's nothing pending
+
+**Format:** `active/{descriptive-name}.md`
+
+```markdown
+# Recording Demo Videos for X
+
+Status: in-progress
+Started: 2026-02-25
+Last updated: 2026-02-25 14:30
+
+## Context
+Building first batch of X content using demo recorder + Remotion pipeline.
+
+## Current State
+- Demo recorder script built and tested (scripts/record-demo.mjs)
+- Backend needs restart (PID 5292 returning 500s)
+- Frontend is up on :5173
+
+## Pending
+- [ ] Restart Ball-AI backend
+- [ ] Record 4 demo videos with impressive queries
+- [ ] Render 2-3 match recap videos via Remotion
+
+## Decisions Made
+- Using Playwright recorder for UI demos, Remotion for match recaps
+- Queries picked: [list them]
+```
+
+**Reading active threads:** At session start, check `active/` for any in-progress work. Reference it in your responses when relevant.
 
 ## Telegram Formatting
 

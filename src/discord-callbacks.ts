@@ -315,7 +315,8 @@ You MUST output valid JSON only. No markdown, no commentary, no backticks.
 
 ### tweetText rules:
 - Single tweet: under 280 characters
-- Thread: separate tweets with --- (each under 280 chars, max 6 tweets)
+- Thread: separate tweets with --- on its own line (EACH tweet MUST be under 280 chars, max 6 tweets)
+- CRITICAL: Count characters for EACH tweet in a thread separately. Every segment between --- markers must be under 280 chars. This is the #1 cause of publishing failures.
 - If including a visualization, write the tweet to reference it: "Here's what that looks like ↓" or "The data speaks for itself" etc.
 
 ### visualization field:
@@ -907,7 +908,11 @@ function createPublishCallback() {
   );
 
   return async (draft: ContentDraft): Promise<string | null> => {
-    logger.info({ charCount: draft.tweetText.length }, 'Publishing tweet to X');
+    const isThread = draft.tweetText.includes('---');
+    logger.info(
+      { charCount: draft.tweetText.length, isThread },
+      isThread ? 'Publishing thread to X' : 'Publishing tweet to X',
+    );
 
     const args = ['--text', draft.tweetText];
     if (draft.imagePath) {
@@ -919,7 +924,7 @@ function createPublishCallback() {
         'node',
         [scriptPath, ...args],
         {
-          timeout: 60_000,
+          timeout: isThread ? 120_000 : 60_000, // threads need more time for chained replies
           cwd: PROJECT_ROOT,
           env: process.env as Record<string, string>,
         },
@@ -935,9 +940,23 @@ function createPublishCallback() {
 
           // Parse JSON output from the script
           try {
-            const result = JSON.parse(stdout);
+            // Find the last JSON line (script logs progress before the final JSON)
+            const lines = stdout.trim().split('\n');
+            let jsonStr = '';
+            for (let i = lines.length - 1; i >= 0; i--) {
+              const trimmed = lines[i].trim();
+              if (trimmed.startsWith('{')) { jsonStr = trimmed; break; }
+            }
+            const result = JSON.parse(jsonStr || stdout);
             if (result.success && result.url) {
-              logger.info({ url: result.url }, 'Publish: tweet posted');
+              if (result.isThread) {
+                logger.info(
+                  { url: result.url, tweetCount: result.tweetCount },
+                  'Publish: thread posted',
+                );
+              } else {
+                logger.info({ url: result.url }, 'Publish: tweet posted');
+              }
               resolve(result.url);
             } else {
               logger.warn({ stdout: stdout.slice(0, 300) }, 'Publish: unexpected output');

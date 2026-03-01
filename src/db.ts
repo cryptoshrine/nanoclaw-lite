@@ -114,6 +114,35 @@ export function initDatabase(): void {
     /* column already exists */
   }
 
+  // Discord draft persistence (survives restarts)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS discord_drafts (
+      message_id TEXT PRIMARY KEY,
+      tweet_text TEXT NOT NULL,
+      image_path TEXT,
+      research_context TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+  `);
+
+  // Post queue — approved tweets awaiting publishing
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS post_queue (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      tweet_text TEXT NOT NULL,
+      image_path TEXT,
+      research_context TEXT,
+      status TEXT NOT NULL DEFAULT 'pending',
+      approved_by TEXT,
+      approved_at TEXT NOT NULL,
+      published_at TEXT,
+      tweet_url TEXT,
+      retry_count INTEGER NOT NULL DEFAULT 0,
+      last_error TEXT,
+      discord_approved_msg_id TEXT
+    );
+  `);
+
   // Memory system tables
   initMemorySchema(db);
 
@@ -776,6 +805,93 @@ export function markTeamMessagesRead(
      SET read = 1
      WHERE team_id = ? AND id <= ? AND (to_member IS NULL OR to_member = ?)`,
   ).run(teamId, upToId, memberId);
+}
+
+// ============ Discord Draft Persistence ============
+
+export interface DiscordDraft {
+  message_id: string;
+  tweet_text: string;
+  image_path: string | null;
+  research_context: string;
+  created_at: string;
+}
+
+export function saveDraft(messageId: string, tweetText: string, imagePath: string | undefined, researchContext: string): void {
+  db.prepare(
+    `INSERT OR REPLACE INTO discord_drafts (message_id, tweet_text, image_path, research_context, created_at)
+     VALUES (?, ?, ?, ?, ?)`,
+  ).run(messageId, tweetText, imagePath || null, researchContext, new Date().toISOString());
+}
+
+export function getDraft(messageId: string): DiscordDraft | undefined {
+  return db.prepare('SELECT * FROM discord_drafts WHERE message_id = ?').get(messageId) as DiscordDraft | undefined;
+}
+
+export function deleteDraft(messageId: string): void {
+  db.prepare('DELETE FROM discord_drafts WHERE message_id = ?').run(messageId);
+}
+
+// ── Post Queue ────────────────────────────────────────────────────────────────
+
+export interface PostQueueItem {
+  id: number;
+  tweet_text: string;
+  image_path: string | null;
+  research_context: string | null;
+  status: string;
+  approved_by: string | null;
+  approved_at: string;
+  published_at: string | null;
+  tweet_url: string | null;
+  retry_count: number;
+  last_error: string | null;
+  discord_approved_msg_id: string | null;
+}
+
+export function enqueuePost(
+  tweetText: string,
+  imagePath: string | undefined,
+  researchContext: string | undefined,
+  approvedBy: string,
+  discordMsgId?: string,
+): number {
+  const result = db.prepare(
+    `INSERT INTO post_queue (tweet_text, image_path, research_context, approved_by, approved_at, discord_approved_msg_id)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+  ).run(tweetText, imagePath || null, researchContext || null, approvedBy, new Date().toISOString(), discordMsgId || null);
+  return Number(result.lastInsertRowid);
+}
+
+export function getPendingPosts(): PostQueueItem[] {
+  return db.prepare(
+    `SELECT * FROM post_queue WHERE status = 'pending' AND retry_count < 3 ORDER BY approved_at ASC`,
+  ).all() as PostQueueItem[];
+}
+
+export function markPostPublished(id: number, tweetUrl: string): void {
+  db.prepare(
+    `UPDATE post_queue SET status = 'published', published_at = ?, tweet_url = ? WHERE id = ?`,
+  ).run(new Date().toISOString(), tweetUrl, id);
+}
+
+export function markPostFailed(id: number, error: string): void {
+  db.prepare(
+    `UPDATE post_queue SET retry_count = retry_count + 1, last_error = ?,
+     status = CASE WHEN retry_count + 1 >= 3 THEN 'failed' ELSE 'pending' END
+     WHERE id = ?`,
+  ).run(error, id);
+}
+
+export function getQueueStats(): { pending: number; published: number; failed: number } {
+  const row = db.prepare(`
+    SELECT
+      SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending,
+      SUM(CASE WHEN status = 'published' THEN 1 ELSE 0 END) as published,
+      SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed
+    FROM post_queue
+  `).get() as { pending: number; published: number; failed: number } | undefined;
+  return row || { pending: 0, published: 0, failed: 0 };
 }
 
 // Cleanup

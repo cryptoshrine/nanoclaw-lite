@@ -351,12 +351,12 @@ export default function MemoryPage() {
 
         {/* Right: File content viewer/editor */}
         <Card className="border-border bg-card lg:col-span-3">
-          <CardHeader className="pb-3">
-            <CardTitle className="flex items-center justify-between">
-              <span className="flex items-center gap-2 text-sm font-medium text-muted-foreground">
-                <FileText className="h-4 w-4" />
+          <CardHeader className="pb-3 sticky top-0 z-10 bg-card border-b border-border rounded-t-lg">
+            <div className="flex items-center justify-between">
+              <span className="flex items-center gap-2 text-sm font-medium text-muted-foreground min-w-0">
+                <FileText className="h-4 w-4 shrink-0" />
                 {activeFile ? (
-                  <span className="font-mono">
+                  <span className="font-mono truncate">
                     {selectedGroup}/{activeFile}
                   </span>
                 ) : (
@@ -366,17 +366,17 @@ export default function MemoryPage() {
 
               {/* Editor controls */}
               {activeFile && (
-                <div className="flex items-center gap-2">
+                <div className="flex items-center gap-2 shrink-0 ml-4">
                   {/* Save status indicator */}
                   {saveStatus === "success" && (
-                    <span className="flex items-center gap-1 text-[10px] text-success">
-                      <CheckCircle2 className="h-3 w-3" />
+                    <span className="flex items-center gap-1 text-xs text-success">
+                      <CheckCircle2 className="h-3.5 w-3.5" />
                       Saved
                     </span>
                   )}
                   {saveStatus === "error" && (
-                    <span className="flex items-center gap-1 text-[10px] text-alert">
-                      <AlertTriangle className="h-3 w-3" />
+                    <span className="flex items-center gap-1 text-xs text-alert">
+                      <AlertTriangle className="h-3.5 w-3.5" />
                       Save failed
                     </span>
                   )}
@@ -388,45 +388,39 @@ export default function MemoryPage() {
                           setEditing(false);
                           setEditContent(fileContent);
                         }}
-                        className="flex items-center gap-1 rounded-md border border-border px-2 py-1 text-[10px] text-muted-foreground hover:bg-muted transition-colors"
+                        className="flex items-center gap-1.5 rounded-md border border-border px-3 py-1.5 text-xs text-muted-foreground hover:bg-muted transition-colors"
                       >
-                        <X className="h-3 w-3" />
+                        <X className="h-3.5 w-3.5" />
                         Cancel
                       </button>
                       <button
                         onClick={saveFile}
                         disabled={saving || !hasChanges}
-                        className="flex items-center gap-1 rounded-md border border-electric/20 bg-electric/10 px-2 py-1 text-[10px] text-electric hover:bg-electric/20 transition-colors disabled:opacity-50"
+                        className="flex items-center gap-1.5 rounded-md border border-electric/20 bg-electric/10 px-3 py-1.5 text-xs text-electric hover:bg-electric/20 transition-colors disabled:opacity-50"
                       >
                         {saving ? (
-                          <Loader2 className="h-3 w-3 animate-spin" />
+                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
                         ) : (
-                          <Save className="h-3 w-3" />
+                          <Save className="h-3.5 w-3.5" />
                         )}
                         Save
                       </button>
                     </>
                   ) : (
-                    <>
-                      <button
-                        onClick={() => {
-                          setEditing(true);
-                          setEditContent(fileContent);
-                        }}
-                        className="flex items-center gap-1 rounded-md border border-electric/20 bg-electric/5 px-2 py-1 text-[10px] text-electric hover:bg-electric/15 transition-colors"
-                      >
-                        <Pencil className="h-3 w-3" />
-                        Edit
-                      </button>
-                      <span className="flex items-center gap-1 text-[10px] text-muted-foreground">
-                        <Eye className="h-3 w-3" />
-                        View
-                      </span>
-                    </>
+                    <button
+                      onClick={() => {
+                        setEditing(true);
+                        setEditContent(fileContent);
+                      }}
+                      className="flex items-center gap-1.5 rounded-md border border-electric/30 bg-electric/10 px-3 py-1.5 text-xs font-medium text-electric hover:bg-electric/20 transition-colors"
+                    >
+                      <Pencil className="h-3.5 w-3.5" />
+                      Edit
+                    </button>
                   )}
                 </div>
               )}
-            </CardTitle>
+            </div>
           </CardHeader>
           <CardContent className="p-0">
             {loadingContent ? (

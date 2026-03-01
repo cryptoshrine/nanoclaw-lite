@@ -42,6 +42,7 @@ export interface ContainerInput {
   chatJid: string;
   isMain: boolean;
   isScheduledTask?: boolean;
+  sourceChannel?: 'telegram' | 'discord';
 }
 
 export interface ContainerOutput {

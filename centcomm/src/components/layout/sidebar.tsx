@@ -13,6 +13,7 @@ import {
   TrendingUp,
   BookOpen,
   Inbox,
+  MessageSquare,
   ChevronLeft,
   ChevronRight,
 } from "lucide-react";
@@ -21,6 +22,7 @@ import { useState } from "react";
 
 const navItems = [
   { href: "/", label: "Dashboard", icon: LayoutDashboard },
+  { href: "/chat", label: "Chat", icon: MessageSquare },
   { href: "/live", label: "Live", icon: Radio },
   { href: "/agents", label: "Agents", icon: Bot },
   { href: "/memory", label: "Memory Vault", icon: Brain },

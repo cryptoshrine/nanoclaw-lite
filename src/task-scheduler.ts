@@ -21,6 +21,11 @@ import {
 } from './db.js';
 import { logger } from './logger.js';
 import { RegisteredGroup, ScheduledTask } from './types.js';
+import {
+  postDailyDigest,
+  postToProject,
+  postToMissionControl,
+} from './discord-channels.js';
 
 export interface SchedulerDependencies {
   sendMessage: (jid: string, text: string) => Promise<void>;
@@ -208,6 +213,25 @@ async function runTask(
 
   const resultSummary = result ? result.slice(0, 200) : 'Completed';
   updateTaskAfterRun(task.id, nextRun, resultSummary);
+
+  // Route task results to Discord channels based on prompt content
+  if (result) {
+    const promptLower = task.prompt.toLowerCase();
+    try {
+      if (promptLower.includes('heartbeat') || promptLower.includes('morning brief') || promptLower.includes('daily digest')) {
+        postDailyDigest(result).catch((err) =>
+          logger.error({ err }, 'Failed to post daily digest to Discord'),
+        );
+      }
+      if (promptLower.includes('bet value') || promptLower.includes('betting') || promptLower.includes('oddsportal')) {
+        postToProject('betting-signals', 'Betting Pipeline Result', result).catch((err) =>
+          logger.error({ err }, 'Failed to post betting signals to Discord'),
+        );
+      }
+    } catch (err) {
+      logger.error({ err }, 'Error routing task result to Discord');
+    }
+  }
 }
 
 export function startSchedulerLoop(deps: SchedulerDependencies): void {

@@ -27,6 +27,7 @@ interface ContainerInput {
   chatJid: string;
   isMain: boolean;
   isScheduledTask?: boolean;
+  sourceChannel?: 'telegram' | 'discord';
   secrets?: Record<string, string>;
 }
 
@@ -280,6 +281,28 @@ function buildMemoryContext(groupDir: string): string | null {
     addPart('Daily Log (Yesterday)', yesterdayLog);
   }
 
+  // Active work threads — files in active/ that track in-progress multi-session work
+  const activeDir = path.join(groupDir, 'active');
+  if (fs.existsSync(activeDir)) {
+    try {
+      const activeFiles = fs.readdirSync(activeDir).filter(f => f.endsWith('.md'));
+      if (activeFiles.length > 0) {
+        const threadParts: string[] = [];
+        for (const file of activeFiles.slice(0, 5)) { // Cap at 5 active threads
+          const content = readFileSafe(path.join(activeDir, file), 2000);
+          if (content) {
+            threadParts.push(`### ${file}\n${content}`);
+          }
+        }
+        if (threadParts.length > 0) {
+          addPart('Active Work Threads', threadParts.join('\n\n'));
+        }
+      }
+    } catch {
+      // Non-fatal — active/ may not exist yet
+    }
+  }
+
   if (parts.length === 0) return null;
 
   return `\n\n# Injected Memory Context\nThe following memory files were loaded from your group directory at session start. Use this context to maintain continuity across sessions.\n\n${parts.join('\n\n')}`;
@@ -362,6 +385,30 @@ function appendToDevLog(projectDir: string, entry: string): void {
   } catch (err) {
     log(`Failed to append to DEVLOG: ${err instanceof Error ? err.message : String(err)}`);
   }
+}
+
+/**
+ * Parse a <handoff> block from agent output.
+ * Returns structured fields or null if no handoff found.
+ */
+function parseHandoff(text: string): Record<string, string> | null {
+  const match = text.match(/<handoff>([\s\S]*?)<\/handoff>/i);
+  if (!match) return null;
+
+  const block = match[1];
+  const fields: Record<string, string> = {};
+
+  for (const line of block.split('\n')) {
+    const colonIdx = line.indexOf(':');
+    if (colonIdx === -1) continue;
+    const key = line.slice(0, colonIdx).trim().toLowerCase().replace(/\s+/g, '_');
+    const value = line.slice(colonIdx + 1).trim();
+    if (key && value) {
+      fields[key] = value;
+    }
+  }
+
+  return Object.keys(fields).length > 0 ? fields : null;
 }
 
 function sanitizeFilename(summary: string): string {
@@ -516,7 +563,7 @@ async function runQuery(
   containerInput: ContainerInput,
   sdkEnv: Record<string, string | undefined>,
   resumeAt?: string,
-): Promise<{ newSessionId?: string; lastAssistantUuid?: string; closedDuringQuery: boolean }> {
+): Promise<{ newSessionId?: string; lastAssistantUuid?: string; closedDuringQuery: boolean; lastResultText?: string }> {
   const stream = new MessageStream();
   stream.push(prompt);
 
@@ -543,6 +590,7 @@ async function runQuery(
 
   let newSessionId: string | undefined;
   let lastAssistantUuid: string | undefined;
+  let lastResultText: string | undefined;
   let messageCount = 0;
   let resultCount = 0;
 
@@ -627,6 +675,7 @@ async function runQuery(
             NANOCLAW_CHAT_JID: containerInput.chatJid,
             NANOCLAW_GROUP_FOLDER: containerInput.groupFolder,
             NANOCLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
+            NANOCLAW_SOURCE_CHANNEL: containerInput.sourceChannel || 'telegram',
           },
         },
         ...externalMcpServers,
@@ -658,6 +707,7 @@ async function runQuery(
     if (message.type === 'result') {
       resultCount++;
       const textResult = 'result' in message ? (message as { result?: string }).result : null;
+      if (textResult) lastResultText = textResult;
       log(`Result #${resultCount}: subtype=${message.subtype}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}`);
       writeOutput({
         status: 'success',
@@ -669,7 +719,7 @@ async function runQuery(
 
   ipcPolling = false;
   log(`Query done. Messages: ${messageCount}, results: ${resultCount}, lastAssistantUuid: ${lastAssistantUuid || 'none'}, closedDuringQuery: ${closedDuringQuery}`);
-  return { newSessionId, lastAssistantUuid, closedDuringQuery };
+  return { newSessionId, lastAssistantUuid, closedDuringQuery, lastResultText };
 }
 
 async function main(): Promise<void> {
@@ -752,6 +802,7 @@ async function main(): Promise<void> {
 
   // Query loop: run query → wait for IPC message → run new query → repeat
   let resumeAt: string | undefined;
+  let lastResultText: string | undefined;
   try {
     while (true) {
       log(`Starting query (session: ${sessionId || 'new'}, resumeAt: ${resumeAt || 'latest'})...`);
@@ -762,6 +813,9 @@ async function main(): Promise<void> {
       }
       if (queryResult.lastAssistantUuid) {
         resumeAt = queryResult.lastAssistantUuid;
+      }
+      if (queryResult.lastResultText) {
+        lastResultText = queryResult.lastResultText;
       }
 
       // If _close was consumed during the query, exit immediately.
@@ -787,19 +841,37 @@ async function main(): Promise<void> {
       log(`Got new message (${nextMessage.length} chars), starting new query`);
       prompt = nextMessage;
     }
-    // SessionEnd: Append session summary to daily log
+    // SessionEnd: Append session summary to daily log with handoff context
     const now = new Date();
     const timeStr = now.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
     const durationMin = Math.round((Date.now() - sessionStartTime) / 60000);
     const isScheduled = containerInput.isScheduledTask ? ' [Scheduled Task]' : '';
     const promptPreview = containerInput.prompt.slice(0, 120).replace(/\n/g, ' ');
 
-    appendToDailyLog(GROUP_DIR,
+    // Parse handoff block from the agent's last output
+    const handoff = lastResultText ? parseHandoff(lastResultText) : null;
+
+    let sessionEntry =
       `## Session @ ${timeStr}${isScheduled}\n` +
       `- Duration: ${durationMin}min\n` +
-      `- Prompt: ${promptPreview}${containerInput.prompt.length > 120 ? '...' : ''}\n` +
-      `- Status: Completed`
-    );
+      `- Prompt: ${promptPreview}${containerInput.prompt.length > 120 ? '...' : ''}`;
+
+    if (handoff) {
+      sessionEntry += `\n- Topic: ${handoff.topic || 'unknown'}`;
+      sessionEntry += `\n- Status: ${handoff.status || 'completed'}`;
+      if (handoff.summary) sessionEntry += `\n- Summary: ${handoff.summary}`;
+      if (handoff.pending && handoff.pending !== 'none') sessionEntry += `\n- Pending: ${handoff.pending}`;
+      if (handoff.next_step && handoff.next_step !== 'none') sessionEntry += `\n- Next step: ${handoff.next_step}`;
+      if (handoff.active_threads && handoff.active_threads !== 'none') sessionEntry += `\n- Active threads: ${handoff.active_threads}`;
+      log(`Handoff parsed: topic=${handoff.topic}, status=${handoff.status}`);
+    } else {
+      sessionEntry += `\n- Status: Completed`;
+      if (lastResultText) {
+        log('No <handoff> block found in agent output');
+      }
+    }
+
+    appendToDailyLog(GROUP_DIR, sessionEntry);
     log('Session summary appended to daily log');
     writeProgress('completed');
     appendToDevLog(PROJECT_DIR,

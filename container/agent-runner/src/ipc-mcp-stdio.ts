@@ -19,6 +19,7 @@ const TASKS_DIR = path.join(IPC_DIR, 'tasks');
 const chatJid = process.env.NANOCLAW_CHAT_JID!;
 const groupFolder = process.env.NANOCLAW_GROUP_FOLDER!;
 const isMain = process.env.NANOCLAW_IS_MAIN === '1';
+const sourceChannel = process.env.NANOCLAW_SOURCE_CHANNEL || 'telegram';
 
 function writeIpcFile(dir: string, data: object): string {
   fs.mkdirSync(dir, { recursive: true });
@@ -53,6 +54,7 @@ server.tool(
       text: args.text,
       sender: args.sender || undefined,
       groupFolder,
+      sourceChannel,
       timestamp: new Date().toISOString(),
     };
 
@@ -270,6 +272,32 @@ Use available_groups.json to find the JID for a group. The folder name should be
 
     return {
       content: [{ type: 'text' as const, text: `Group "${args.name}" registered. It will start receiving messages immediately.` }],
+    };
+  },
+);
+
+// Log a posted tweet to Discord #posted channel
+server.tool(
+  'log_tweet',
+  'Log a posted tweet to the Discord #posted channel. Call this after posting any tweet via Zapier or the media script.',
+  {
+    text: z.string().describe('The tweet text that was posted'),
+    url: z.string().optional().describe('The tweet URL (e.g., https://x.com/Ball_AI_Agent/status/...)'),
+    source: z.string().optional().describe('How the tweet was posted (e.g., "zapier", "media-script", "autonomous-engagement")'),
+  },
+  async (args) => {
+    const data = {
+      type: 'discord_post',
+      text: args.text,
+      url: args.url || '',
+      source: args.source || 'autonomous',
+      timestamp: new Date().toISOString(),
+    };
+
+    writeIpcFile(TASKS_DIR, data);
+
+    return {
+      content: [{ type: 'text' as const, text: `Tweet logged to Discord #posted channel.` }],
     };
   },
 );

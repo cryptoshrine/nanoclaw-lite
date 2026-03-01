@@ -11,6 +11,7 @@ import {
 } from './config.js';
 import { AvailableGroup } from './container-runner.js';
 import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
+import { sendToDiscordChannel } from './discord-pipeline.js';
 import { logger } from './logger.js';
 import { RegisteredGroup } from './types.js';
 
@@ -494,6 +495,25 @@ export async function processTaskIpc(
         );
       }
       break;
+
+    case 'discord_post': {
+      const postedChannelId = process.env.DISCORD_CHANNEL_POSTED;
+      if (!postedChannelId) {
+        logger.warn('discord_post: DISCORD_CHANNEL_POSTED not set');
+        break;
+      }
+      const tweetText = data.text || 'No text provided';
+      const tweetUrl = data.url || '';
+      const source = data.source || 'autonomous';
+      const msg = `🐦 **Published to X** (${source})\n\n${tweetText}${tweetUrl ? `\n\n🔗 ${tweetUrl}` : ''}`;
+      try {
+        await sendToDiscordChannel(msg, postedChannelId);
+        logger.info({ url: tweetUrl, source }, 'discord_post: sent to #posted');
+      } catch (err) {
+        logger.error({ err }, 'discord_post: failed to send to #posted');
+      }
+      break;
+    }
 
     default:
       logger.warn({ type: data.type }, 'Unknown IPC task type');

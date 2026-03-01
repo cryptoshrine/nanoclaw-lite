@@ -50,6 +50,8 @@ export async function transcribeVoiceMessage(
     return FALLBACK;
   }
 
+  logger.info({ fileId: voice.file_id, duration: voice.duration }, 'Starting voice transcription');
+
   let tempPath = '';
   try {
     const tmpDir = path.join(
@@ -58,10 +60,11 @@ export async function transcribeVoiceMessage(
     );
     fs.mkdirSync(tmpDir, { recursive: true });
 
+    logger.info({ tmpDir }, 'Downloading voice file from Telegram');
     tempPath = await downloadTelegramFile(bot, voice.file_id, tmpDir);
     const fileSize = fs.statSync(tempPath).size;
     logger.info(
-      { fileId: voice.file_id, duration: voice.duration, bytes: fileSize },
+      { fileId: voice.file_id, duration: voice.duration, bytes: fileSize, tempPath },
       'Downloaded voice message',
     );
 
@@ -73,6 +76,7 @@ export async function transcribeVoiceMessage(
     formData.append('model', 'whisper-1');
     formData.append('response_format', 'text');
 
+    logger.info({ bytes: fileBuffer.length }, 'Sending to Whisper API');
     const response = await fetch(
       'https://api.openai.com/v1/audio/transcriptions',
       {
@@ -100,7 +104,7 @@ export async function transcribeVoiceMessage(
     );
     return transcript;
   } catch (err) {
-    logger.error({ err }, 'Voice transcription failed');
+    logger.error({ err, step: 'transcription', fileId: voice.file_id }, 'Voice transcription failed');
     return FALLBACK;
   } finally {
     // Clean up temp file

@@ -23,6 +23,7 @@ import {
   Partials,
 } from 'discord.js';
 import { logger } from './logger.js';
+import { saveDraft, getDraft, deleteDraft, enqueuePost, getPendingPosts, markPostPublished, markPostFailed } from './db.js';
 
 // ── Config ───────────────────────────────────────────────────────────────────
 
@@ -362,9 +363,8 @@ async function handleResearchPost(message: Message): Promise<void> {
     await draftMessage.react('✅');
     await draftMessage.react('❌');
 
-    // Store the draft data on the message for later retrieval
-    // We use a Map keyed by message ID
-    pendingDrafts.set(draftMessage.id, draft);
+    // Persist draft to SQLite (survives restarts)
+    saveDraft(draftMessage.id, draft.tweetText, draft.imagePath, draft.researchContext);
 
     await logToPipeline(`✍️ Draft posted to #content-drafts — awaiting approval`);
   } catch (err) {
@@ -373,8 +373,152 @@ async function handleResearchPost(message: Message): Promise<void> {
   }
 }
 
-// Store pending drafts for approval
-const pendingDrafts = new Map<string, ContentDraft>();
+// Legacy in-memory map removed — drafts now persisted to SQLite via db.ts
+
+// ── Direct Line (Interactive Discord Channels) ──────────────────────────────
+//
+// Allows Ladi to send messages in interactive Discord channels (#general-ops,
+// Ideas channels, etc.) and have them routed to the NanoClaw agent loop,
+// with responses posted back to the SAME Discord channel.
+
+/**
+ * Callback for processing a direct-line message from Discord.
+ * Takes the message text, author name, and source channel ID.
+ * Returns the agent's response.
+ */
+export type DirectLineCallback = (text: string, author: string, channelId: string) => Promise<string | null>;
+
+let directLineFn: DirectLineCallback | null = null;
+const interactiveChannelIds = new Set<string>();
+/** Tracks the channel ID that the current/most recent agent session originated from */
+let activeDiscordChannelId: string | null = null;
+
+export function setDirectLineCallback(fn: DirectLineCallback): void {
+  directLineFn = fn;
+}
+
+export function setGeneralOpsChannel(channelId: string): void {
+  interactiveChannelIds.add(channelId);
+}
+
+/**
+ * Register additional interactive channels (e.g. Ideas channels).
+ * Messages in these channels will be routed to the agent, with responses
+ * posted back to the same channel.
+ */
+export function addInteractiveChannels(channelIds: string[]): void {
+  for (const id of channelIds) {
+    if (id) interactiveChannelIds.add(id);
+  }
+  logger.info({ count: interactiveChannelIds.size }, 'Interactive Discord channels registered');
+}
+
+/** Get the channel ID where the current agent session was triggered from */
+export function getActiveDiscordChannelId(): string | null {
+  return activeDiscordChannelId;
+}
+
+const directLineProcessing = new Set<string>();
+
+async function handleDirectLineMessage(message: Message): Promise<void> {
+  // Ignore bot messages and empty messages
+  if (message.author.bot) return;
+  if (!message.content.trim()) return;
+
+  // Deduplicate
+  if (directLineProcessing.has(message.id)) return;
+  directLineProcessing.add(message.id);
+  if (directLineProcessing.size > 100) {
+    const iter = directLineProcessing.values();
+    for (let i = 0; i < 30; i++) {
+      const v = iter.next().value;
+      if (v) directLineProcessing.delete(v);
+    }
+  }
+
+  if (!directLineFn) {
+    logger.warn('Direct line: no callback set, ignoring message');
+    return;
+  }
+
+  const text = message.content.trim();
+  const author = message.author.displayName || message.author.username;
+
+  const channelName = (message.channel as TextChannel).name || message.channelId;
+  await logToPipeline(`💬 Direct line message from ${author} in #${channelName}: "${text.slice(0, 80)}..."`);
+
+  try {
+    // Show typing indicator
+    const channel = message.channel as TextChannel;
+    await channel.sendTyping();
+
+    // Track which channel triggered this agent session
+    activeDiscordChannelId = message.channelId;
+
+    const response = await directLineFn(text, author, message.channelId);
+
+    if (response) {
+      // Split long responses for Discord's 2000 char limit
+      const chunks: string[] = [];
+      let remaining = response;
+      while (remaining.length > 0) {
+        if (remaining.length <= 2000) {
+          chunks.push(remaining);
+          break;
+        }
+        let splitAt = remaining.lastIndexOf('\n', 2000);
+        if (splitAt < 1000) splitAt = remaining.lastIndexOf(' ', 2000);
+        if (splitAt < 1000) splitAt = 2000;
+        chunks.push(remaining.slice(0, splitAt));
+        remaining = remaining.slice(splitAt).trimStart();
+      }
+
+      for (const chunk of chunks) {
+        await channel.send(chunk);
+      }
+
+      await logToPipeline(`💬 Direct line response sent (${response.length} chars)`);
+    }
+  } catch (err) {
+    logger.error({ err, messageId: message.id }, 'Direct line: failed to process message');
+    await logToPipeline(`❌ Direct line error: ${(err as Error).message}`);
+  }
+}
+
+/**
+ * Send a message to a specific Discord channel by ID.
+ * Falls back to the active channel (where the last message came from).
+ */
+export async function sendToDiscordChannel(text: string, channelId?: string): Promise<void> {
+  const targetId = channelId || activeDiscordChannelId;
+  if (!targetId || !klawClient) return;
+  const channel = await getChannel(klawClient, targetId);
+  if (!channel) return;
+
+  const chunks: string[] = [];
+  let remaining = text;
+  while (remaining.length > 0) {
+    if (remaining.length <= 2000) { chunks.push(remaining); break; }
+    let splitAt = remaining.lastIndexOf('\n', 2000);
+    if (splitAt < 1000) splitAt = remaining.lastIndexOf(' ', 2000);
+    if (splitAt < 1000) splitAt = 2000;
+    chunks.push(remaining.slice(0, splitAt));
+    remaining = remaining.slice(splitAt).trimStart();
+  }
+
+  for (const chunk of chunks) {
+    await channel.send(chunk);
+  }
+}
+
+/**
+ * Backwards-compatible alias — sends to #general-ops or active channel.
+ */
+export async function sendToGeneralOps(text: string): Promise<void> {
+  // Find general-ops from the interactive set (first one registered)
+  const firstId = interactiveChannelIds.values().next().value;
+  await sendToDiscordChannel(text, firstId as string);
+}
 
 async function handleReaction(reaction: MessageReaction, user: User): Promise<void> {
   // Ignore bot reactions
@@ -384,14 +528,32 @@ async function handleReaction(reaction: MessageReaction, user: User): Promise<vo
   if (reaction.message.channelId !== config.channels.contentDrafts) return;
 
   const messageId = reaction.message.id;
-  const draft = pendingDrafts.get(messageId);
-  if (!draft) return;
+  const row = getDraft(messageId);
+  if (!row) {
+    logger.warn({ messageId }, 'Approval reaction on unknown draft (data may have been lost or already processed)');
+    await logToPipeline(`⚠️ Draft not found for message ${messageId.slice(0, 8)}... — may have been lost during restart`);
+    return;
+  }
+
+  const draft: ContentDraft = {
+    tweetText: row.tweet_text,
+    imagePath: row.image_path || undefined,
+    researchContext: row.research_context,
+  };
 
   const emoji = reaction.emoji.name;
 
   if (emoji === '✅') {
-    // Approved — move to approved queue
-    pendingDrafts.delete(messageId);
+    // Approved — save to post queue and show in approved channel
+    deleteDraft(messageId);
+
+    const queueId = enqueuePost(
+      draft.tweetText,
+      draft.imagePath,
+      draft.researchContext,
+      user.username,
+      messageId,
+    );
 
     const approvedChannel = await getChannel(klawClient, config.channels.approvedQueue);
     if (approvedChannel) {
@@ -400,7 +562,8 @@ async function handleReaction(reaction: MessageReaction, user: User): Promise<vo
         .setTitle('✅ Approved Tweet')
         .setDescription(draft.tweetText)
         .addFields(
-          { name: 'Status', value: 'Queued for optimal posting window', inline: true },
+          { name: 'Status', value: 'In post queue — publishing shortly', inline: true },
+          { name: 'Queue ID', value: `#${queueId}`, inline: true },
         )
         .setFooter({ text: `Approved by ${user.username}` })
         .setTimestamp();
@@ -408,40 +571,88 @@ async function handleReaction(reaction: MessageReaction, user: User): Promise<vo
       await approvedChannel.send({ embeds: [approvedEmbed] });
     }
 
-    await logToPipeline(`✅ Tweet approved by ${user.username} — queued for posting`);
+    await logToPipeline(`✅ Tweet approved by ${user.username} — added to post queue (#${queueId})`);
+  } else if (emoji === '❌') {
+    // Rejected
+    deleteDraft(messageId);
+    await logToPipeline(`❌ Tweet rejected by ${user.username}`);
+  }
+}
 
-    // Publish to X
-    if (publishFn) {
-      try {
-        const tweetUrl = await publishFn(draft);
+// ── Post Queue Consumer ─────────────────────────────────────────────────────
+//
+// Polls the post_queue table and publishes pending tweets via publishFn.
+// Runs on a 2-minute interval after pipeline start.
+
+let queueInterval: ReturnType<typeof setInterval> | null = null;
+
+export async function processPostQueue(): Promise<void> {
+  if (!publishFn) {
+    logger.debug('Post queue: publishFn not set, skipping');
+    return;
+  }
+
+  const pending = getPendingPosts();
+  if (pending.length === 0) return;
+
+  logger.info({ count: pending.length }, 'Post queue: processing pending tweets');
+
+  for (const item of pending) {
+    const draft: ContentDraft = {
+      tweetText: item.tweet_text,
+      imagePath: item.image_path || undefined,
+      researchContext: item.research_context || '',
+    };
+
+    try {
+      const tweetUrl = await publishFn(draft);
+
+      if (tweetUrl) {
+        markPostPublished(item.id, tweetUrl);
+
+        // Post to #posted channel
         const postedChannel = await getChannel(klawClient, config.channels.posted);
-        if (postedChannel && tweetUrl) {
+        if (postedChannel) {
           const postedEmbed = new EmbedBuilder()
             .setColor(0x1da1f2)
             .setTitle('🐦 Published to X')
             .setDescription(draft.tweetText)
             .addFields({ name: 'URL', value: tweetUrl })
-            .setFooter({ text: 'Ball-AI Agent' })
+            .setFooter({ text: `Queue #${item.id} • Ball-AI Agent` })
             .setTimestamp();
 
           await postedChannel.send({ embeds: [postedEmbed] });
         }
-        await logToPipeline(`🐦 Tweet published: ${tweetUrl || 'posted'}`);
-      } catch (err) {
-        logger.error({ err }, 'Klaw: failed to publish tweet');
-        await logToPipeline(`❌ Failed to publish: ${(err as Error).message}`);
+
+        await logToPipeline(`🐦 Queue #${item.id} published: ${tweetUrl}`);
+        logger.info({ queueId: item.id, url: tweetUrl }, 'Post queue: published');
+      } else {
+        markPostFailed(item.id, 'publishFn returned null');
+        await logToPipeline(`⚠️ Queue #${item.id} publish returned null (retry ${item.retry_count + 1}/3)`);
       }
+    } catch (err) {
+      const errMsg = (err as Error).message;
+      markPostFailed(item.id, errMsg);
+      logger.error({ err, queueId: item.id }, 'Post queue: publish failed');
+      await logToPipeline(`❌ Queue #${item.id} failed: ${errMsg} (retry ${item.retry_count + 1}/3)`);
     }
-  } else if (emoji === '❌') {
-    // Rejected
-    pendingDrafts.delete(messageId);
-    await logToPipeline(`❌ Tweet rejected by ${user.username}`);
+
+    // Small delay between posts to avoid rate limits
+    await new Promise((r) => setTimeout(r, 5_000));
   }
 }
 
 // ── Startup ──────────────────────────────────────────────────────────────────
 
 let scoutInterval: ReturnType<typeof setInterval> | null = null;
+
+/**
+ * Returns the Klaw Discord client (after pipeline start).
+ * Used by discord-channels.ts to reuse the same bot connection.
+ */
+export function getKlawClient(): Client | null {
+  return klawClient ?? null;
+}
 
 export async function startDiscordPipeline(): Promise<void> {
   try {
@@ -493,6 +704,10 @@ export async function startDiscordPipeline(): Promise<void> {
     if (message.channelId === config.channels.researchDesk && message.author.bot) {
       await handleResearchPost(message);
     }
+    // Direct line: route interactive channel messages to agent
+    if (interactiveChannelIds.has(message.channelId) && !message.author.bot) {
+      await handleDirectLineMessage(message);
+    }
   });
 
   klawClient.on('messageReactionAdd', async (reaction, user) => {
@@ -540,8 +755,23 @@ export async function startDiscordPipeline(): Promise<void> {
       });
     }, 30_000);
 
+    // Start post queue consumer — every 2 minutes
+    const TWO_MINUTES = 2 * 60 * 1000;
+    queueInterval = setInterval(() => {
+      processPostQueue().catch((err) => {
+        logger.error({ err }, 'Post queue consumer error');
+      });
+    }, TWO_MINUTES);
+
+    // Process any pending queue items after 15 seconds
+    setTimeout(() => {
+      processPostQueue().catch((err) => {
+        logger.error({ err }, 'Initial post queue processing error');
+      });
+    }, 15_000);
+
     // Log startup to pipeline
-    await logToPipeline('🚀 Discord Content Pipeline started — Scout (2h), Researcher (auto), Klaw (auto + approval)');
+    await logToPipeline('🚀 Discord Content Pipeline started — Scout (2h), Researcher (auto), Klaw (auto + approval), Post Queue (2min)');
   } catch (err) {
     logger.error({ err }, 'Failed to start Discord pipeline');
   }
@@ -551,6 +781,10 @@ export async function stopDiscordPipeline(): Promise<void> {
   if (scoutInterval) {
     clearInterval(scoutInterval);
     scoutInterval = null;
+  }
+  if (queueInterval) {
+    clearInterval(queueInterval);
+    queueInterval = null;
   }
   await Promise.allSettled([
     scoutClient?.destroy(),
