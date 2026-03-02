@@ -404,6 +404,83 @@ Use available_groups.json to find the JID for a group. The folder name should be
         }
       ),
 
+      // ============ DM Allowlist Tools ============
+
+      tool(
+        'dm_allowlist_add',
+        'Add a Telegram user ID to the DM allowlist so they can message the bot directly.',
+        {
+          user_id: z.number().describe('Telegram user ID to allow'),
+        },
+        async (args) => {
+          if (!isMain) {
+            return {
+              content: [{ type: 'text', text: 'Only the main group can manage the DM allowlist.' }],
+              isError: true,
+            };
+          }
+          writeIpcFile(TASKS_DIR, {
+            type: 'dm_allowlist_add',
+            user_id: args.user_id,
+            timestamp: new Date().toISOString(),
+          });
+          return {
+            content: [{ type: 'text', text: `User ${args.user_id} added to DM allowlist.` }],
+          };
+        }
+      ),
+
+      tool(
+        'dm_allowlist_remove',
+        'Remove a Telegram user ID from the DM allowlist.',
+        {
+          user_id: z.number().describe('Telegram user ID to remove'),
+        },
+        async (args) => {
+          if (!isMain) {
+            return {
+              content: [{ type: 'text', text: 'Only the main group can manage the DM allowlist.' }],
+              isError: true,
+            };
+          }
+          writeIpcFile(TASKS_DIR, {
+            type: 'dm_allowlist_remove',
+            user_id: args.user_id,
+            timestamp: new Date().toISOString(),
+          });
+          return {
+            content: [{ type: 'text', text: `User ${args.user_id} removed from DM allowlist.` }],
+          };
+        }
+      ),
+
+      tool(
+        'dm_allowlist_list',
+        'List all allowed DM users and pending access requests.',
+        {},
+        async () => {
+          if (!isMain) {
+            return {
+              content: [{ type: 'text', text: 'Only the main group can view the DM allowlist.' }],
+              isError: true,
+            };
+          }
+          // Read the allowlist file directly (agent has filesystem access in local mode)
+          const projectDir = process.env.NANOCLAW_PROJECT_DIR || path.join(IPC_DIR, '..', '..');
+          const allowlistPath = path.join(projectDir, 'data', 'dm-allowlist.json');
+          try {
+            const data = JSON.parse(fs.readFileSync(allowlistPath, 'utf-8'));
+            return {
+              content: [{ type: 'text', text: JSON.stringify(data, null, 2) }],
+            };
+          } catch {
+            return {
+              content: [{ type: 'text', text: 'No DM allowlist found.' }],
+            };
+          }
+        }
+      ),
+
       // ============ Agent Teams Tools ============
 
       // Lead-only: Create a new team

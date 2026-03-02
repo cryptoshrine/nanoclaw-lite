@@ -82,6 +82,20 @@ export interface TaskRunLog {
   error: string | null;
 }
 
+// ============ DM Allowlist ============
+
+export interface DmAllowlistEntry {
+  user_id: number;
+  username?: string;
+  first_name?: string;
+  requested_at: string;
+}
+
+export interface DmAllowlist {
+  allowed_user_ids: number[];
+  pending_requests: DmAllowlistEntry[];
+}
+
 // ============ Agent Teams ============
 
 export interface Team {

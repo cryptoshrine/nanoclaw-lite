@@ -13,6 +13,7 @@ import { AvailableGroup } from './container-runner.js';
 import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
 import { sendToDiscordChannel } from './discord-pipeline.js';
 import { logger } from './logger.js';
+import { addToDmAllowlist, getDmAllowlist, removeFromDmAllowlist } from './dm-allowlist.js';
 import { RegisteredGroup } from './types.js';
 
 export interface IpcDeps {
@@ -512,6 +513,43 @@ export async function processTaskIpc(
       } catch (err) {
         logger.error({ err }, 'discord_post: failed to send to #posted');
       }
+      break;
+    }
+
+    case 'dm_allowlist_add':
+      if (!isMain) {
+        logger.warn({ sourceGroup }, 'Unauthorized dm_allowlist_add attempt blocked');
+        break;
+      }
+      if (typeof data.user_id === 'number') {
+        const added = addToDmAllowlist(data.user_id);
+        logger.info({ userId: data.user_id, added }, 'dm_allowlist_add processed');
+      }
+      break;
+
+    case 'dm_allowlist_remove':
+      if (!isMain) {
+        logger.warn({ sourceGroup }, 'Unauthorized dm_allowlist_remove attempt blocked');
+        break;
+      }
+      if (typeof data.user_id === 'number') {
+        const removed = removeFromDmAllowlist(data.user_id);
+        logger.info({ userId: data.user_id, removed }, 'dm_allowlist_remove processed');
+      }
+      break;
+
+    case 'dm_allowlist_list': {
+      if (!isMain) {
+        logger.warn({ sourceGroup }, 'Unauthorized dm_allowlist_list attempt blocked');
+        break;
+      }
+      const allowlist = getDmAllowlist();
+      // Write result to IPC response file for the agent to read
+      const responseDir = path.join(DATA_DIR, 'ipc', sourceGroup, 'responses');
+      fs.mkdirSync(responseDir, { recursive: true });
+      const responseFile = path.join(responseDir, `dm_allowlist_${Date.now()}.json`);
+      fs.writeFileSync(responseFile, JSON.stringify(allowlist, null, 2));
+      logger.info('dm_allowlist_list: wrote response');
       break;
     }
 

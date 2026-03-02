@@ -58,6 +58,7 @@ import {
   startTeamWatcher,
   writeTeamSnapshot,
 } from './team-manager.js';
+import { addPendingRequest, dmRejectTimes, getDmAllowlist, loadDmAllowlist } from './dm-allowlist.js';
 import { NewMessage, RegisteredGroup, Session, TeamTask } from './types.js';
 import { loadJson, saveJson } from './utils.js';
 import { logger } from './logger.js';
@@ -136,10 +137,14 @@ function loadState(): void {
     path.join(DATA_DIR, 'registered_groups.json'),
     {},
   );
+  // Load DM allowlist
+  const allowlist = loadDmAllowlist();
+
   logger.info(
     {
       groupCount: Object.keys(registeredGroups).length,
       processedIds: processedMessageIds.size,
+      dmAllowedUsers: allowlist.allowed_user_ids.length,
     },
     'State loaded',
   );
@@ -1237,6 +1242,32 @@ function connectTelegram(): void {
       msg.chat.title ||
       [msg.chat.first_name, msg.chat.last_name].filter(Boolean).join(' ') ||
       String(chatId);
+
+    // DM allowlist gate: block unknown private chat users
+    // Positive chatId = private/DM chat. Negative = group/supergroup.
+    if (chatId > 0 && !registeredGroups[jid]) {
+      const userId = msg.from?.id;
+      const allowlist = getDmAllowlist();
+      if (userId && !allowlist.allowed_user_ids.includes(userId)) {
+        // Rate-limit rejection reply (once per hour per user)
+        const now = Date.now();
+        const lastReject = dmRejectTimes.get(userId) || 0;
+        if (now - lastReject > 3_600_000) {
+          dmRejectTimes.set(userId, now);
+          await bot.api.sendMessage(
+            chatId,
+            'This bot is private. Contact the owner for access.',
+          );
+        }
+        // Log to pending requests (once per user)
+        addPendingRequest(userId, msg.from?.username, msg.from?.first_name);
+        logger.info(
+          { userId, username: msg.from?.username },
+          'Blocked DM from unknown user',
+        );
+        return;
+      }
+    }
 
     storeChatMetadata(jid, timestamp, chatName);
 
