@@ -553,6 +553,99 @@ export async function processTaskIpc(
       break;
     }
 
+    case 'canvas_update': {
+      const canvasDir = path.join(DATA_DIR, 'canvas', sourceGroup);
+      fs.mkdirSync(canvasDir, { recursive: true });
+
+      const canvasPath = path.join(canvasDir, 'canvas.json');
+      const eventsPath = path.join(canvasDir, 'events.json');
+
+      // Read current state
+      let state: {
+        id: string;
+        artifacts: Array<Record<string, unknown>>;
+        annotations: Array<Record<string, unknown>>;
+        viewport: { x: number; y: number; zoom: number };
+        lastUpdate: string;
+      } = {
+        id: sourceGroup,
+        artifacts: [],
+        annotations: [],
+        viewport: { x: 0, y: 0, zoom: 1 },
+        lastUpdate: '',
+      };
+      try {
+        if (fs.existsSync(canvasPath)) {
+          state = JSON.parse(fs.readFileSync(canvasPath, 'utf-8'));
+        }
+      } catch {
+        /* fresh start */
+      }
+
+      const action = data.canvas_action as string;
+      let event: Record<string, unknown> | null = null;
+
+      if (action === 'add' && data.artifact) {
+        state.artifacts.push(data.artifact as Record<string, unknown>);
+        event = { type: 'artifact_add', artifact: data.artifact };
+      } else if (action === 'update' && data.artifactId && data.changes) {
+        const idx = state.artifacts.findIndex(
+          (a) => (a as { id: string }).id === data.artifactId,
+        );
+        if (idx >= 0) {
+          state.artifacts[idx] = {
+            ...state.artifacts[idx],
+            ...(data.changes as Record<string, unknown>),
+            updatedAt: new Date().toISOString(),
+          };
+          event = {
+            type: 'artifact_update',
+            artifactId: data.artifactId,
+            changes: data.changes,
+          };
+        }
+      } else if (action === 'remove' && data.artifactId) {
+        state.artifacts = state.artifacts.filter(
+          (a) => (a as { id: string }).id !== data.artifactId,
+        );
+        event = { type: 'artifact_remove', artifactId: data.artifactId };
+      }
+
+      if (event) {
+        state.lastUpdate = new Date().toISOString();
+        fs.writeFileSync(canvasPath, JSON.stringify(state, null, 2));
+
+        // Append event for SSE streaming (ring buffer, max 100)
+        let events: Array<Record<string, unknown>> = [];
+        try {
+          if (fs.existsSync(eventsPath)) {
+            events = JSON.parse(fs.readFileSync(eventsPath, 'utf-8'));
+          }
+        } catch {
+          /* empty */
+        }
+        const seq =
+          events.length > 0
+            ? ((events[events.length - 1].seq as number) || 0) + 1
+            : 1;
+        events.push({
+          ...event,
+          timestamp: new Date().toISOString(),
+          seq,
+        });
+        if (events.length > 100) {
+          events = events.slice(-100);
+        }
+        fs.writeFileSync(eventsPath, JSON.stringify(events));
+
+        logger.info(
+          { sourceGroup, action, artifactId: data.artifactId },
+          'Canvas update processed',
+        );
+      }
+      break;
+    }
+
     default:
       logger.warn({ type: data.type }, 'Unknown IPC task type');
   }

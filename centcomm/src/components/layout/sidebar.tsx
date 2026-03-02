@@ -14,6 +14,7 @@ import {
   BookOpen,
   Inbox,
   MessageSquare,
+  Layers,
   ChevronLeft,
   ChevronRight,
 } from "lucide-react";
@@ -24,6 +25,7 @@ const navItems = [
   { href: "/", label: "Dashboard", icon: LayoutDashboard },
   { href: "/chat", label: "Chat", icon: MessageSquare },
   { href: "/live", label: "Live", icon: Radio },
+  { href: "/canvas", label: "Canvas", icon: Layers },
   { href: "/agents", label: "Agents", icon: Bot },
   { href: "/memory", label: "Memory Vault", icon: Brain },
   { href: "/kanban", label: "Kanban", icon: Kanban },

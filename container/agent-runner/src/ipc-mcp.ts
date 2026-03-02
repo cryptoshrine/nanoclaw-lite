@@ -154,6 +154,62 @@ export function createIpcMcp(ctx: IpcMcpContext) {
       ),
 
       tool(
+        'send_canvas',
+        `Push a visual artifact to the Live Canvas in CENTCOMM. Artifacts appear as draggable/resizable cards on a spatial workspace.
+
+Supported types:
+- "markdown": Rendered markdown text
+- "code": Syntax-highlighted code block (set metadata.language)
+- "svg": Raw SVG markup
+- "image": URL or path to an image file
+- "chart": JSON chart data (Recharts-compatible)
+- "html": Raw HTML content
+
+Artifacts appear in real-time on the canvas. Use for sharing visualizations, code, research findings, or any visual content.`,
+        {
+          type: z.enum(['markdown', 'code', 'svg', 'image', 'chart', 'html']).describe('Artifact type'),
+          title: z.string().describe('Display title for the artifact card'),
+          content: z.string().describe('Content: markdown text, code, SVG markup, image URL/path, chart JSON, or HTML'),
+          metadata: z.record(z.string(), z.string()).optional().describe('Optional metadata (e.g., { language: "python" })'),
+          width: z.number().optional().describe('Width in pixels (default: 400)'),
+          height: z.number().optional().describe('Height in pixels (default: 300)'),
+        },
+        async (args) => {
+          const artifactId = `art-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+          const posX = 50 + Math.floor(Math.random() * 200);
+          const posY = 50 + Math.floor(Math.random() * 200);
+
+          const artifact = {
+            id: artifactId,
+            type: args.type,
+            title: args.title,
+            content: args.content,
+            metadata: args.metadata || {},
+            position: { x: posX, y: posY },
+            size: { width: args.width || 400, height: args.height || 300 },
+            sourceAgent: groupFolder,
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+          };
+
+          writeIpcFile(TASKS_DIR, {
+            type: 'canvas_update',
+            canvas_action: 'add',
+            artifact,
+            groupFolder,
+            timestamp: new Date().toISOString(),
+          });
+
+          return {
+            content: [{
+              type: 'text',
+              text: `Artifact "${args.title}" (${args.type}) pushed to canvas (${artifactId})`
+            }]
+          };
+        }
+      ),
+
+      tool(
         'schedule_task',
         `Schedule a recurring or one-time task. The task will run as a full agent with access to all tools.
 

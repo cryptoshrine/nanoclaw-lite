@@ -20,4 +20,6 @@ export const PATHS = {
   ipc: path.join(PROJECT_ROOT, "data", "ipc"),
   /** Betting analysis output directory */
   bettingOutput: path.join(PROJECT_ROOT, "groups", "main", "betting", "output"),
+  /** Canvas state directory */
+  canvas: path.join(PROJECT_ROOT, "data", "canvas"),
 } as const;
