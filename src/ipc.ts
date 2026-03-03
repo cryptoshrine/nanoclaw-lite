@@ -204,6 +204,17 @@ export async function processTaskIpc(
     trigger?: string;
     requiresTrigger?: boolean;
     containerConfig?: RegisteredGroup['containerConfig'];
+    // For log_tweet
+    text?: string;
+    url?: string;
+    source?: string;
+    // For dm_allowlist
+    user_id?: string;
+    // For canvas_update
+    canvas_action?: string;
+    artifact?: Record<string, unknown>;
+    artifactId?: string;
+    changes?: Record<string, unknown>;
   },
   sourceGroup: string, // Verified identity from IPC directory
   isMain: boolean, // Verified from directory path
@@ -314,6 +325,8 @@ export async function processTaskIpc(
           next_run: nextRun,
           status: 'active',
           created_at: new Date().toISOString(),
+          retry_count: 0,
+          max_retries: 3,
         });
         logger.info(
           { taskId, sourceGroup, targetFolder, contextMode },
@@ -384,14 +397,14 @@ export async function processTaskIpc(
           const updates: Parameters<typeof updateTask>[1] = {};
 
           if (data.prompt !== undefined) updates.prompt = data.prompt;
-          if (data.context_mode !== undefined) updates.context_mode = data.context_mode;
+          if (data.context_mode !== undefined) updates.context_mode = data.context_mode as 'group' | 'isolated';
 
           // Handle schedule changes — recalculate next_run
-          const newScheduleType = data.schedule_type || task.schedule_type;
+          const newScheduleType = (data.schedule_type || task.schedule_type) as 'cron' | 'interval' | 'once';
           const newScheduleValue = data.schedule_value || task.schedule_value;
           const scheduleChanged = data.schedule_type !== undefined || data.schedule_value !== undefined;
 
-          if (data.schedule_type !== undefined) updates.schedule_type = data.schedule_type;
+          if (data.schedule_type !== undefined) updates.schedule_type = data.schedule_type as 'cron' | 'interval' | 'once';
           if (data.schedule_value !== undefined) updates.schedule_value = data.schedule_value;
 
           if (scheduleChanged && task.status === 'active') {
@@ -586,8 +599,20 @@ export async function processTaskIpc(
       let event: Record<string, unknown> | null = null;
 
       if (action === 'add' && data.artifact) {
-        state.artifacts.push(data.artifact as Record<string, unknown>);
-        event = { type: 'artifact_add', artifact: data.artifact };
+        // Normalize flat x/y/width/height into nested position/size
+        const art = data.artifact as Record<string, unknown>;
+        if (!art.position && (art.x !== undefined || art.y !== undefined)) {
+          art.position = { x: art.x ?? 0, y: art.y ?? 0 };
+          delete art.x;
+          delete art.y;
+        }
+        if (!art.size && (art.width !== undefined || art.height !== undefined)) {
+          art.size = { width: art.width ?? 400, height: art.height ?? 300 };
+          delete art.width;
+          delete art.height;
+        }
+        state.artifacts.push(art);
+        event = { type: 'artifact_add', artifact: art };
       } else if (action === 'update' && data.artifactId && data.changes) {
         const idx = state.artifacts.findIndex(
           (a) => (a as { id: string }).id === data.artifactId,

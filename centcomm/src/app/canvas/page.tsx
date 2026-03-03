@@ -89,21 +89,27 @@ export default function CanvasPage() {
   useEffect(() => {
     if (!canvasState) return;
 
-    const artifactNodes: Node[] = canvasState.artifacts.map((a) => ({
-      id: a.id,
-      type: "artifact" as const,
-      position: a.position,
-      data: {
-        artifactId: a.id,
-        type: a.type,
-        title: a.title,
-        content: a.content,
-        metadata: a.metadata,
-        sourceAgent: a.sourceAgent,
-        onRemove: handleRemoveArtifact,
-      },
-      style: { width: a.size.width, height: a.size.height },
-    }));
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const artifactNodes: Node[] = canvasState.artifacts.map((a: any) => {
+      // Support both nested {position, size} and flat {x, y, width, height}
+      const pos = a.position ?? { x: a.x ?? 0, y: a.y ?? 0 };
+      const size = a.size ?? { width: a.width ?? 400, height: a.height ?? 300 };
+      return {
+        id: a.id,
+        type: "artifact" as const,
+        position: pos,
+        data: {
+          artifactId: a.id,
+          type: a.type,
+          title: a.title,
+          content: a.content,
+          metadata: a.metadata,
+          sourceAgent: a.sourceAgent,
+          onRemove: handleRemoveArtifact,
+        },
+        style: { width: size.width, height: size.height },
+      };
+    });
 
     const annotationNodes: Node[] = canvasState.annotations
       .filter((a) => a.type === "sticky")

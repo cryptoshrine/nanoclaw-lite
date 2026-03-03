@@ -58,7 +58,7 @@ import {
   startTeamWatcher,
   writeTeamSnapshot,
 } from './team-manager.js';
-import { addPendingRequest, dmRejectTimes, getDmAllowlist, loadDmAllowlist } from './dm-allowlist.js';
+import { addPendingRequest, addToDmAllowlist, dmRejectTimes, getDmAllowlist, loadDmAllowlist, removeFromDmAllowlist } from './dm-allowlist.js';
 import { NewMessage, RegisteredGroup, Session, TeamTask } from './types.js';
 import { loadJson, saveJson } from './utils.js';
 import { logger } from './logger.js';
@@ -849,6 +849,20 @@ async function processTaskIpc(
     taskStatus?: 'pending' | 'in_progress' | 'completed' | 'blocked';
     priority?: number;
     dependsOn?: string;
+    // For edit_task
+    task_id?: string;
+    // For log_tweet / discord_post
+    text?: string;
+    url?: string;
+    source?: string;
+    // For dm_allowlist
+    user_id?: number;
+    // For canvas_update
+    canvas_action?: string;
+    artifact?: Record<string, unknown>;
+    artifactId?: string;
+    changes?: Record<string, unknown>;
+    requiresTrigger?: boolean;
   },
   sourceGroup: string,
   isMain: boolean,
@@ -1198,6 +1212,173 @@ async function processTaskIpc(
         logger.info({ taskId: data.taskId }, 'Team task updated');
       }
       break;
+
+    case 'edit_task': {
+      const editTaskId = data.taskId || data.task_id;
+      if (editTaskId) {
+        const task = getTask(editTaskId);
+        if (task && (isMain || task.group_folder === sourceGroup)) {
+          const updates: Parameters<typeof updateTask>[1] = {};
+          if (data.prompt !== undefined) updates.prompt = data.prompt;
+          if (data.context_mode !== undefined) updates.context_mode = data.context_mode as 'group' | 'isolated';
+
+          const newScheduleType = (data.schedule_type || task.schedule_type) as 'cron' | 'interval' | 'once';
+          const newScheduleValue = data.schedule_value || task.schedule_value;
+          const scheduleChanged = data.schedule_type !== undefined || data.schedule_value !== undefined;
+
+          if (data.schedule_type !== undefined) updates.schedule_type = data.schedule_type as 'cron' | 'interval' | 'once';
+          if (data.schedule_value !== undefined) updates.schedule_value = data.schedule_value;
+
+          if (scheduleChanged && task.status === 'active') {
+            if (newScheduleType === 'cron') {
+              try {
+                const interval = CronExpressionParser.parse(newScheduleValue, { tz: TIMEZONE });
+                updates.next_run = interval.next().toISOString();
+              } catch {
+                logger.warn({ scheduleValue: newScheduleValue, taskId: editTaskId }, 'Invalid cron expression in edit_task');
+                break;
+              }
+            } else if (newScheduleType === 'interval') {
+              const ms = parseInt(newScheduleValue, 10);
+              if (isNaN(ms) || ms <= 0) break;
+              updates.next_run = new Date(Date.now() + ms).toISOString();
+            } else if (newScheduleType === 'once') {
+              const scheduled = new Date(newScheduleValue);
+              if (isNaN(scheduled.getTime())) break;
+              updates.next_run = scheduled.toISOString();
+            }
+          }
+
+          updateTask(editTaskId, updates);
+          logger.info({ taskId: editTaskId, sourceGroup, updates: Object.keys(updates) }, 'Task edited via IPC');
+        }
+      }
+      break;
+    }
+
+    case 'refresh_groups':
+      if (isMain) {
+        logger.info({ sourceGroup }, 'Group metadata refresh requested via IPC');
+        // Sync handled elsewhere — this is a no-op in index.ts context
+      }
+      break;
+
+    case 'discord_post': {
+      const postedChannelId = process.env.DISCORD_CHANNEL_POSTED;
+      if (!postedChannelId) {
+        logger.warn('discord_post: DISCORD_CHANNEL_POSTED not set');
+        break;
+      }
+      const tweetText = data.text || 'No text provided';
+      const tweetUrl = data.url || '';
+      const tweetSource = data.source || 'autonomous';
+      const discordMsg = `🐦 **Published to X** (${tweetSource})\n\n${tweetText}${tweetUrl ? `\n\n🔗 ${tweetUrl}` : ''}`;
+      try {
+        await sendToDiscordChannel(discordMsg, postedChannelId);
+        logger.info({ url: tweetUrl, source: tweetSource }, 'discord_post: sent to #posted');
+      } catch (err) {
+        logger.error({ err }, 'discord_post: failed to send to #posted');
+      }
+      break;
+    }
+
+    case 'dm_allowlist_add':
+      if (isMain && typeof data.user_id === 'number') {
+        const added = addToDmAllowlist(data.user_id);
+        logger.info({ userId: data.user_id, added }, 'dm_allowlist_add processed');
+      }
+      break;
+
+    case 'dm_allowlist_remove':
+      if (isMain && typeof data.user_id === 'number') {
+        const removed = removeFromDmAllowlist(data.user_id);
+        logger.info({ userId: data.user_id, removed }, 'dm_allowlist_remove processed');
+      }
+      break;
+
+    case 'dm_allowlist_list': {
+      if (!isMain) break;
+      const allowlist = getDmAllowlist();
+      const responseDir = path.join(DATA_DIR, 'ipc', sourceGroup, 'responses');
+      fs.mkdirSync(responseDir, { recursive: true });
+      const responseFile = path.join(responseDir, `dm_allowlist_${Date.now()}.json`);
+      fs.writeFileSync(responseFile, JSON.stringify(allowlist, null, 2));
+      logger.info('dm_allowlist_list: wrote response');
+      break;
+    }
+
+    case 'canvas_update': {
+      const canvasDir = path.join(DATA_DIR, 'canvas', sourceGroup);
+      fs.mkdirSync(canvasDir, { recursive: true });
+
+      const canvasPath = path.join(canvasDir, 'canvas.json');
+      const eventsPath = path.join(canvasDir, 'events.json');
+
+      let state: {
+        id: string;
+        artifacts: Array<Record<string, unknown>>;
+        annotations: Array<Record<string, unknown>>;
+        viewport: { x: number; y: number; zoom: number };
+        lastUpdate: string;
+      } = {
+        id: sourceGroup,
+        artifacts: [],
+        annotations: [],
+        viewport: { x: 0, y: 0, zoom: 1 },
+        lastUpdate: '',
+      };
+      try {
+        if (fs.existsSync(canvasPath)) {
+          state = JSON.parse(fs.readFileSync(canvasPath, 'utf-8'));
+        }
+      } catch { /* fresh start */ }
+
+      const action = data.canvas_action as string;
+      let event: Record<string, unknown> | null = null;
+
+      if (action === 'add' && data.artifact) {
+        state.artifacts.push(data.artifact as Record<string, unknown>);
+        event = { type: 'artifact_add', artifact: data.artifact };
+      } else if (action === 'update' && data.artifactId && data.changes) {
+        const idx = state.artifacts.findIndex(
+          (a) => (a as { id: string }).id === data.artifactId,
+        );
+        if (idx >= 0) {
+          state.artifacts[idx] = {
+            ...state.artifacts[idx],
+            ...(data.changes as Record<string, unknown>),
+            updatedAt: new Date().toISOString(),
+          };
+          event = { type: 'artifact_update', artifactId: data.artifactId, changes: data.changes };
+        }
+      } else if (action === 'remove' && data.artifactId) {
+        state.artifacts = state.artifacts.filter(
+          (a) => (a as { id: string }).id !== data.artifactId,
+        );
+        event = { type: 'artifact_remove', artifactId: data.artifactId };
+      }
+
+      if (event) {
+        state.lastUpdate = new Date().toISOString();
+        fs.writeFileSync(canvasPath, JSON.stringify(state, null, 2));
+
+        let events: Array<Record<string, unknown>> = [];
+        try {
+          if (fs.existsSync(eventsPath)) {
+            events = JSON.parse(fs.readFileSync(eventsPath, 'utf-8'));
+          }
+        } catch { /* empty */ }
+        const seq = events.length > 0
+          ? ((events[events.length - 1].seq as number) || 0) + 1
+          : 1;
+        events.push({ ...event, timestamp: new Date().toISOString(), seq });
+        if (events.length > 100) events = events.slice(-100);
+        fs.writeFileSync(eventsPath, JSON.stringify(events));
+
+        logger.info({ sourceGroup, action, artifactId: data.artifactId }, 'Canvas update processed');
+      }
+      break;
+    }
 
     default:
       logger.warn({ type: data.type }, 'Unknown IPC task type');

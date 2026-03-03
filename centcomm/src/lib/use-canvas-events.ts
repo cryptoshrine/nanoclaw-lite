@@ -52,6 +52,8 @@ export function useCanvasEvents(groupFolder: string) {
   const [connected, setConnected] = useState(false);
   const sourceRef = useRef<EventSource | null>(null);
   const reconnectTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Track the highest seq seen from the initial state load so SSE skips replayed events
+  const lastSeqRef = useRef<number>(0);
 
   const loadCanvas = useCallback(async () => {
     try {
@@ -59,6 +61,8 @@ export function useCanvasEvents(groupFolder: string) {
       if (res.ok) {
         const state = await res.json();
         setCanvasState(state);
+        // Record the seq watermark so SSE only applies newer events
+        lastSeqRef.current = state.lastSeq ?? 0;
       }
     } catch {
       /* silently fail */
@@ -75,7 +79,10 @@ export function useCanvasEvents(groupFolder: string) {
 
     source.addEventListener("canvas_event", (e) => {
       try {
-        const event = JSON.parse(e.data) as CanvasEvent;
+        const event = JSON.parse(e.data) as CanvasEvent & { seq?: number };
+        // Skip events already reflected in the initial state load
+        if (event.seq && event.seq <= lastSeqRef.current) return;
+        if (event.seq) lastSeqRef.current = event.seq;
         setCanvasState((prev) => {
           if (!prev) return prev;
           return applyCanvasEvent(prev, event);

@@ -28,11 +28,23 @@ export async function GET(
   const canvasPath = getCanvasPath(groupFolder);
 
   try {
+    let state;
     if (fs.existsSync(canvasPath)) {
-      const state = JSON.parse(fs.readFileSync(canvasPath, "utf-8"));
-      return NextResponse.json(state);
+      state = JSON.parse(fs.readFileSync(canvasPath, "utf-8"));
+    } else {
+      state = defaultCanvas(groupFolder);
     }
-    return NextResponse.json(defaultCanvas(groupFolder));
+    // Attach highest event seq so the client can skip replayed SSE events
+    const eventsPath = path.join(PATHS.canvas, groupFolder, "events.json");
+    try {
+      if (fs.existsSync(eventsPath)) {
+        const events = JSON.parse(fs.readFileSync(eventsPath, "utf-8"));
+        if (events.length > 0) {
+          state.lastSeq = events[events.length - 1].seq ?? 0;
+        }
+      }
+    } catch { /* ignore */ }
+    return NextResponse.json(state);
   } catch (error) {
     return NextResponse.json(
       { error: "Failed to read canvas state", detail: String(error) },
