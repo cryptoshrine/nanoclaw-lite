@@ -218,13 +218,36 @@ function createSanitizeBashHook(): HookCallback {
 }
 
 /**
+ * In-process file cache keyed on mtime — avoids re-reading unchanged files
+ * across multiple agent invocations in the same process (e.g. IPC message loop).
+ */
+const fileCache = new Map<string, { mtimeMs: number; content: string | null }>();
+
+/**
  * Read a file safely, returning its content or null if not found/error.
+ * Uses mtime cache to skip re-reads of unchanged files.
  */
 function readFileSafe(filePath: string, maxChars = 10000): string | null {
   try {
     if (!fs.existsSync(filePath)) return null;
+
+    const stat = fs.statSync(filePath);
+    const cached = fileCache.get(filePath);
+    if (cached && cached.mtimeMs === stat.mtimeMs) {
+      return cached.content ? cached.content.slice(0, maxChars) : null;
+    }
+
     const content = fs.readFileSync(filePath, 'utf-8').trim();
-    return content ? content.slice(0, maxChars) : null;
+    const result = content || null;
+    fileCache.set(filePath, { mtimeMs: stat.mtimeMs, content: result });
+
+    // Cap cache size to prevent unbounded growth
+    if (fileCache.size > 50) {
+      const first = fileCache.keys().next().value;
+      if (first) fileCache.delete(first);
+    }
+
+    return result ? result.slice(0, maxChars) : null;
   } catch {
     return null;
   }
@@ -300,6 +323,27 @@ function buildMemoryContext(groupDir: string): string | null {
       }
     } catch {
       // Non-fatal — active/ may not exist yet
+    }
+  }
+
+  // Extracted facts from the memory queue (written by SnapshotMiddleware)
+  const factsPath = path.join(IPC_BASE_DIR, 'memory_facts.json');
+  const factsRaw = readFileSafe(factsPath, 5000);
+  if (factsRaw) {
+    try {
+      const facts = JSON.parse(factsRaw) as Array<{
+        content: string;
+        category: string;
+        confidence: number;
+      }>;
+      if (facts.length > 0) {
+        const formatted = facts
+          .map((f) => `- [${f.category}] ${f.content} (${(f.confidence * 100).toFixed(0)}%)`)
+          .join('\n');
+        addPart('Extracted Facts', formatted);
+      }
+    } catch {
+      // Non-fatal — facts file may be corrupt
     }
   }
 

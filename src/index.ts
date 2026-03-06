@@ -8,6 +8,13 @@ import { Bot, InputFile } from 'grammy';
 import { GROUPS_DIR } from './config.js';
 
 import {
+  createDefaultPipeline,
+  MiddlewarePipeline,
+  MiddlewareServices,
+} from './middleware/index.js';
+import { FactExtractor } from './memory/fact-extractor.js';
+
+import {
   AGENT_RUNNER_ENTRY,
   ASSISTANT_NAME,
   DATA_DIR,
@@ -21,8 +28,6 @@ import {
 import {
   AvailableGroup,
   runAgent as runContainerAgentDispatch,
-  writeGroupsSnapshot,
-  writeTasksSnapshot,
 } from './container-runner.js';
 import {
   getAllChats,
@@ -83,6 +88,8 @@ let sessions: Session = {};
 let registeredGroups: Record<string, RegisteredGroup> = {};
 let lastAgentTimestamp: Record<string, string> = {};
 let memoryManager: MemoryManager;
+let factExtractor: FactExtractor;
+let pipeline: MiddlewarePipeline;
 
 /**
  * Set of recently processed message IDs (format: "msgId:chatJid").
@@ -274,87 +281,20 @@ async function runAgent(
   chatJid: string,
   options?: { sourceChannel?: 'telegram' | 'discord' },
 ): Promise<string | null> {
-  const isMain = group.folder === MAIN_GROUP_FOLDER;
-  const sessionId = sessions[group.folder];
-
-  const tasks = getAllTasks();
-  writeTasksSnapshot(
-    group.folder,
-    isMain,
-    tasks.map((t) => ({
-      id: t.id,
-      groupFolder: t.group_folder,
-      prompt: t.prompt,
-      schedule_type: t.schedule_type,
-      schedule_value: t.schedule_value,
-      status: t.status,
-      next_run: t.next_run,
-    })),
-  );
-
-  const availableGroups = getAvailableGroups();
-  writeGroupsSnapshot(
-    group.folder,
-    isMain,
-    availableGroups,
-    new Set(Object.keys(registeredGroups)),
-  );
+  const ctx = {
+    group,
+    chatJid,
+    prompt,
+    isMain: group.folder === MAIN_GROUP_FOLDER,
+    sourceChannel: options?.sourceChannel,
+    meta: {} as Record<string, unknown>,
+  };
 
   try {
-    await memoryManager.sync(group.folder);
+    const result = await pipeline.execute(ctx);
+    return result.response;
   } catch (err) {
-    logger.warn({ group: group.name, err }, 'Memory sync failed (non-fatal)');
-  }
-
-  try {
-    const output = await runContainerAgentDispatch(group, {
-      prompt,
-      sessionId,
-      groupFolder: group.folder,
-      chatJid,
-      isMain,
-      sourceChannel: options?.sourceChannel,
-    });
-
-    if (output.sessionCleared) {
-      logger.warn(
-        { group: group.name, oldSessionId: sessionId },
-        'Agent recovered from corrupt session by starting fresh',
-      );
-    }
-
-    if (output.newSessionId) {
-      sessions[group.folder] = output.newSessionId;
-      saveJson(path.join(DATA_DIR, 'sessions.json'), sessions);
-    }
-
-    if (output.status === 'error') {
-      logger.error(
-        { group: group.name, error: output.error },
-        'Container agent error',
-      );
-      if (sessions[group.folder]) {
-        logger.info(
-          { group: group.name, sessionId: sessions[group.folder] },
-          'Clearing failed session to prevent retry loop',
-        );
-        delete sessions[group.folder];
-        saveJson(path.join(DATA_DIR, 'sessions.json'), sessions);
-      }
-      return null;
-    }
-
-    return output.result;
-  } catch (err) {
-    logger.error({ group: group.name, err }, 'Agent error');
-    if (sessions[group.folder]) {
-      logger.info(
-        { group: group.name, sessionId: sessions[group.folder] },
-        'Clearing session after unexpected error',
-      );
-      delete sessions[group.folder];
-      saveJson(path.join(DATA_DIR, 'sessions.json'), sessions);
-    }
+    logger.error({ group: group.name, err }, 'Pipeline error');
     return null;
   }
 }
@@ -1803,6 +1743,26 @@ async function main(): Promise<void> {
   logger.info('Memory system initialized');
 
   loadState();
+
+  // Initialize fact extractor and middleware pipeline
+  factExtractor = new FactExtractor(getDb());
+  const services: MiddlewareServices = {
+    getSessions: () => sessions,
+    setSession: (folder, id) => { sessions[folder] = id; },
+    clearSession: (folder) => { delete sessions[folder]; },
+    saveSessions: () => saveJson(path.join(DATA_DIR, 'sessions.json'), sessions),
+    getRegisteredGroups: () => registeredGroups,
+    getAvailableGroups,
+    getAllTasks,
+    getMemoryManager: () => memoryManager,
+    getFactExtractor: () => factExtractor,
+    runAgent: (group, input) => runContainerAgentDispatch(group, input),
+  };
+  pipeline = createDefaultPipeline(services, factExtractor);
+  logger.info(
+    { factExtraction: factExtractor.isAvailable },
+    'Middleware pipeline initialized',
+  );
 
   for (const group of Object.values(registeredGroups)) {
     memoryManager.watchGroup(group.folder);

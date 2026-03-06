@@ -22,4 +22,17 @@ export const PATHS = {
   bettingOutput: path.join(PROJECT_ROOT, "groups", "main", "betting", "output"),
   /** Canvas state directory */
   canvas: path.join(PROJECT_ROOT, "data", "canvas"),
+  /** Distribution data directory */
+  distributionDir: path.join(PROJECT_ROOT, "groups", "main", "distribution"),
+  /** X engagement log */
+  xEngagementLog: path.join(
+    PROJECT_ROOT,
+    "groups",
+    "main",
+    "knowledge",
+    "areas",
+    "x-engagement-log.md"
+  ),
+  /** Creator CSV */
+  creatorCsv: "C:\\claw\\Ball_AI_Lead_List_Clean.csv",
 } as const;

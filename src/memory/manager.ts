@@ -90,10 +90,17 @@ export class MemoryManager {
       currentPaths.add(relativePath);
 
       const stat = fs.statSync(absPath);
+      const existing = indexed.get(relativePath);
+
+      // Fast path: skip files whose mtime hasn't changed (avoids reading file content)
+      if (existing && Math.floor(stat.mtimeMs) === existing.mtime) {
+        continue;
+      }
+
+      // mtime changed (or new file) — read content and compare hash
       const content = fs.readFileSync(absPath, 'utf-8');
       const fileHash = hashText(content);
 
-      const existing = indexed.get(relativePath);
       if (!existing || existing.hash !== fileHash) {
         toIndex.push({ filePath: absPath, relativePath });
       }

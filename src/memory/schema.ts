@@ -46,6 +46,24 @@ export function initMemorySchema(db: Database.Database): void {
       embedding TEXT NOT NULL,
       updated_at INTEGER NOT NULL
     );
+
+    -- Automated fact extraction from conversations
+    CREATE TABLE IF NOT EXISTS memory_facts (
+      id TEXT PRIMARY KEY,
+      group_folder TEXT NOT NULL,
+      content TEXT NOT NULL,
+      category TEXT NOT NULL,
+      confidence REAL NOT NULL DEFAULT 0.5,
+      source_session TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      superseded_by TEXT,
+      access_count INTEGER DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS idx_memory_facts_group
+      ON memory_facts(group_folder);
+    CREATE INDEX IF NOT EXISTS idx_memory_facts_confidence
+      ON memory_facts(confidence DESC);
   `);
 
   // FTS5 virtual table — must be created separately

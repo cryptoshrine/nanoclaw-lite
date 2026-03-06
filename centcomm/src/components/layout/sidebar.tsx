@@ -15,6 +15,7 @@ import {
   Inbox,
   MessageSquare,
   Layers,
+  Megaphone,
   ChevronLeft,
   ChevronRight,
 } from "lucide-react";
@@ -32,6 +33,7 @@ const navItems = [
   { href: "/teams", label: "Teams", icon: Users },
   { href: "/council", label: "Council", icon: Swords },
   { href: "/betting", label: "Bet Finder", icon: TrendingUp },
+  { href: "/distribution", label: "Distribution", icon: Megaphone },
   { href: "/docs", label: "Docs", icon: BookOpen },
   { href: "/inbox", label: "Agent Inbox", icon: Inbox },
 ];
