@@ -12,6 +12,7 @@ import {
   TEAM_POLL_INTERVAL,
   TEAMMATE_TIMEOUT,
   DEFAULT_TEAMMATE_MODEL,
+  MAX_CONCURRENT_SPECIALISTS,
 } from './config.js';
 import {
   createTeam,
@@ -31,6 +32,7 @@ interface ActiveTeammate {
   memberId: string;
   teamId: string;
   name: string;
+  chatJid: string;
   promise: Promise<void>;
   startTime: number;
 }
@@ -100,6 +102,14 @@ export async function spawnTeammate(params: {
   const { teamId, name, prompt, model, leadGroup, chatJid } = params;
   const now = new Date().toISOString();
 
+  // Enforce concurrency cap — prevent runaway specialist spawning
+  if (activeTeammates.size >= MAX_CONCURRENT_SPECIALISTS) {
+    throw new Error(
+      `Concurrency cap reached: ${activeTeammates.size}/${MAX_CONCURRENT_SPECIALISTS} specialists active. ` +
+      `Wait for a specialist to finish before spawning another.`
+    );
+  }
+
   const team = getTeam(teamId);
   if (!team) {
     throw new Error(`Team ${teamId} not found`);
@@ -134,6 +144,7 @@ export async function spawnTeammate(params: {
     memberId,
     teamId,
     name,
+    chatJid: chatJid || '',
     promise: containerPromise,
     startTime: Date.now(),
   });
@@ -286,6 +297,23 @@ export function startTeamWatcher(): void {
 
   checkTeams();
   logger.info('Team watcher started');
+}
+
+/**
+ * Get the number of currently active specialists across all teams.
+ */
+export function getActiveSpecialistCount(): number {
+  return activeTeammates.size;
+}
+
+/**
+ * Get info about a tracked active teammate for progress streaming.
+ * Returns null if the teammate is not active.
+ */
+export function getTeammateInfo(memberId: string): { name: string; chatJid: string; teamId: string } | null {
+  const active = activeTeammates.get(memberId);
+  if (!active) return null;
+  return { name: active.name, chatJid: active.chatJid, teamId: active.teamId };
 }
 
 /**

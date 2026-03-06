@@ -14,6 +14,7 @@ export { createSessionResolveMiddleware, createSessionPersistMiddleware } from '
 export { createAgentMiddleware } from './agent.js';
 export { createErrorRecoveryMiddleware } from './error-recovery.js';
 export { createMemoryQueueMiddleware } from './memory-queue.js';
+export { createClarificationMiddleware } from './clarification.js';
 
 import { FactExtractor } from '../memory/fact-extractor.js';
 
@@ -21,6 +22,7 @@ import { MiddlewarePipeline } from './pipeline.js';
 import { MiddlewareServices } from './services.js';
 
 import { createAgentMiddleware } from './agent.js';
+import { createClarificationMiddleware } from './clarification.js';
 import { createErrorRecoveryMiddleware } from './error-recovery.js';
 import { createMemoryQueueMiddleware } from './memory-queue.js';
 import { createMemorySyncMiddleware } from './memory-sync.js';
@@ -33,15 +35,16 @@ import { createSnapshotMiddleware } from './snapshot.js';
  * Create the default middleware pipeline with all standard middlewares.
  *
  * Pipeline order:
- *   1. Metrics          — timing + logging
- *   2. Snapshot         — write task/group/fact snapshots to IPC
- *   3. MemorySync       — sync memory index
- *   4. PromptSanitize   — strip triggers, truncate uploads, remove base64
- *   5. SessionResolve   — resolve session ID from store
- *   6. Agent            — invoke the agent (short-circuits, triggers after hooks)
- *   7. MemoryQueue      — queue conversation for fact extraction (after hook)
- *   8. SessionPersist   — save new session ID (after hook)
- *   9. ErrorRecovery    — clear failed sessions (after hook)
+ *   1. Metrics           — timing + logging
+ *   2. Snapshot          — write task/group/fact snapshots to IPC
+ *   3. MemorySync        — sync memory index
+ *   4. PromptSanitize    — strip triggers, truncate uploads, remove base64
+ *   5. Clarification     — catch empty/trivially incomplete prompts (DeerFlow Phase 2)
+ *   6. SessionResolve    — resolve session ID from store
+ *   7. Agent             — invoke the agent (short-circuits, triggers after hooks)
+ *   8. MemoryQueue       — queue conversation for fact extraction (after hook)
+ *   9. SessionPersist    — save new session ID (after hook)
+ *  10. ErrorRecovery     — clear failed sessions (after hook)
  */
 export function createDefaultPipeline(
   services: MiddlewareServices,
@@ -52,6 +55,7 @@ export function createDefaultPipeline(
     .use(createSnapshotMiddleware(services))
     .use(createMemorySyncMiddleware(services))
     .use(createPromptSanitizeMiddleware())
+    .use(createClarificationMiddleware())
     .use(createSessionResolveMiddleware(services))
     .use(createAgentMiddleware(services));
 

@@ -14,6 +14,21 @@ export function createErrorRecoveryMiddleware(services: MiddlewareServices): Mid
 
     async after(ctx: MiddlewareContext, result: MiddlewareResult): Promise<MiddlewareResult> {
       if (result.error) {
+        const errorMsg = result.error.toLowerCase();
+
+        // Don't nuke the session for dangling tool call errors —
+        // the agent-runner handles these with targeted recovery.
+        const isDangling = ['tool_use', 'tool_result', 'malformed', 'incomplete', 'dangling']
+          .some(p => errorMsg.includes(p));
+
+        if (isDangling) {
+          logger.warn(
+            { group: ctx.group.name, error: result.error },
+            'Dangling tool call error — preserving session for agent-runner recovery',
+          );
+          return { ...result, response: null };
+        }
+
         logger.error(
           { group: ctx.group.name, error: result.error },
           'Agent error detected',

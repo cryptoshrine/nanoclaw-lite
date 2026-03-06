@@ -61,6 +61,7 @@ interface SDKUserMessage {
 const GROUP_DIR = process.env.NANOCLAW_GROUP_DIR || '/workspace/group';
 const IPC_BASE_DIR = process.env.NANOCLAW_IPC_DIR || '/workspace/ipc';
 const PROJECT_DIR = process.env.NANOCLAW_PROJECT_DIR || '/workspace/project';
+const TEAM_DIR = process.env.NANOCLAW_TEAM_DIR || '';
 const MODEL = process.env.NANOCLAW_MODEL || 'claude-sonnet-4-6';
 
 const IPC_INPUT_DIR = path.join(IPC_BASE_DIR, 'input');
@@ -149,7 +150,31 @@ function getSessionSummary(sessionId: string, transcriptPath: string): string | 
 }
 
 /**
- * Archive the full transcript to conversations/ before compaction.
+ * Custom instructions for the compaction summarizer.
+ * Returned via systemMessage in the PreCompact hook — the SDK injects this
+ * into the compaction prompt as "Additional Instructions".
+ */
+const COMPACTION_INSTRUCTIONS = `When summarizing this conversation, ALWAYS preserve verbatim:
+- Memory context references (SOUL.md, USER.md, knowledge index, daily log entries)
+- All file paths, function names, variable names, and line numbers mentioned
+- Specific error messages, stack traces, and their resolutions
+- Decisions made and their rationale (why X was chosen over Y)
+- Active work thread status and next steps
+- Scheduled task IDs, cron expressions, and configuration values
+- Session handoff blocks (<handoff> content)
+- API keys, endpoint URLs, script paths (names only, never actual secrets)
+- Tool call results that informed decisions
+
+Aggressively compress:
+- Verbose tool outputs (file listings, grep results) — keep only the relevant matches
+- Repeated file reads of the same file — keep only the final state
+- Intermediate search/exploration steps that led nowhere
+- System reminder tags and boilerplate
+- Long code blocks — summarize what changed, keep diffs minimal`;
+
+/**
+ * Archive the full transcript to conversations/ before compaction,
+ * and return custom compaction instructions via systemMessage.
  */
 function createPreCompactHook(): HookCallback {
   return async (input, _toolUseId, _context) => {
@@ -159,7 +184,7 @@ function createPreCompactHook(): HookCallback {
 
     if (!transcriptPath || !fs.existsSync(transcriptPath)) {
       log('No transcript found for archiving');
-      return {};
+      return { systemMessage: COMPACTION_INSTRUCTIONS };
     }
 
     try {
@@ -168,7 +193,7 @@ function createPreCompactHook(): HookCallback {
 
       if (messages.length === 0) {
         log('No messages to archive');
-        return {};
+        return { systemMessage: COMPACTION_INSTRUCTIONS };
       }
 
       const summary = getSessionSummary(sessionId, transcriptPath);
@@ -189,7 +214,7 @@ function createPreCompactHook(): HookCallback {
       log(`Failed to archive transcript: ${err instanceof Error ? err.message : String(err)}`);
     }
 
-    return {};
+    return { systemMessage: COMPACTION_INSTRUCTIONS };
   };
 }
 
@@ -600,6 +625,28 @@ function waitForIpcMessage(): Promise<string | null> {
  * allowing agent teams subagents to run to completion.
  * Also pipes IPC messages into the stream during the query.
  */
+/** Max retries for dangling tool call recovery */
+const MAX_DANGLING_RETRIES = 1;
+
+/**
+ * Detect if an error is likely caused by a dangling/interrupted tool call.
+ * These happen when the model hits max tokens mid-tool_use, leaving an
+ * incomplete tool_use block with no matching tool_result.
+ */
+function isDanglingToolCallError(error: unknown): boolean {
+  const msg = error instanceof Error ? error.message : String(error);
+  const patterns = [
+    'tool_use',
+    'tool_result',
+    'malformed',
+    'unexpected end',
+    'incomplete',
+    'dangling',
+  ];
+  const lower = msg.toLowerCase();
+  return patterns.some(p => lower.includes(p));
+}
+
 async function runQuery(
   prompt: string,
   sessionId: string | undefined,
@@ -607,7 +654,7 @@ async function runQuery(
   containerInput: ContainerInput,
   sdkEnv: Record<string, string | undefined>,
   resumeAt?: string,
-): Promise<{ newSessionId?: string; lastAssistantUuid?: string; closedDuringQuery: boolean; lastResultText?: string }> {
+): Promise<{ newSessionId?: string; lastAssistantUuid?: string; closedDuringQuery: boolean; lastResultText?: string; lastResultError?: string }> {
   const stream = new MessageStream();
   stream.push(prompt);
 
@@ -635,6 +682,7 @@ async function runQuery(
   let newSessionId: string | undefined;
   let lastAssistantUuid: string | undefined;
   let lastResultText: string | undefined;
+  let lastResultError: string | undefined;
   let messageCount = 0;
   let resultCount = 0;
 
@@ -660,8 +708,9 @@ async function runQuery(
   // Combine global CLAUDE.md + memory context + inbox into system prompt append
   const systemAppend = [globalClaudeMd, memoryContext, inboxContext].filter(Boolean).join('\n\n') || undefined;
 
-  // Discover additional directories mounted at /workspace/extra/* (Docker)
-  // or PROJECT_DIR-relative paths (local runner on Windows)
+  // Discover additional directories:
+  // 1. /workspace/extra/* (Docker mount convention)
+  // 2. NANOCLAW_TEAM_DIR (shared workspace for specialists — DeerFlow Phase 2)
   const extraDirs: string[] = [];
   const extraBase = '/workspace/extra';
   if (fs.existsSync(extraBase)) {
@@ -671,6 +720,12 @@ async function runQuery(
         extraDirs.push(fullPath);
       }
     }
+  }
+  // Shared workspace: let specialists access the team dir alongside the lead's group dir.
+  // CWD is already GROUP_DIR (lead's files), so adding TEAM_DIR gives read/write to shared workspace.
+  if (TEAM_DIR && fs.existsSync(TEAM_DIR)) {
+    extraDirs.push(TEAM_DIR);
+    log(`Shared workspace added: ${TEAM_DIR}`);
   }
   if (extraDirs.length > 0) {
     log(`Additional directories: ${extraDirs.join(', ')}`);
@@ -752,7 +807,14 @@ async function runQuery(
       resultCount++;
       const textResult = 'result' in message ? (message as { result?: string }).result : null;
       if (textResult) lastResultText = textResult;
-      log(`Result #${resultCount}: subtype=${message.subtype}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}`);
+
+      // Detect dangling tool call errors in result messages
+      const resultError = 'error' in message ? (message as { error?: string }).error : null;
+      if (resultError) {
+        lastResultError = resultError;
+      }
+
+      log(`Result #${resultCount}: subtype=${message.subtype}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}${resultError ? ` error=${resultError.slice(0, 200)}` : ''}`);
       writeOutput({
         status: 'success',
         result: textResult || null,
@@ -763,7 +825,7 @@ async function runQuery(
 
   ipcPolling = false;
   log(`Query done. Messages: ${messageCount}, results: ${resultCount}, lastAssistantUuid: ${lastAssistantUuid || 'none'}, closedDuringQuery: ${closedDuringQuery}`);
-  return { newSessionId, lastAssistantUuid, closedDuringQuery, lastResultText };
+  return { newSessionId, lastAssistantUuid, closedDuringQuery, lastResultText, lastResultError };
 }
 
 async function main(): Promise<void> {
@@ -848,10 +910,42 @@ async function main(): Promise<void> {
   let resumeAt: string | undefined;
   let lastResultText: string | undefined;
   try {
+    let danglingRetries = 0;
+
     while (true) {
       log(`Starting query (session: ${sessionId || 'new'}, resumeAt: ${resumeAt || 'latest'})...`);
 
-      const queryResult = await runQuery(prompt, sessionId, mcpServerPath, containerInput, sdkEnv, resumeAt);
+      let queryResult;
+      try {
+        queryResult = await runQuery(prompt, sessionId, mcpServerPath, containerInput, sdkEnv, resumeAt);
+      } catch (queryErr) {
+        // Dangling tool call recovery: if the query failed due to an
+        // interrupted tool call, retry once with a recovery prompt instead
+        // of letting ErrorRecoveryMiddleware nuke the entire session.
+        if (isDanglingToolCallError(queryErr) && danglingRetries < MAX_DANGLING_RETRIES) {
+          danglingRetries++;
+          log(`Dangling tool call detected (retry ${danglingRetries}/${MAX_DANGLING_RETRIES}), recovering...`);
+          prompt = 'The previous tool call was interrupted. Please continue from where you left off.';
+          // Keep the same sessionId and resumeAt to continue the session
+          continue;
+        }
+        throw queryErr;
+      }
+
+      // Check if the result contains a dangling tool call error
+      if (queryResult.lastResultError && isDanglingToolCallError(queryResult.lastResultError) && danglingRetries < MAX_DANGLING_RETRIES) {
+        danglingRetries++;
+        log(`Dangling tool call in result (retry ${danglingRetries}/${MAX_DANGLING_RETRIES}), recovering...`);
+        // Update session tracking before retry
+        if (queryResult.newSessionId) sessionId = queryResult.newSessionId;
+        if (queryResult.lastAssistantUuid) resumeAt = queryResult.lastAssistantUuid;
+        prompt = 'The previous tool call was interrupted. Please continue from where you left off.';
+        continue;
+      }
+
+      // Reset retry counter on successful query
+      danglingRetries = 0;
+
       if (queryResult.newSessionId) {
         sessionId = queryResult.newSessionId;
       }

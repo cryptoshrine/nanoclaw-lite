@@ -62,8 +62,20 @@ import {
   cleanupTeam,
   startTeamWatcher,
   writeTeamSnapshot,
+  getTeammateInfo,
 } from './team-manager.js';
+import { ProgressStreamer } from './progress-streamer.js';
 import { addPendingRequest, addToDmAllowlist, dmRejectTimes, getDmAllowlist, loadDmAllowlist, removeFromDmAllowlist } from './dm-allowlist.js';
+import { registerCallbackHandler, processApprovalRequest, cleanupStaleApprovals } from './inline-keyboards.js';
+import {
+  createWorkflow,
+  advanceWorkflow,
+  loadWorkflow,
+  saveWorkflow,
+  buildContinuationPrompt,
+  listActiveWorkflows,
+} from './workflow-engine.js';
+import { startBrowserDaemon } from './browser-daemon.js';
 import { NewMessage, RegisteredGroup, Session, TeamTask } from './types.js';
 import { loadJson, saveJson } from './utils.js';
 import { logger } from './logger.js';
@@ -810,6 +822,13 @@ async function processTaskIpc(
     artifactId?: string;
     changes?: Record<string, unknown>;
     requiresTrigger?: boolean;
+    // For request_approval
+    requestId?: string;
+    description?: string;
+    approveLabel?: string;
+    rejectLabel?: string;
+    options?: string[];
+    ipcDir?: string;
   },
   sourceGroup: string,
   isMain: boolean,
@@ -1327,6 +1346,125 @@ async function processTaskIpc(
       break;
     }
 
+    case 'start_workflow': {
+      const wfData = data as {
+        workflowPath?: string;
+        taskDescription?: string;
+        chatJid?: string;
+        groupFolder?: string;
+      };
+      if (wfData.workflowPath && wfData.taskDescription) {
+        try {
+          const workflow = createWorkflow(
+            wfData.workflowPath,
+            wfData.taskDescription,
+            wfData.groupFolder || sourceGroup,
+            wfData.chatJid || '',
+          );
+          // Mark step 1 as in_progress
+          if (workflow.steps.length > 0) {
+            workflow.steps[0].status = 'in_progress';
+            workflow.steps[0].startedAt = new Date().toISOString();
+            saveWorkflow(workflow);
+          }
+          // Write response for the agent to read
+          const responsesDir = path.join(DATA_DIR, 'ipc', sourceGroup, 'responses');
+          fs.mkdirSync(responsesDir, { recursive: true });
+          const respFile = path.join(responsesDir, `workflow-${workflow.id}.json`);
+          fs.writeFileSync(respFile, JSON.stringify({
+            workflowId: workflow.id,
+            totalSteps: workflow.steps.length,
+            currentStep: 1,
+            firstStep: workflow.steps[0],
+          }));
+          logger.info({ workflowId: workflow.id, steps: workflow.steps.length }, 'Workflow created via IPC');
+        } catch (err) {
+          logger.error({ err }, 'Failed to create workflow');
+        }
+      }
+      break;
+    }
+
+    case 'advance_workflow': {
+      const advData = data as { workflowId?: string; stepOutput?: string };
+      if (advData.workflowId && advData.stepOutput) {
+        try {
+          const result = advanceWorkflow(advData.workflowId, advData.stepOutput);
+          if (result) {
+            if (result.nextStep) {
+              logger.info(
+                { workflowId: advData.workflowId, nextStep: result.nextStep.number },
+                'Workflow advanced',
+              );
+            } else {
+              logger.info({ workflowId: advData.workflowId }, 'Workflow completed');
+              // Send completion notification
+              if (result.state.chatJid) {
+                const mainJid = Object.entries(registeredGroups).find(
+                  ([, g]) => g.folder === MAIN_GROUP_FOLDER,
+                )?.[0];
+                if (mainJid) {
+                  await sendMessage(mainJid, `${ASSISTANT_NAME}: ✅ Workflow completed: ${result.state.taskDescription}`);
+                }
+              }
+            }
+          }
+        } catch (err) {
+          logger.error({ err, workflowId: advData.workflowId }, 'Failed to advance workflow');
+        }
+      }
+      break;
+    }
+
+    case 'block_workflow': {
+      const blockData = data as { workflowId?: string; reason?: string; findings?: string };
+      if (blockData.workflowId && blockData.reason) {
+        try {
+          const workflow = loadWorkflow(blockData.workflowId);
+          if (workflow) {
+            workflow.status = 'blocked';
+            const idx = workflow.currentStep - 1;
+            if (idx >= 0 && idx < workflow.steps.length) {
+              workflow.steps[idx].status = 'blocked';
+            }
+            saveWorkflow(workflow);
+
+            // Notify user via Telegram
+            const mainJid = Object.entries(registeredGroups).find(
+              ([, g]) => g.folder === MAIN_GROUP_FOLDER,
+            )?.[0];
+            if (mainJid) {
+              const msg = `${ASSISTANT_NAME}: ⚠️ Workflow blocked: ${workflow.taskDescription}\n\nStep ${workflow.currentStep}: ${workflow.steps[idx]?.title || 'unknown'}\nReason: ${blockData.reason}${blockData.findings ? `\nFindings: ${blockData.findings}` : ''}`;
+              await sendMessage(mainJid, msg);
+            }
+            logger.info({ workflowId: blockData.workflowId, reason: blockData.reason }, 'Workflow blocked');
+          }
+        } catch (err) {
+          logger.error({ err, workflowId: blockData.workflowId }, 'Failed to block workflow');
+        }
+      }
+      break;
+    }
+
+    case 'request_approval':
+      if (data.chatJid && (data as { description?: string }).description) {
+        try {
+          await processApprovalRequest(bot, {
+            requestId: (data as { requestId?: string }).requestId || `approval-${Date.now()}`,
+            chatJid: data.chatJid,
+            description: (data as { description?: string }).description!,
+            approveLabel: (data as { approveLabel?: string }).approveLabel,
+            rejectLabel: (data as { rejectLabel?: string }).rejectLabel,
+            options: (data as { options?: string[] }).options,
+            ipcDir: (data as { ipcDir?: string }).ipcDir || path.join(DATA_DIR, 'ipc', sourceGroup),
+            groupFolder: sourceGroup,
+          });
+        } catch (err) {
+          logger.error({ err }, 'Failed to process approval request');
+        }
+      }
+      break;
+
     default:
       logger.warn({ type: data.type }, 'Unknown IPC task type');
   }
@@ -1342,6 +1480,9 @@ function connectTelegram(): void {
   }
 
   bot = new Bot(token);
+
+  // Register inline keyboard callback handler (for approval buttons)
+  registerCallbackHandler(bot);
 
   bot.on('message', async (ctx) => {
     const msg = ctx.message;
@@ -1505,6 +1646,12 @@ function connectTelegram(): void {
       });
       startIpcWatcher();
       startMessageLoop();
+
+      // Periodic cleanup of stale inline keyboard approvals (every 5 min)
+      setInterval(() => cleanupStaleApprovals(), 5 * 60 * 1000);
+
+      // Start browser daemon for persistent Playwright sessions
+      startBrowserDaemon();
     },
   });
 }
@@ -1776,6 +1923,31 @@ async function main(): Promise<void> {
   }
 
   startTeamWatcher();
+
+  // Progress streamer: real-time specialist progress in Telegram (DeerFlow Phase 2)
+  const progressStreamer = new ProgressStreamer({
+    sendProgressMessage: async (jid, text) => {
+      try {
+        const chatId = jidToChatId(jid);
+        const msg = await bot.api.sendMessage(chatId, text);
+        return msg.message_id;
+      } catch (err) {
+        logger.debug({ jid, err }, 'Progress sendMessage failed');
+        return null;
+      }
+    },
+    editMessage: async (jid, messageId, text) => {
+      try {
+        const chatId = jidToChatId(jid);
+        await bot.api.editMessageText(chatId, messageId, text);
+      } catch (err) {
+        logger.debug({ jid, messageId, err }, 'editMessageText failed');
+      }
+    },
+    getTeammateInfo,
+  });
+  progressStreamer.start();
+
   connectTelegram();
 
   // Wire Discord pipeline callbacks then start the pipeline

@@ -28,6 +28,59 @@ const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
 const ALLOWED_ENV_VARS = ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY', 'GITHUB_TOKEN', 'ZAPIER_MCP_TOKEN'];
 
 /**
+ * Progressive skill loading: instead of copying full skill files (~500K+),
+ * generate lightweight stubs with just frontmatter. The agent reads the
+ * full skill on demand via the Read tool when it needs to invoke one.
+ *
+ * Stub format preserves the YAML frontmatter (name, description, triggers)
+ * and appends a pointer to the full file path.
+ */
+function syncSkillStubs(sourceDir: string, targetDir: string): void {
+  fs.mkdirSync(targetDir, { recursive: true });
+
+  for (const entry of fs.readdirSync(sourceDir)) {
+    const srcPath = path.join(sourceDir, entry);
+    const stat = fs.statSync(srcPath);
+
+    if (stat.isDirectory()) {
+      // Skill in a subdirectory — find the .md file inside
+      const mdFiles = fs.readdirSync(srcPath).filter(f => f.endsWith('.md'));
+      if (mdFiles.length === 0) continue;
+
+      const mdFile = mdFiles[0];
+      const fullPath = path.join(srcPath, mdFile);
+      const content = fs.readFileSync(fullPath, 'utf-8');
+      const stub = generateSkillStub(content, fullPath);
+
+      const targetSubDir = path.join(targetDir, entry);
+      fs.mkdirSync(targetSubDir, { recursive: true });
+      fs.writeFileSync(path.join(targetSubDir, mdFile), stub);
+    } else if (entry.endsWith('.md')) {
+      // Skill as a standalone .md file
+      const content = fs.readFileSync(srcPath, 'utf-8');
+      const stub = generateSkillStub(content, srcPath);
+      fs.writeFileSync(path.join(targetDir, entry), stub);
+    }
+  }
+}
+
+/**
+ * Extract YAML frontmatter and generate a stub.
+ * If no frontmatter exists, copy the first 500 chars as-is.
+ */
+function generateSkillStub(content: string, fullPath: string): string {
+  const fmMatch = content.match(/^---\n([\s\S]*?)\n---/);
+  if (fmMatch) {
+    // Preserve full frontmatter, replace body with pointer
+    return `${fmMatch[0]}\n\n<!-- Full skill content available at: ${fullPath} -->\n<!-- Use the Read tool to load the full skill when you need to invoke it. -->\n`;
+  }
+
+  // No frontmatter — keep first 500 chars as context
+  const preview = content.slice(0, 500);
+  return `${preview}\n\n<!-- Full skill content available at: ${fullPath} -->\n<!-- Use the Read tool to load the full skill when you need to invoke it. -->\n`;
+}
+
+/**
  * Read allowed env vars from .env file, returning them as a record.
  */
 function loadAllowedEnvVars(): Record<string, string> {
@@ -108,11 +161,13 @@ export async function runLocalAgent(
   const groupClaudeDir = path.join(groupSessionsDir, '.claude');
   fs.mkdirSync(groupClaudeDir, { recursive: true });
 
-  // Sync skills from project to session's .claude directory
+  // Progressive skill loading: generate lightweight stubs instead of
+  // copying full skill files. Saves ~500K+ of context per session.
+  // The agent reads the full skill file on demand when it needs to use it.
   const projectSkillsDir = path.join(PROJECT_ROOT, '.claude', 'skills');
   const sessionSkillsDir = path.join(groupClaudeDir, 'skills');
   if (fs.existsSync(projectSkillsDir)) {
-    fs.cpSync(projectSkillsDir, sessionSkillsDir, { recursive: true });
+    syncSkillStubs(projectSkillsDir, sessionSkillsDir);
   }
 
   // Build environment: inherit full host env, then override specifics
@@ -334,11 +389,11 @@ export async function runLocalTeammate(
   const teammateClaudeDir = path.join(teammateSessionsDir, '.claude');
   fs.mkdirSync(teammateClaudeDir, { recursive: true });
 
-  // Sync skills from project
+  // Progressive skill loading for teammates
   const projectSkillsDir = path.join(PROJECT_ROOT, '.claude', 'skills');
   const sessionSkillsDir = path.join(teammateClaudeDir, 'skills');
   if (fs.existsSync(projectSkillsDir)) {
-    fs.cpSync(projectSkillsDir, sessionSkillsDir, { recursive: true });
+    syncSkillStubs(projectSkillsDir, sessionSkillsDir);
   }
 
   // Teammate IPC namespace

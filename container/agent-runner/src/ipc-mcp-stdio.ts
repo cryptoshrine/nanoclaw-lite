@@ -302,6 +302,313 @@ server.tool(
   },
 );
 
+// Start a step-file workflow for multi-session task execution.
+server.tool(
+  'start_workflow',
+  `Start a step-file workflow for complex multi-session tasks.
+The workflow file is a markdown file with steps defined as "## Step N: Title".
+Each step is executed one at a time, with state persisted to disk.
+If the session ends mid-workflow, the workflow auto-continues in a new session.
+
+Use this for tasks that:
+- Span multiple steps that need sequential execution
+- Might take longer than a single session
+- Need human checkpoints between steps
+- Benefit from structured, auditable execution`,
+  {
+    workflow_path: z.string().describe('Absolute path to the workflow markdown file'),
+    task_description: z.string().describe('What this workflow is accomplishing'),
+  },
+  async (args) => {
+    const data = {
+      type: 'start_workflow',
+      workflowPath: args.workflow_path,
+      taskDescription: args.task_description,
+      chatJid,
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    };
+
+    writeIpcFile(TASKS_DIR, data);
+
+    // Wait briefly for the host to create the workflow and return its ID
+    await new Promise(r => setTimeout(r, 2000));
+
+    // Try to read the response
+    const responsesDir = path.join(IPC_DIR, 'responses');
+    let response = 'Workflow start requested. Check workflow status for the ID.';
+    try {
+      const files = fs.existsSync(responsesDir)
+        ? fs.readdirSync(responsesDir).filter(f => f.startsWith('workflow-')).sort().reverse()
+        : [];
+      if (files.length > 0) {
+        const respFile = path.join(responsesDir, files[0]);
+        const resp = JSON.parse(fs.readFileSync(respFile, 'utf-8'));
+        response = JSON.stringify(resp);
+        try { fs.unlinkSync(respFile); } catch { /* ignore */ }
+      }
+    } catch { /* fall back to generic */ }
+
+    return {
+      content: [{ type: 'text' as const, text: response }],
+    };
+  },
+);
+
+// Advance to the next step in an active workflow.
+server.tool(
+  'advance_workflow',
+  `Report completion of the current workflow step and advance to the next.
+Call this after successfully completing the current step's instructions.`,
+  {
+    workflow_id: z.string().describe('The workflow ID'),
+    step_output: z.string().describe('Summary of what was accomplished in this step'),
+  },
+  async (args) => {
+    const data = {
+      type: 'advance_workflow',
+      workflowId: args.workflow_id,
+      stepOutput: args.step_output,
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    };
+
+    writeIpcFile(TASKS_DIR, data);
+
+    // Wait briefly for the host to process the advancement
+    await new Promise(r => setTimeout(r, 2000));
+
+    // Read updated workflow state to return the next step inline
+    const workflowsDir = path.join(IPC_DIR, '..', '..', 'workflows');
+    let nextStepInfo = 'Advance requested. Check workflow status for the next step.';
+    try {
+      const wfFile = path.join(workflowsDir, `${args.workflow_id}.json`);
+      if (fs.existsSync(wfFile)) {
+        const state = JSON.parse(fs.readFileSync(wfFile, 'utf-8'));
+        const nextIdx = state.currentStep - 1;
+        if (nextIdx >= 0 && nextIdx < state.steps.length) {
+          const next = state.steps[nextIdx];
+          nextStepInfo = `Next step (${next.number}/${state.steps.length}): ${next.title}\n\n${next.content}`;
+        } else if (state.status === 'completed') {
+          nextStepInfo = 'Workflow completed! All steps are done.';
+        }
+      }
+    } catch { /* fall back to generic message */ }
+
+    return {
+      content: [{ type: 'text' as const, text: nextStepInfo }],
+    };
+  },
+);
+
+// Block the current workflow step (escalate).
+server.tool(
+  'block_workflow',
+  `Report that the current workflow step is blocked and needs escalation.
+The workflow will be paused and the user notified.`,
+  {
+    workflow_id: z.string().describe('The workflow ID'),
+    reason: z.string().describe('Why the step is blocked'),
+    findings: z.string().optional().describe('What was learned before getting blocked'),
+  },
+  async (args) => {
+    const data = {
+      type: 'block_workflow',
+      workflowId: args.workflow_id,
+      reason: args.reason,
+      findings: args.findings || '',
+      chatJid,
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    };
+
+    writeIpcFile(TASKS_DIR, data);
+
+    return {
+      content: [{
+        type: 'text' as const,
+        text: `Workflow blocked. The user has been notified. Reason: ${args.reason}`,
+      }],
+    };
+  },
+);
+
+// Request user approval via Telegram inline keyboard buttons.
+// Agent can wait for the response by polling the IPC response file.
+server.tool(
+  'request_approval',
+  `Request user approval via Telegram inline keyboard buttons.
+After calling this tool, poll for the response using check_approval.
+The user will see buttons in Telegram and can approve or reject.
+
+Use this for human checkpoints in long-running tasks:
+- Before deploying code
+- Before sending external messages (tweets, emails)
+- Before destructive operations
+- At decision points in multi-step workflows`,
+  {
+    description: z.string().describe('What you are asking approval for. Shown to the user.'),
+    approve_label: z.string().optional().describe('Custom approve button label (default: "Approve")'),
+    reject_label: z.string().optional().describe('Custom reject button label (default: "Reject")'),
+    options: z.array(z.string()).optional().describe('Custom options for multi-choice approval (replaces approve/reject)'),
+  },
+  async (args) => {
+    const requestId = `approval-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+    const data = {
+      type: 'request_approval',
+      requestId,
+      chatJid,
+      description: args.description,
+      approveLabel: args.approve_label,
+      rejectLabel: args.reject_label,
+      options: args.options,
+      ipcDir: IPC_DIR,
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    };
+
+    writeIpcFile(TASKS_DIR, data);
+
+    return {
+      content: [{
+        type: 'text' as const,
+        text: `Approval requested (${requestId}). Use check_approval with this ID to poll for the user's response.`,
+      }],
+    };
+  },
+);
+
+// Check for approval response from user
+server.tool(
+  'check_approval',
+  `Check if the user has responded to an approval request.
+Call this after request_approval to poll for the response.
+The response will appear once the user taps a button in Telegram.`,
+  {
+    request_id: z.string().describe('The approval request ID returned by request_approval'),
+    wait_seconds: z.number().optional().describe('How long to wait for a response (default: 30, max: 120)'),
+  },
+  async (args) => {
+    const responsesDir = path.join(IPC_DIR, 'responses');
+    const responseFile = path.join(responsesDir, `approval-${args.request_id}.json`);
+
+    const waitMs = Math.min((args.wait_seconds || 30), 120) * 1000;
+    const startTime = Date.now();
+
+    // Poll for the response file
+    while (Date.now() - startTime < waitMs) {
+      if (fs.existsSync(responseFile)) {
+        try {
+          const response = JSON.parse(fs.readFileSync(responseFile, 'utf-8'));
+          // Clean up the response file
+          try { fs.unlinkSync(responseFile); } catch { /* ignore */ }
+
+          return {
+            content: [{
+              type: 'text' as const,
+              text: JSON.stringify({
+                status: response.status,
+                choice: response.choice,
+                requestId: response.requestId,
+              }),
+            }],
+          };
+        } catch {
+          // File might be partially written, retry
+        }
+      }
+      await new Promise(r => setTimeout(r, 1000));
+    }
+
+    return {
+      content: [{
+        type: 'text' as const,
+        text: JSON.stringify({
+          status: 'pending',
+          message: `No response after ${Math.round(waitMs / 1000)}s. The user hasn't tapped a button yet. Try again.`,
+        }),
+      }],
+    };
+  },
+);
+
+// Browser daemon commands — persistent browser that survives session boundaries.
+server.tool(
+  'browser_open',
+  `Open a URL in the persistent browser daemon. The browser state (cookies, localStorage)
+survives across agent sessions. Use this instead of agent-browser for tasks that need
+persistent auth or multi-session browsing.
+
+After opening, you can still use regular agent-browser commands for interactions.
+The daemon auto-saves/loads state between sessions.`,
+  {
+    url: z.string().describe('URL to navigate to'),
+    context_id: z.string().optional().describe('Browser context ID (default: current group folder). Use different IDs for separate browser sessions.'),
+  },
+  async (args) => {
+    const requestId = `br-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const contextId = args.context_id || groupFolder;
+    const browserTasksDir = path.join(IPC_DIR, '..', '..', 'ipc', 'browser', 'commands');
+    fs.mkdirSync(browserTasksDir, { recursive: true });
+
+    const cmdFile = path.join(browserTasksDir, `${requestId}.json`);
+    fs.writeFileSync(cmdFile, JSON.stringify({
+      type: 'open',
+      contextId,
+      url: args.url,
+      requestId,
+    }));
+
+    // Wait for result
+    const resultsDir = path.join(IPC_DIR, '..', '..', 'ipc', 'browser', 'results');
+    const resultFile = path.join(resultsDir, `${requestId}.json`);
+    const deadline = Date.now() + 10000;
+
+    while (Date.now() < deadline) {
+      if (fs.existsSync(resultFile)) {
+        try {
+          const result = JSON.parse(fs.readFileSync(resultFile, 'utf-8'));
+          try { fs.unlinkSync(resultFile); } catch { /* ignore */ }
+          return {
+            content: [{ type: 'text' as const, text: JSON.stringify(result) }],
+          };
+        } catch { /* retry */ }
+      }
+      await new Promise(r => setTimeout(r, 500));
+    }
+
+    return {
+      content: [{ type: 'text' as const, text: 'Browser daemon did not respond in time. It may not be running.' }],
+    };
+  },
+);
+
+server.tool(
+  'browser_status',
+  'Check the browser daemon status: whether it is running, active contexts, etc.',
+  {},
+  async () => {
+    const statusFile = path.join(IPC_DIR, '..', '..', 'ipc', 'browser', 'status.json');
+    if (!fs.existsSync(statusFile)) {
+      return {
+        content: [{ type: 'text' as const, text: 'Browser daemon is not running (no status file).' }],
+      };
+    }
+
+    try {
+      const status = JSON.parse(fs.readFileSync(statusFile, 'utf-8'));
+      return {
+        content: [{ type: 'text' as const, text: JSON.stringify(status, null, 2) }],
+      };
+    } catch {
+      return {
+        content: [{ type: 'text' as const, text: 'Failed to read browser daemon status.' }],
+      };
+    }
+  },
+);
+
 // Start the stdio transport
 const transport = new StdioServerTransport();
 await server.connect(transport);

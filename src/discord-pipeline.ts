@@ -25,6 +25,32 @@ import {
 import { logger } from './logger.js';
 import { saveDraft, getDraft, deleteDraft, enqueuePost, getPendingPosts, markPostPublished, markPostFailed } from './db.js';
 
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+/** Truncate text to fit Discord embed limits (description: 4096, field value: 1024). */
+function truncate(text: string, max: number): string {
+  if (text.length <= max) return text;
+  return text.slice(0, max - 3) + '...';
+}
+
+/**
+ * Extract clean tweet text from LLM output that may contain chain-of-thought,
+ * JSON iterations, or other wrapper content.
+ */
+function extractTweetText(raw: string): string {
+  // Try to extract from JSON if the LLM wrapped it
+  const jsonMatch = raw.match(/"(?:tweet_?text|text|tweet|content)":\s*"((?:[^"\\]|\\.)*)"/);
+  if (jsonMatch) {
+    try {
+      return JSON.parse(`"${jsonMatch[1]}"`);
+    } catch { /* fall through */ }
+  }
+  // If the raw text is short enough to be a tweet, use it directly
+  if (raw.length <= 300 && !raw.includes('{') && !raw.includes('```')) return raw.trim();
+  // Otherwise return as-is — truncation will handle length
+  return raw.trim();
+}
+
 // ── Config ───────────────────────────────────────────────────────────────────
 
 interface DiscordConfig {
@@ -269,8 +295,8 @@ async function handleScoutAlert(message: Message): Promise<void> {
     const researchEmbed = new EmbedBuilder()
       .setColor(0x7c3aed) // purple
       .setTitle('📚 Research Report')
-      .setDescription(research.slice(0, 4000))
-      .addFields({ name: 'Source Tweet', value: `${author}: "${tweetText.slice(0, 200)}..."` })
+      .setDescription(truncate(research, 4096))
+      .addFields({ name: 'Source Tweet', value: truncate(`${author}: "${tweetText}"`, 1024) })
       .setFooter({ text: 'Researcher Bot' })
       .setTimestamp();
 
@@ -342,6 +368,8 @@ async function handleResearchPost(message: Message): Promise<void> {
 
   try {
     const draft = await contentFn(research);
+    // LLM may return chain-of-thought or JSON — extract clean tweet text
+    draft.tweetText = extractTweetText(draft.tweetText);
 
     const draftsChannel = await getChannel(klawClient, config.channels.contentDrafts);
     if (!draftsChannel) return;
@@ -349,7 +377,7 @@ async function handleResearchPost(message: Message): Promise<void> {
     const draftEmbed = new EmbedBuilder()
       .setColor(0xf59e0b) // amber
       .setTitle('📝 Tweet Draft — React ✅ to approve, ❌ to reject')
-      .setDescription(draft.tweetText)
+      .setDescription(truncate(draft.tweetText, 4096))
       .addFields(
         { name: 'Characters', value: `${draft.tweetText.length}/280`, inline: true },
         { name: 'Has Image', value: draft.imagePath ? '✅' : '❌', inline: true },
@@ -560,7 +588,7 @@ async function handleReaction(reaction: MessageReaction, user: User): Promise<vo
       const approvedEmbed = new EmbedBuilder()
         .setColor(0x22c55e) // green
         .setTitle('✅ Approved Tweet')
-        .setDescription(draft.tweetText)
+        .setDescription(truncate(draft.tweetText, 4096))
         .addFields(
           { name: 'Status', value: 'In post queue — publishing shortly', inline: true },
           { name: 'Queue ID', value: `#${queueId}`, inline: true },
@@ -616,7 +644,7 @@ export async function processPostQueue(): Promise<void> {
           const postedEmbed = new EmbedBuilder()
             .setColor(0x1da1f2)
             .setTitle('🐦 Published to X')
-            .setDescription(draft.tweetText)
+            .setDescription(truncate(draft.tweetText, 4096))
             .addFields({ name: 'URL', value: tweetUrl })
             .setFooter({ text: `Queue #${item.id} • Ball-AI Agent` })
             .setTimestamp();

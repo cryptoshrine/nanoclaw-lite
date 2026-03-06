@@ -70,3 +70,7 @@ export const TEAM_DIR = path.resolve(DATA_DIR, 'teams');
 export const TEAM_POLL_INTERVAL = 2000; // Poll interval for teammate status checks
 export const TEAMMATE_TIMEOUT = 600000; // 10 minutes timeout for teammates
 export const DEFAULT_TEAMMATE_MODEL = 'claude-sonnet-4-6';
+export const MAX_CONCURRENT_SPECIALISTS = parseInt(
+  process.env.MAX_CONCURRENT_SPECIALISTS || '3',
+  10,
+);

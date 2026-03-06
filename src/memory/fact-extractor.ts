@@ -70,21 +70,21 @@ export class FactExtractor {
   private queue = new Map<string, QueueEntry>();
   private debounceTimers = new Map<string, NodeJS.Timeout>();
   private db: Database.Database;
-  private apiKey: string | undefined;
+  private oauthToken: string | undefined;
 
   constructor(db: Database.Database) {
     this.db = db;
-    this.apiKey = process.env.ANTHROPIC_API_KEY;
+    this.oauthToken = process.env.CLAUDE_CODE_OAUTH_TOKEN;
   }
 
   get isAvailable(): boolean {
-    return !!this.apiKey;
+    return !!this.oauthToken;
   }
 
   /** Queue a conversation for fact extraction. Debounced per group. */
   enqueue(groupFolder: string, transcript: string, sessionId?: string): void {
     if (!this.isAvailable) {
-      logger.debug('Fact extraction unavailable — no ANTHROPIC_API_KEY');
+      logger.debug('Fact extraction unavailable — no CLAUDE_CODE_OAUTH_TOKEN');
       return;
     }
 
@@ -257,7 +257,7 @@ export class FactExtractor {
     transcript: string,
     existingFacts: StoredFact[],
   ): Promise<ExtractedFact[]> {
-    if (!this.apiKey) return [];
+    if (!this.oauthToken) return [];
 
     const existingContext =
       existingFacts.length > 0
@@ -269,8 +269,9 @@ export class FactExtractor {
         method: 'POST',
         headers: {
           'content-type': 'application/json',
-          'x-api-key': this.apiKey,
+          'Authorization': `Bearer ${this.oauthToken}`,
           'anthropic-version': '2023-06-01',
+          'anthropic-beta': 'oauth-2025-04-20',
         },
         body: JSON.stringify({
           model: 'claude-3-5-haiku-20241022',
