@@ -17,7 +17,7 @@ beforeEach(() => {
   _initTestDatabase();
 });
 
-// Helper to store a message using the normalized NewMessage interface
+// Helper to store a message using the storeMessage API
 function store(overrides: {
   id: string;
   chat_jid: string;
@@ -29,12 +29,12 @@ function store(overrides: {
 }) {
   storeMessage({
     id: overrides.id,
-    chat_jid: overrides.chat_jid,
+    chatJid: overrides.chat_jid,
     sender: overrides.sender,
-    sender_name: overrides.sender_name,
+    senderName: overrides.sender_name,
     content: overrides.content,
     timestamp: overrides.timestamp,
-    is_from_me: overrides.is_from_me ?? false,
+    isFromMe: overrides.is_from_me ?? false,
   });
 }
 
@@ -138,9 +138,9 @@ describe('getMessagesSince', () => {
       sender_name: 'Bob', content: 'second', timestamp: '2024-01-01T00:00:02.000Z',
     });
     storeMessage({
-      id: 'm3', chat_jid: 'group@g.us', sender: 'Bot@s.whatsapp.net',
-      sender_name: 'Bot', content: 'bot reply', timestamp: '2024-01-01T00:00:03.000Z',
-      is_bot_message: true,
+      id: 'm3', chatJid: 'group@g.us', sender: 'Bot@s.whatsapp.net',
+      senderName: 'Bot', content: 'Andy: bot reply', timestamp: '2024-01-01T00:00:03.000Z',
+      isFromMe: false,
     });
     store({
       id: 'm4', chat_jid: 'group@g.us', sender: 'Carol@s.whatsapp.net',
@@ -155,9 +155,9 @@ describe('getMessagesSince', () => {
     expect(msgs[0].content).toBe('third');
   });
 
-  it('excludes bot messages via is_bot_message flag', () => {
+  it('excludes bot messages via content prefix', () => {
     const msgs = getMessagesSince('group@g.us', '2024-01-01T00:00:00.000Z', 'Andy');
-    const botMsgs = msgs.filter((m) => m.content === 'bot reply');
+    const botMsgs = msgs.filter((m) => m.content === 'Andy: bot reply');
     expect(botMsgs).toHaveLength(0);
   });
 
@@ -195,9 +195,9 @@ describe('getNewMessages', () => {
       sender_name: 'User', content: 'g2 msg1', timestamp: '2024-01-01T00:00:02.000Z',
     });
     storeMessage({
-      id: 'a3', chat_jid: 'group1@g.us', sender: 'user@s.whatsapp.net',
-      sender_name: 'User', content: 'bot reply', timestamp: '2024-01-01T00:00:03.000Z',
-      is_bot_message: true,
+      id: 'a3', chatJid: 'group1@g.us', sender: 'user@s.whatsapp.net',
+      senderName: 'User', content: 'Andy: bot reply', timestamp: '2024-01-01T00:00:03.000Z',
+      isFromMe: false,
     });
     store({
       id: 'a4', chat_jid: 'group1@g.us', sender: 'user@s.whatsapp.net',

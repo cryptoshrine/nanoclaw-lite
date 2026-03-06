@@ -206,10 +206,17 @@ function jidToChatId(jid: string): number {
 }
 
 /**
+ * Set registered groups (for testing only).
+ */
+export function _setRegisteredGroups(groups: Record<string, RegisteredGroup>): void {
+  registeredGroups = groups;
+}
+
+/**
  * Get available groups list for the agent.
  * Returns groups ordered by most recent activity.
  */
-function getAvailableGroups(): AvailableGroup[] {
+export function getAvailableGroups(): AvailableGroup[] {
   const chats = getAllChats();
   const registeredJids = new Set(Object.keys(registeredGroups));
 

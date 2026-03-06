@@ -6,6 +6,7 @@ import { STORE_DIR } from './config.js';
 import { initMemorySchema } from './memory/schema.js';
 import {
   NewMessage,
+  RegisteredGroup,
   ScheduledTask,
   TaskRunLog,
   Team,
@@ -24,12 +25,17 @@ export function getDb(): Database.Database {
   return db;
 }
 
-export function initDatabase(): void {
-  const dbPath = path.join(STORE_DIR, 'messages.db');
-  fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+/**
+ * Initialize an in-memory database for tests.
+ * Resets state on every call (suitable for beforeEach).
+ */
+export function _initTestDatabase(): void {
+  db = new Database(':memory:');
+  _createSchema(db);
+}
 
-  db = new Database(dbPath);
-  db.exec(`
+function _createSchema(database: Database.Database): void {
+  database.exec(`
     CREATE TABLE IF NOT EXISTS chats (
       jid TEXT PRIMARY KEY,
       name TEXT,
@@ -59,7 +65,11 @@ export function initDatabase(): void {
       last_run TEXT,
       last_result TEXT,
       status TEXT DEFAULT 'active',
-      created_at TEXT NOT NULL
+      created_at TEXT NOT NULL,
+      context_mode TEXT DEFAULT 'isolated',
+      retry_count INTEGER DEFAULT 0,
+      max_retries INTEGER DEFAULT 3,
+      last_error TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_next_run ON scheduled_tasks(next_run);
     CREATE INDEX IF NOT EXISTS idx_status ON scheduled_tasks(status);
@@ -75,47 +85,7 @@ export function initDatabase(): void {
       FOREIGN KEY (task_id) REFERENCES scheduled_tasks(id)
     );
     CREATE INDEX IF NOT EXISTS idx_task_run_logs ON task_run_logs(task_id, run_at);
-  `);
 
-  // Add sender_name column if it doesn't exist (migration for existing DBs)
-  try {
-    db.exec(`ALTER TABLE messages ADD COLUMN sender_name TEXT`);
-  } catch {
-    /* column already exists */
-  }
-
-  // Add context_mode column if it doesn't exist (migration for existing DBs)
-  try {
-    db.exec(
-      `ALTER TABLE scheduled_tasks ADD COLUMN context_mode TEXT DEFAULT 'isolated'`,
-    );
-  } catch {
-    /* column already exists */
-  }
-
-  // Add retry columns if they don't exist (migration for existing DBs)
-  try {
-    db.exec(
-      `ALTER TABLE scheduled_tasks ADD COLUMN retry_count INTEGER DEFAULT 0`,
-    );
-  } catch {
-    /* column already exists */
-  }
-  try {
-    db.exec(
-      `ALTER TABLE scheduled_tasks ADD COLUMN max_retries INTEGER DEFAULT 3`,
-    );
-  } catch {
-    /* column already exists */
-  }
-  try {
-    db.exec(`ALTER TABLE scheduled_tasks ADD COLUMN last_error TEXT`);
-  } catch {
-    /* column already exists */
-  }
-
-  // Discord draft persistence (survives restarts)
-  db.exec(`
     CREATE TABLE IF NOT EXISTS discord_drafts (
       message_id TEXT PRIMARY KEY,
       tweet_text TEXT NOT NULL,
@@ -123,10 +93,7 @@ export function initDatabase(): void {
       research_context TEXT NOT NULL,
       created_at TEXT NOT NULL
     );
-  `);
 
-  // Post queue — approved tweets awaiting publishing
-  db.exec(`
     CREATE TABLE IF NOT EXISTS post_queue (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       tweet_text TEXT NOT NULL,
@@ -141,13 +108,17 @@ export function initDatabase(): void {
       last_error TEXT,
       discord_approved_msg_id TEXT
     );
-  `);
 
-  // Memory system tables
-  initMemorySchema(db);
+    CREATE TABLE IF NOT EXISTS registered_groups (
+      jid TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      folder TEXT NOT NULL,
+      trigger_word TEXT NOT NULL,
+      added_at TEXT NOT NULL,
+      requires_trigger INTEGER DEFAULT 1,
+      container_config TEXT
+    );
 
-  // Agent Teams tables
-  db.exec(`
     CREATE TABLE IF NOT EXISTS teams (
       id TEXT PRIMARY KEY,
       name TEXT NOT NULL UNIQUE,
@@ -200,6 +171,28 @@ export function initDatabase(): void {
     CREATE INDEX IF NOT EXISTS idx_team_messages_team ON team_messages(team_id);
     CREATE INDEX IF NOT EXISTS idx_team_messages_to ON team_messages(to_member);
   `);
+
+  initMemorySchema(database);
+}
+
+export function initDatabase(): void {
+  const dbPath = path.join(STORE_DIR, 'messages.db');
+  fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+
+  db = new Database(dbPath);
+  _createSchema(db);
+
+  // Migrations for existing DBs (safe to run multiple times)
+  const migrations = [
+    'ALTER TABLE messages ADD COLUMN sender_name TEXT',
+    "ALTER TABLE scheduled_tasks ADD COLUMN context_mode TEXT DEFAULT 'isolated'",
+    'ALTER TABLE scheduled_tasks ADD COLUMN retry_count INTEGER DEFAULT 0',
+    'ALTER TABLE scheduled_tasks ADD COLUMN max_retries INTEGER DEFAULT 3',
+    'ALTER TABLE scheduled_tasks ADD COLUMN last_error TEXT',
+  ];
+  for (const sql of migrations) {
+    try { db.exec(sql); } catch { /* column already exists */ }
+  }
 }
 
 /**
@@ -900,4 +893,42 @@ export function deleteTeam(teamId: string): void {
   db.prepare('DELETE FROM team_tasks WHERE team_id = ?').run(teamId);
   db.prepare('DELETE FROM team_members WHERE team_id = ?').run(teamId);
   db.prepare('DELETE FROM teams WHERE id = ?').run(teamId);
+}
+
+// --- Registered groups (DB-backed for tests) ---
+
+export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
+  db.prepare(
+    `INSERT OR REPLACE INTO registered_groups (jid, name, folder, trigger_word, added_at, requires_trigger, container_config)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    jid,
+    group.name,
+    group.folder,
+    group.trigger,
+    group.added_at,
+    group.requiresTrigger === false ? 0 : 1,
+    group.containerConfig ? JSON.stringify(group.containerConfig) : null,
+  );
+}
+
+export function getRegisteredGroup(jid: string): RegisteredGroup | undefined {
+  const row = db.prepare('SELECT * FROM registered_groups WHERE jid = ?').get(jid) as {
+    jid: string;
+    name: string;
+    folder: string;
+    trigger_word: string;
+    added_at: string;
+    requires_trigger: number;
+    container_config: string | null;
+  } | undefined;
+  if (!row) return undefined;
+  return {
+    name: row.name,
+    folder: row.folder,
+    trigger: row.trigger_word,
+    added_at: row.added_at,
+    requiresTrigger: row.requires_trigger === 1,
+    containerConfig: row.container_config ? JSON.parse(row.container_config) : undefined,
+  };
 }
