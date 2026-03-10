@@ -609,6 +609,81 @@ server.tool(
   },
 );
 
+// ============ Agent Teams Tools ============
+
+server.tool(
+  'create_team',
+  `Create a new agent team. You become the team lead and can spawn teammates to work on tasks in parallel.
+
+Use this when you have a complex task that can be broken down into independent subtasks that can run concurrently.`,
+  {
+    name: z.string().describe('Unique name for the team (e.g., "refactor-auth-2024")'),
+  },
+  async (args) => {
+    if (!isMain) {
+      return {
+        content: [{ type: 'text' as const, text: 'Only the main group can create teams.' }],
+        isError: true,
+      };
+    }
+
+    const data = {
+      type: 'create_team',
+      teamName: args.name,
+      timestamp: new Date().toISOString(),
+    };
+
+    writeIpcFile(TASKS_DIR, data);
+
+    return {
+      content: [{ type: 'text' as const, text: `Team "${args.name}" creation requested. Use list_teams to see available teams.` }],
+    };
+  },
+);
+
+server.tool(
+  'spawn_teammate',
+  `Spawn a new teammate agent in a separate container. The teammate will work autonomously on the given task.
+
+Teammates have access to:
+- The team's shared /workspace/team directory
+- Your group's files (read-only)
+- Team messaging and task tools
+
+Teammates run with sonnet by default for cost efficiency. Use opus for complex reasoning tasks.`,
+  {
+    team_id: z.string().describe('The team ID to add the teammate to'),
+    name: z.string().describe('A short name for this teammate (e.g., "api-refactor", "test-writer")'),
+    prompt: z.string().describe('The task for this teammate to complete. Be specific and include all context needed.'),
+    model: z.enum(['claude-sonnet-4-6', 'claude-sonnet-4-20250514', 'claude-opus-4-6']).optional().describe('Model to use (default: claude-sonnet-4-6)'),
+  },
+  async (args) => {
+    if (!isMain) {
+      return {
+        content: [{ type: 'text' as const, text: 'Only the main group can spawn teammates.' }],
+        isError: true,
+      };
+    }
+
+    const data = {
+      type: 'spawn_teammate',
+      teamId: args.team_id,
+      teammateName: args.name,
+      teammatePrompt: args.prompt,
+      teammateModel: args.model,
+      chatJid,
+      sourceChannel,
+      timestamp: new Date().toISOString(),
+    };
+
+    writeIpcFile(TASKS_DIR, data);
+
+    return {
+      content: [{ type: 'text' as const, text: `Teammate "${args.name}" spawn requested for team ${args.team_id}.` }],
+    };
+  },
+);
+
 // Start the stdio transport
 const transport = new StdioServerTransport();
 await server.connect(transport);

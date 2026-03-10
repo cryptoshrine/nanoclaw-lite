@@ -77,6 +77,7 @@ import {
 } from './workflow-engine.js';
 import { startBrowserDaemon } from './browser-daemon.js';
 import { NewMessage, RegisteredGroup, Session, TeamTask } from './types.js';
+import { formatOutbound } from './router.js';
 import { loadJson, saveJson } from './utils.js';
 import { logger } from './logger.js';
 import {
@@ -262,7 +263,14 @@ async function processMessage(msg: NewMessage): Promise<void> {
         .replace(/</g, '&lt;')
         .replace(/>/g, '&gt;')
         .replace(/"/g, '&quot;');
-    return `<message sender="${escapeXml(m.sender_name)}" time="${m.timestamp}">${escapeXml(m.content)}</message>`;
+    // Strip "klaw: " prefix from bot messages to avoid redundant attribution
+    // since the sender tag already identifies the source
+    let content = m.content;
+    if (content.startsWith(`${ASSISTANT_NAME}: `)) {
+      content = content.slice(ASSISTANT_NAME.length + 2);
+    }
+    const role = m.sender_name === ASSISTANT_NAME ? 'assistant' : 'user';
+    return `<message sender="${escapeXml(m.sender_name)}" role="${role}" time="${m.timestamp}">${escapeXml(content)}</message>`;
   });
   const prompt = `<messages>\n${lines.join('\n')}\n</messages>`;
 
@@ -278,19 +286,22 @@ async function processMessage(msg: NewMessage): Promise<void> {
 
   if (response) {
     lastAgentTimestamp[msg.chat_jid] = msg.timestamp;
-    const fullResponse = `${ASSISTANT_NAME}: ${response}`;
-    await sendMessage(msg.chat_jid, fullResponse);
-    // Store agent response in DB so CENTCOMM chat can see it
-    // (Telegram private chats don't echo bot's own messages back)
-    storeMessage({
-      id: `agent-resp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-      chatJid: msg.chat_jid,
-      sender: ASSISTANT_NAME,
-      senderName: ASSISTANT_NAME,
-      content: fullResponse,
-      timestamp: new Date().toISOString(),
-      isFromMe: true,
-    });
+    const cleanResponse = formatOutbound(response);
+    if (cleanResponse) {
+      const fullResponse = `${ASSISTANT_NAME}: ${cleanResponse}`;
+      await sendMessage(msg.chat_jid, fullResponse);
+      // Store agent response in DB so CENTCOMM chat can see it
+      // (Telegram private chats don't echo bot's own messages back)
+      storeMessage({
+        id: `agent-resp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        chatJid: msg.chat_jid,
+        sender: ASSISTANT_NAME,
+        senderName: ASSISTANT_NAME,
+        content: fullResponse,
+        timestamp: new Date().toISOString(),
+        isFromMe: true,
+      });
+    }
   }
 }
 
@@ -476,11 +487,29 @@ function startIpcWatcher(): void {
                   }
                   if (targetJid) {
                     const senderLabel = data.sender || `teammate:${memberId}`;
-                    const messageText = `${ASSISTANT_NAME}: ${data.text}`;
+                    const cleanText = formatOutbound(data.text);
+                    if (!cleanText) { fs.unlinkSync(filePath); continue; }
+                    const messageText = `${ASSISTANT_NAME}: ${cleanText}`;
                     const messageId = `teammate-${memberId}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
                     const timestamp = data.timestamp || new Date().toISOString();
 
-                    await sendMessage(targetJid, messageText);
+                    // Check sourceChannel: route to Discord if the originating session was Discord
+                    const teammateSourceChannel = data.sourceChannel || 'telegram';
+                    if (teammateSourceChannel === 'discord') {
+                      const discordTarget = data.discordChannelId || getActiveDiscordChannelId();
+                      await sendToDiscordChannel(data.text, discordTarget || undefined);
+                      logger.info(
+                        { memberId, sender: senderLabel, discordChannel: discordTarget },
+                        'Teammate message routed to Discord',
+                      );
+                    } else {
+                      await sendMessage(targetJid, messageText);
+                      logger.info(
+                        { memberId, chatJid: targetJid, sender: senderLabel },
+                        'Teammate message sent to Telegram',
+                      );
+                    }
+
                     storeMessage({
                       id: messageId,
                       chatJid: targetJid,
@@ -490,10 +519,6 @@ function startIpcWatcher(): void {
                       timestamp,
                       isFromMe: true,
                     });
-                    logger.info(
-                      { memberId, chatJid: targetJid, sender: senderLabel },
-                      'Teammate message sent to Telegram',
-                    );
 
                     // Route to Discord agent line channel
                     const agentLineMap: Record<string, AgentLine> = {
@@ -553,7 +578,9 @@ function startIpcWatcher(): void {
                 ) {
                   const isSteering = data.source === 'centcomm-steering';
                   const isDiscord = data.sourceChannel === 'discord';
-                  const messageText = isSteering ? data.text : `${ASSISTANT_NAME}: ${data.text}`;
+                  const cleanIpcText = isSteering ? data.text : formatOutbound(data.text);
+                  if (!cleanIpcText) { fs.unlinkSync(filePath); continue; }
+                  const messageText = isSteering ? cleanIpcText : `${ASSISTANT_NAME}: ${cleanIpcText}`;
                   const messageId = `ipc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
                   const timestamp = data.timestamp || new Date().toISOString();
 
@@ -814,6 +841,9 @@ async function processTaskIpc(
     text?: string;
     url?: string;
     source?: string;
+    // For source channel routing (Discord → specialist → Discord)
+    sourceChannel?: 'telegram' | 'discord';
+    discordChannelId?: string;
     // For dm_allowlist
     user_id?: number;
     // For canvas_update
@@ -1082,6 +1112,7 @@ async function processTaskIpc(
             model: data.teammateModel,
             leadGroup: sourceGroup,
             chatJid: teammateChatJid,
+            sourceChannel: data.sourceChannel,
           });
           logger.info(
             { teamId: data.teamId, name: data.teammateName },
@@ -1968,20 +1999,58 @@ async function main(): Promise<void> {
       logger.info({ ideasChannels }, 'Ideas channels registered as interactive');
     }
 
-    setDirectLineCallback(async (text: string, author: string, _channelId: string) => {
-      // Find the main group
-      const mainEntry = Object.entries(registeredGroups).find(
-        ([, g]) => g.folder === MAIN_GROUP_FOLDER,
+    // Register Klaw Projects channels as interactive (two-way)
+    const klawProjectChannels = [
+      process.env.DISCORD_CHANNEL_BETTING_INTELLIGENCE,
+      process.env.DISCORD_CHANNEL_INFO_PRODUCT_FACTORY,
+      process.env.DISCORD_CHANNEL_OPENCLAW_FOOTBALL_SKILLS,
+    ].filter(Boolean) as string[];
+
+    // Register Betting Model channels as interactive (two-way)
+    const bettingModelChannels = [
+      process.env.DISCORD_CHANNEL_MODEL_DEVELOPMENT,
+      process.env.DISCORD_CHANNEL_VALUE_BETS,
+    ].filter(Boolean) as string[];
+    if (bettingModelChannels.length > 0) {
+      addInteractiveChannels(bettingModelChannels);
+      logger.info({ bettingModelChannels }, 'Betting Model channels registered as interactive');
+    }
+    if (klawProjectChannels.length > 0) {
+      addInteractiveChannels(klawProjectChannels);
+      logger.info({ klawProjectChannels }, 'Klaw Projects channels registered as interactive');
+    }
+
+    // Map Discord channel IDs to dedicated groups (falls back to main)
+    const discordChannelGroupMap: Record<string, string> = {};
+    const bettingModelChannelIds = [
+      process.env.DISCORD_CHANNEL_MODEL_DEVELOPMENT,
+      process.env.DISCORD_CHANNEL_VALUE_BETS,
+    ].filter(Boolean) as string[];
+    for (const chId of bettingModelChannelIds) {
+      discordChannelGroupMap[chId] = 'betting-model';
+    }
+
+    setDirectLineCallback(async (text: string, author: string, channelId: string) => {
+      // Resolve which group to route this channel to
+      const targetFolder = discordChannelGroupMap[channelId] || MAIN_GROUP_FOLDER;
+      const targetEntry = Object.entries(registeredGroups).find(
+        ([, g]) => g.folder === targetFolder,
       );
-      if (!mainEntry) return null;
-      const [mainJid, mainGroup] = mainEntry;
+      // Fall back to main if the dedicated group isn't registered
+      const fallbackEntry = targetFolder !== MAIN_GROUP_FOLDER
+        ? Object.entries(registeredGroups).find(([, g]) => g.folder === MAIN_GROUP_FOLDER)
+        : null;
+      const [targetJid, targetGroup] = targetEntry || fallbackEntry || [null, null];
+      if (!targetJid || !targetGroup) return null;
 
       // Store the Discord message in our DB so it shows in history
       const msgId = `discord-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       const timestamp = new Date().toISOString();
+      // Ensure the chat row exists (Discord groups may not have been synced into chats table)
+      storeChatMetadata(targetJid, timestamp, targetGroup.name);
       storeMessage({
         id: msgId,
-        chatJid: mainJid,
+        chatJid: targetJid,
         sender: author,
         senderName: author,
         content: text,
@@ -1990,13 +2059,13 @@ async function main(): Promise<void> {
       });
 
       // Mark as processed so the message loop doesn't pick it up and send to Telegram
-      const dedupKey = `${msgId}:${mainJid}`;
+      const dedupKey = `${msgId}:${targetJid}`;
       processedMessageIds.add(dedupKey);
       inFlightMessages.add(dedupKey);
 
       // Format and run through the agent (same as Telegram message processing)
       const prompt = `<messages>\n<message sender="${author}" time="${timestamp}">${text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</message>\n</messages>`;
-      const rawResponse = await runAgent(mainGroup, prompt, mainJid, { sourceChannel: 'discord' });
+      const rawResponse = await runAgent(targetGroup, prompt, targetJid, { sourceChannel: 'discord' });
 
       // Strip <internal> and <handoff> tags — only return user-facing content
       const response = rawResponse
@@ -2010,7 +2079,7 @@ async function main(): Promise<void> {
       if (rawResponse) {
         storeMessage({
           id: `discord-resp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-          chatJid: mainJid,
+          chatJid: targetJid,
           sender: ASSISTANT_NAME,
           senderName: ASSISTANT_NAME,
           content: rawResponse,
@@ -2022,7 +2091,7 @@ async function main(): Promise<void> {
       inFlightMessages.delete(dedupKey);
       return response || null;
     });
-    logger.info('Discord direct line wired: #general-ops → agent');
+    logger.info('Discord direct line wired with channel-to-group routing');
   }
 
   startDiscordPipeline()

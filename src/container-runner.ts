@@ -523,6 +523,7 @@ export interface TeammateContainerInput {
   model: string;
   leadGroup: string;
   chatJid?: string;
+  sourceChannel?: 'telegram' | 'discord';
 }
 
 function buildTeammateMounts(input: TeammateContainerInput): VolumeMount[] {
@@ -650,6 +651,7 @@ export async function runTeammateContainer(
     memberId: input.memberId,
     memberName: input.memberName,
     teammateModel: input.model,
+    sourceChannel: input.sourceChannel || 'telegram',
   };
 
   const logsDir = path.join(TEAM_DIR, input.teamId, 'logs');

@@ -26,6 +26,7 @@ import {
   postToProject,
   postToMissionControl,
 } from './discord-channels.js';
+import { checkAndScheduleWorkflowContinuation } from './workflow-engine.js';
 
 export interface SchedulerDependencies {
   sendMessage: (jid: string, text: string) => Promise<void>;
@@ -231,6 +232,19 @@ async function runTask(
     } catch (err) {
       logger.error({ err }, 'Error routing task result to Discord');
     }
+  }
+
+  // Auto-continue any active workflows for this group
+  try {
+    const continued = checkAndScheduleWorkflowContinuation(task.group_folder, task.chat_jid);
+    if (continued > 0) {
+      logger.info(
+        { taskId: task.id, groupFolder: task.group_folder, continued },
+        'Scheduled workflow continuation after task completed',
+      );
+    }
+  } catch (err) {
+    logger.error({ err, taskId: task.id }, 'Failed to check workflow continuation');
   }
 }
 

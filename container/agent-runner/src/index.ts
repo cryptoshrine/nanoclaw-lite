@@ -321,8 +321,8 @@ function buildMemoryContext(groupDir: string): string | null {
   }
 
   // Today's daily log, falling back to yesterday
-  const todayLog = readFileSafe(getDailyLogPath(groupDir, 0), 5000);
-  const yesterdayLog = !todayLog ? readFileSafe(getDailyLogPath(groupDir, 1), 3000) : null;
+  const todayLog = readFileSafe(getDailyLogPath(groupDir, 0), 12000);
+  const yesterdayLog = !todayLog ? readFileSafe(getDailyLogPath(groupDir, 1), 5000) : null;
   if (todayLog) {
     addPart('Daily Log (Today)', todayLog);
   } else if (yesterdayLog) {

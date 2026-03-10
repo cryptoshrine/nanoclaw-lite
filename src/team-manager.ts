@@ -26,6 +26,7 @@ import {
 import { runTeammate as runTeammateDispatch } from './container-runner.js';
 import { logger } from './logger.js';
 import { Team, TeamMember } from './types.js';
+import { checkAndScheduleWorkflowContinuation } from './workflow-engine.js';
 
 // Track active teammate containers
 interface ActiveTeammate {
@@ -33,6 +34,7 @@ interface ActiveTeammate {
   teamId: string;
   name: string;
   chatJid: string;
+  sourceChannel: 'telegram' | 'discord';
   promise: Promise<void>;
   startTime: number;
 }
@@ -98,8 +100,9 @@ export async function spawnTeammate(params: {
   model?: string;
   leadGroup: string;
   chatJid?: string;
+  sourceChannel?: 'telegram' | 'discord';
 }): Promise<TeamMember> {
-  const { teamId, name, prompt, model, leadGroup, chatJid } = params;
+  const { teamId, name, prompt, model, leadGroup, chatJid, sourceChannel } = params;
   const now = new Date().toISOString();
 
   // Enforce concurrency cap — prevent runaway specialist spawning
@@ -138,13 +141,14 @@ export async function spawnTeammate(params: {
   logger.info({ memberId, teamId, name }, 'Spawning teammate');
 
   // Start the container asynchronously
-  const containerPromise = runTeammateInContainer(member, leadGroup, chatJid);
+  const containerPromise = runTeammateInContainer(member, leadGroup, chatJid, sourceChannel);
 
   activeTeammates.set(memberId, {
     memberId,
     teamId,
     name,
     chatJid: chatJid || '',
+    sourceChannel: sourceChannel || 'telegram',
     promise: containerPromise,
     startTime: Date.now(),
   });
@@ -162,6 +166,7 @@ async function runTeammateInContainer(
   member: TeamMember,
   leadGroup: string,
   chatJid?: string,
+  sourceChannel?: 'telegram' | 'discord',
 ): Promise<void> {
   try {
     const output = await runTeammateDispatch({
@@ -172,6 +177,7 @@ async function runTeammateInContainer(
       model: member.model,
       leadGroup,
       chatJid,
+      sourceChannel,
     });
 
     if (output.status === 'error') {
@@ -186,6 +192,19 @@ async function runTeammateInContainer(
         status: 'completed',
         session_id: output.newSessionId,
       });
+
+      // Auto-continue any active workflows for this group
+      try {
+        const continued = checkAndScheduleWorkflowContinuation(leadGroup, chatJid || '');
+        if (continued > 0) {
+          logger.info(
+            { memberId: member.id, leadGroup, continued },
+            'Scheduled workflow continuation after specialist completed',
+          );
+        }
+      } catch (err) {
+        logger.error({ err, memberId: member.id }, 'Failed to check workflow continuation');
+      }
     }
   } catch (err) {
     logger.error({ memberId: member.id, err }, 'Teammate container error');
@@ -310,10 +329,10 @@ export function getActiveSpecialistCount(): number {
  * Get info about a tracked active teammate for progress streaming.
  * Returns null if the teammate is not active.
  */
-export function getTeammateInfo(memberId: string): { name: string; chatJid: string; teamId: string } | null {
+export function getTeammateInfo(memberId: string): { name: string; chatJid: string; teamId: string; sourceChannel: 'telegram' | 'discord' } | null {
   const active = activeTeammates.get(memberId);
   if (!active) return null;
-  return { name: active.name, chatJid: active.chatJid, teamId: active.teamId };
+  return { name: active.name, chatJid: active.chatJid, teamId: active.teamId, sourceChannel: active.sourceChannel };
 }
 
 /**

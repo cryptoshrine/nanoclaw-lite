@@ -339,18 +339,24 @@ export function getNewMessages(
 export function getMessagesSince(
   chatJid: string,
   sinceTimestamp: string,
-  botPrefix: string,
+  _botPrefix: string,
 ): NewMessage[] {
-  // Filter out bot's own messages by checking content prefix
+  // Include ALL messages (both user and bot) so the agent sees the full
+  // conversation thread. Bot messages are stored with "klaw: " prefix.
+  // The polling loop (getNewMessages) still filters bot messages to avoid
+  // re-triggering on its own responses.
+  // Cap at 50 most recent messages to prevent context explosion.
   const sql = `
     SELECT id, chat_jid, sender, sender_name, content, timestamp
     FROM messages
-    WHERE chat_jid = ? AND timestamp > ? AND content NOT LIKE ?
-    ORDER BY timestamp
+    WHERE chat_jid = ? AND timestamp > ?
+    ORDER BY timestamp DESC
+    LIMIT 50
   `;
-  return db
+  const rows = db
     .prepare(sql)
-    .all(chatJid, sinceTimestamp, `${botPrefix}:%`) as NewMessage[];
+    .all(chatJid, sinceTimestamp) as NewMessage[];
+  return rows.reverse();
 }
 
 export function createTask(

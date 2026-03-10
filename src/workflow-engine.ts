@@ -16,6 +16,7 @@ import fs from 'fs';
 import path from 'path';
 
 import { DATA_DIR } from './config.js';
+import { createTask } from './db.js';
 import { logger } from './logger.js';
 
 const WORKFLOWS_DIR = path.join(DATA_DIR, 'workflows');
@@ -284,4 +285,51 @@ INSTRUCTIONS:
 2. When done, call advance_workflow with the step output
 3. If blocked, call block_workflow with the reason
 4. Report progress via send_message`;
+}
+
+/**
+ * Check for active workflows in a group and schedule continuation tasks.
+ * Called after a specialist completes or a scheduled task finishes.
+ * Schedules a one-shot task with a 10s delay so the scheduler picks it up.
+ */
+export function checkAndScheduleWorkflowContinuation(
+  groupFolder: string,
+  chatJid: string,
+): number {
+  const activeWorkflows = listActiveWorkflows().filter(
+    (wf) => wf.groupFolder === groupFolder,
+  );
+
+  let scheduled = 0;
+  for (const wf of activeWorkflows) {
+    const prompt = buildContinuationPrompt(wf.id);
+    if (!prompt) continue;
+
+    const taskId = `wf-cont-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const now = new Date();
+    const runAt = new Date(now.getTime() + 10_000).toISOString();
+
+    createTask({
+      id: taskId,
+      group_folder: groupFolder,
+      chat_jid: chatJid || wf.chatJid,
+      prompt,
+      schedule_type: 'once',
+      schedule_value: runAt,
+      context_mode: 'isolated',
+      next_run: runAt,
+      status: 'active',
+      created_at: now.toISOString(),
+      retry_count: 0,
+      max_retries: 2,
+    });
+
+    logger.info(
+      { workflowId: wf.id, taskId, step: wf.currentStep, runAt },
+      'Scheduled workflow continuation',
+    );
+    scheduled++;
+  }
+
+  return scheduled;
 }

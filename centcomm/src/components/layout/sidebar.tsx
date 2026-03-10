@@ -33,6 +33,7 @@ const navItems = [
   { href: "/teams", label: "Teams", icon: Users },
   { href: "/council", label: "Council", icon: Swords },
   { href: "/betting", label: "Bet Finder", icon: TrendingUp },
+  { href: "/model", label: "Betting Model", icon: Brain },
   { href: "/distribution", label: "Distribution", icon: Megaphone },
   { href: "/docs", label: "Docs", icon: BookOpen },
   { href: "/inbox", label: "Agent Inbox", icon: Inbox },

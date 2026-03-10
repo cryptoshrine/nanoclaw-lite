@@ -411,6 +411,7 @@ export async function runLocalTeammate(
     NANOCLAW_TEAM_DIR: teamDir,
     NANOCLAW_PROJECT_DIR: PROJECT_ROOT,
     NANOCLAW_CHAT_JID: input.chatJid || '',
+    NANOCLAW_SOURCE_CHANNEL: input.sourceChannel || 'telegram',
     HOME: teammateSessionsDir,
     USERPROFILE: teammateSessionsDir,
   };
@@ -426,6 +427,7 @@ export async function runLocalTeammate(
     memberId: input.memberId,
     memberName: input.memberName,
     teammateModel: input.model,
+    sourceChannel: input.sourceChannel || 'telegram',
   };
 
   logger.info(
