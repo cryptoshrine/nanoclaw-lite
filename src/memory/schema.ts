@@ -84,4 +84,30 @@ export function initMemorySchema(db: Database.Database): void {
   } catch {
     // Table already exists
   }
+
+  // sqlite-vec virtual table for native vector search (384-dim, all-MiniLM-L6-v2)
+  // vec0 uses rowid internally; we map chunk_id via a separate lookup table
+  try {
+    db.exec(`
+      CREATE VIRTUAL TABLE IF NOT EXISTS memory_chunks_vec USING vec0(
+        embedding float[384]
+      );
+    `);
+
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS memory_vec_map (
+        vec_rowid INTEGER NOT NULL,
+        chunk_id TEXT NOT NULL UNIQUE,
+        group_folder TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_memory_vec_map_group
+        ON memory_vec_map(group_folder);
+      CREATE INDEX IF NOT EXISTS idx_memory_vec_map_chunk
+        ON memory_vec_map(chunk_id);
+      CREATE INDEX IF NOT EXISTS idx_memory_vec_map_rowid
+        ON memory_vec_map(vec_rowid);
+    `);
+  } catch {
+    // sqlite-vec extension not loaded
+  }
 }

@@ -248,6 +248,29 @@ Building first batch of X content using demo recorder + Remotion pipeline.
 
 **Reading active threads:** At session start, check `active/` for any in-progress work. Reference it in your responses when relevant.
 
+## Credential Handling
+
+When the user shares login credentials, API keys, passwords, or tokens:
+
+1. **Immediately save them** to `active/{service}-creds.md` (e.g., `active/gumroad-creds.md`)
+2. **Confirm** you've saved them: "Saved your Gumroad credentials to active/gumroad-creds.md"
+3. **Re-read the file** if you need the credentials later in the session — don't rely on them being in your context
+4. **Delete the file** when the task is complete and credentials are no longer needed
+
+This prevents credentials from being lost during context compaction (the summarizer strips secrets by design). The `active/` file survives compaction because the agent re-reads it from disk.
+
+**Format:**
+```markdown
+# Gumroad Credentials
+Saved: 2026-03-11
+Delete after: task completion
+
+email: user@example.com
+password: their-password-here
+```
+
+**Security:** These files live in the group's local workspace only. They are never committed to git, never sent externally, and should be deleted as soon as the task completes.
+
 ## Telegram Formatting
 
 Do NOT use markdown headings (##) in messages. Only use:

@@ -1,6 +1,7 @@
 import Database from 'better-sqlite3';
 import fs from 'fs';
 import path from 'path';
+import * as sqliteVec from 'sqlite-vec';
 
 import { STORE_DIR } from './config.js';
 import { initMemorySchema } from './memory/schema.js';
@@ -35,6 +36,13 @@ export function _initTestDatabase(): void {
 }
 
 function _createSchema(database: Database.Database): void {
+  // Load sqlite-vec extension for native vector search
+  try {
+    sqliteVec.load(database);
+  } catch {
+    // sqlite-vec may not be available in all environments (e.g., some test setups)
+  }
+
   database.exec(`
     CREATE TABLE IF NOT EXISTS chats (
       jid TEXT PRIMARY KEY,

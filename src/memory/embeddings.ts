@@ -1,40 +1,55 @@
 /**
- * OpenAI embedding client (simplified)
- * Falls back to null when OPENAI_API_KEY is not set
+ * Local embedding client using @xenova/transformers
+ * Runs all-MiniLM-L6-v2 locally — no API keys, no cloud, zero cost.
+ * Model auto-downloads on first run (~80MB), cached in .cache/
  */
 
-import { EMBEDDING_BATCH_SIZE, EMBEDDING_MODEL } from './config.js';
+import { EMBEDDING_MODEL } from './config.js';
 import { logger } from '../logger.js';
 
-interface EmbeddingResponse {
-  data: Array<{
-    embedding: number[];
-    index: number;
-  }>;
-  model: string;
-  usage: {
-    prompt_tokens: number;
-    total_tokens: number;
-  };
+// @xenova/transformers has complex union types that don't play nice with strict TS.
+// Using `any` for the pipeline instance is the pragmatic choice.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let extractor: any = null;
+let initPromise: Promise<void> | null = null;
+
+async function ensureInitialized(): Promise<boolean> {
+  if (extractor) return true;
+
+  if (initPromise) {
+    await initPromise;
+    return extractor !== null;
+  }
+
+  initPromise = (async () => {
+    try {
+      const { pipeline } = await import('@xenova/transformers');
+      logger.info({ model: EMBEDDING_MODEL }, 'Loading local embedding model...');
+      extractor = await pipeline('feature-extraction', EMBEDDING_MODEL);
+      logger.info({ model: EMBEDDING_MODEL }, 'Local embedding model loaded');
+    } catch (err) {
+      logger.error({ err }, 'Failed to load local embedding model — memory will use keyword-only search');
+      extractor = null;
+    }
+  })();
+
+  await initPromise;
+  return extractor !== null;
 }
 
 export class EmbeddingClient {
-  private apiKey: string | null;
   private model: string;
 
   constructor() {
-    this.apiKey = process.env.OPENAI_API_KEY || null;
     this.model = EMBEDDING_MODEL;
-
-    if (!this.apiKey) {
-      logger.warn(
-        'OPENAI_API_KEY not set — memory search will use keyword-only mode',
-      );
-    }
+    // Trigger initialization in background (non-blocking)
+    ensureInitialized().catch(() => {});
   }
 
   get isAvailable(): boolean {
-    return this.apiKey !== null;
+    // Always return true — model will be loaded when needed
+    // The actual availability check happens in embed/embedBatch
+    return true;
   }
 
   get modelName(): string {
@@ -43,95 +58,46 @@ export class EmbeddingClient {
 
   /**
    * Embed a single text string.
-   * Returns null if the API key is not configured.
    */
   async embed(text: string): Promise<number[] | null> {
-    if (!this.apiKey) return null;
-
     const results = await this.embedBatch([text]);
     return results ? results[0] : null;
   }
 
   /**
    * Embed multiple texts in batches.
-   * Returns null if the API key is not configured.
+   * Returns Float32Arrays as number[] for JSON serialization compatibility.
    */
   async embedBatch(texts: string[]): Promise<number[][] | null> {
-    if (!this.apiKey) return null;
     if (texts.length === 0) return [];
 
-    const allEmbeddings: number[][] = new Array(texts.length);
+    const ready = await ensureInitialized();
+    if (!ready || !extractor) return null;
 
-    // Process in batches
-    for (let i = 0; i < texts.length; i += EMBEDDING_BATCH_SIZE) {
-      const batch = texts.slice(i, i + EMBEDDING_BATCH_SIZE);
-      const response = await this.callApi(batch);
+    try {
+      const allEmbeddings: number[][] = [];
 
-      if (!response) {
-        return null;
-      }
+      // Process in batches to avoid memory pressure
+      for (let i = 0; i < texts.length; i += 8) {
+        const batch = texts.slice(i, i + 8);
+        const output = await extractor(batch, {
+          pooling: 'mean',
+          normalize: true,
+        });
 
-      for (const item of response.data) {
-        allEmbeddings[i + item.index] = item.embedding;
-      }
-    }
-
-    return allEmbeddings;
-  }
-
-  private async callApi(
-    texts: string[],
-    retries = 3,
-  ): Promise<EmbeddingResponse | null> {
-    for (let attempt = 1; attempt <= retries; attempt++) {
-      try {
-        const response = await fetch(
-          'https://api.openai.com/v1/embeddings',
-          {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              Authorization: `Bearer ${this.apiKey}`,
-            },
-            body: JSON.stringify({
-              input: texts,
-              model: this.model,
-            }),
-          },
-        );
-
-        if (!response.ok) {
-          const errorText = await response.text();
-          if (response.status === 429 && attempt < retries) {
-            // Rate limited — back off
-            const delay = 1000 * attempt;
-            logger.warn(
-              { attempt, delay },
-              'Embedding API rate limited, retrying',
-            );
-            await new Promise((r) => setTimeout(r, delay));
-            continue;
-          }
-          logger.error(
-            { status: response.status, error: errorText },
-            'Embedding API error',
-          );
-          return null;
+        // output.data is a flat Float32Array of shape [batch_size, 384]
+        const dims = 384;
+        for (let j = 0; j < batch.length; j++) {
+          const start = j * dims;
+          const end = start + dims;
+          allEmbeddings.push(Array.from(output.data.slice(start, end)));
         }
-
-        return (await response.json()) as EmbeddingResponse;
-      } catch (err) {
-        if (attempt < retries) {
-          const delay = 1000 * attempt;
-          logger.warn({ attempt, delay, err }, 'Embedding API request failed, retrying');
-          await new Promise((r) => setTimeout(r, delay));
-          continue;
-        }
-        logger.error({ err }, 'Embedding API request failed after retries');
-        return null;
       }
-    }
 
-    return null;
+      return allEmbeddings;
+    } catch (err) {
+      logger.error({ err }, 'Local embedding failed');
+      return null;
+    }
   }
 }

@@ -1,10 +1,14 @@
 /**
  * MemoryManager — Core class for the memory system
  * Handles file indexing, embedding, and hybrid search
+ *
+ * Uses:
+ * - FTS5 for BM25 keyword search
+ * - sqlite-vec (vec0) for native vector search
+ * - @xenova/transformers for local embeddings (all-MiniLM-L6-v2, 384 dims)
  */
 
 import Database from 'better-sqlite3';
-import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 
@@ -14,10 +18,11 @@ import { logger } from '../logger.js';
 import {
   DEFAULT_MAX_RESULTS,
   DEFAULT_MIN_SCORE,
+  EMBEDDING_DIMENSIONS,
   FILE_WATCH_DEBOUNCE_MS,
   VECTOR_CANDIDATES_MULTIPLIER,
 } from './config.js';
-import { chunkId, chunkMarkdown, cosineSimilarity, hashText } from './chunker.js';
+import { chunkId, chunkMarkdown, hashText } from './chunker.js';
 import { EmbeddingClient } from './embeddings.js';
 import {
   bm25RankToScore,
@@ -25,7 +30,7 @@ import {
   mergeHybridResults,
   rankResults,
 } from './hybrid.js';
-import { MemoryChunk, MemorySearchResult } from './types.js';
+import { MemorySearchResult } from './types.js';
 
 const BUSY_RETRY_COUNT = 3;
 const BUSY_RETRY_DELAY_MS = 500;
@@ -56,10 +61,30 @@ export class MemoryManager {
   private embedder: EmbeddingClient;
   private watchers = new Map<string, fs.FSWatcher>();
   private syncDebounceTimers = new Map<string, NodeJS.Timeout>();
+  private hasVec0: boolean;
 
   constructor(db: Database.Database) {
     this.db = db;
     this.embedder = new EmbeddingClient();
+
+    // Check if sqlite-vec is available by testing the vec0 table
+    this.hasVec0 = this.checkVec0Available();
+    if (this.hasVec0) {
+      logger.info('sqlite-vec (vec0) available — native vector search enabled');
+    } else {
+      logger.warn('sqlite-vec (vec0) NOT available — falling back to JS cosine similarity');
+    }
+  }
+
+  private checkVec0Available(): boolean {
+    try {
+      this.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='memory_chunks_vec'").get();
+      // Try a dummy query to confirm vec0 is actually functional
+      this.db.prepare('SELECT rowid FROM memory_chunks_vec LIMIT 0').all();
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   /**
@@ -152,9 +177,8 @@ export class MemoryManager {
     }
 
     // If keyword-only mode, adjust minimum score down since no vector boost
-    const effectiveMinScore = this.embedder.isAvailable
-      ? minScore
-      : minScore * 0.5;
+    const effectiveMinScore =
+      vectorResults.length > 0 ? minScore : minScore * 0.5;
 
     // Merge results
     let finalResults: MemorySearchResult[];
@@ -383,6 +407,21 @@ export class MemoryManager {
         this.db
           .prepare('DELETE FROM memory_chunks_fts WHERE id = ?')
           .run(old.id);
+
+        // Remove from vec0 via mapping table
+        if (this.hasVec0) {
+          const mapRow = this.db
+            .prepare('SELECT vec_rowid FROM memory_vec_map WHERE chunk_id = ?')
+            .get(old.id) as { vec_rowid: number } | undefined;
+          if (mapRow) {
+            this.db
+              .prepare('DELETE FROM memory_chunks_vec WHERE rowid = ?')
+              .run(mapRow.vec_rowid);
+            this.db
+              .prepare('DELETE FROM memory_vec_map WHERE vec_rowid = ?')
+              .run(mapRow.vec_rowid);
+          }
+        }
       }
       this.db
         .prepare(
@@ -400,6 +439,15 @@ export class MemoryManager {
         INSERT INTO memory_chunks_fts (text, id, path, group_folder, source, start_line, end_line)
         VALUES (?, ?, ?, ?, ?, ?, ?)
       `);
+
+      // Prepare vec0 insert if available
+      // Note: vec0 doesn't accept explicit rowid — insert vec first, then map
+      const insertVec = this.hasVec0
+        ? this.db.prepare('INSERT INTO memory_chunks_vec (embedding) VALUES (?)')
+        : null;
+      const insertVecMap = this.hasVec0
+        ? this.db.prepare('INSERT INTO memory_vec_map (vec_rowid, chunk_id, group_folder) VALUES (?, ?, ?)')
+        : null;
 
       for (let i = 0; i < chunks.length; i++) {
         const chunk = chunks[i];
@@ -438,6 +486,14 @@ export class MemoryManager {
           chunk.startLine,
           chunk.endLine,
         );
+
+        // Insert into vec0 if we have embeddings and the extension is loaded
+        // vec0 auto-assigns rowid — insert embedding first, then map to chunk_id
+        if (insertVec && insertVecMap && embedding.length === EMBEDDING_DIMENSIONS) {
+          const float32 = new Float32Array(embedding);
+          const vecResult = insertVec.run(Buffer.from(float32.buffer));
+          insertVecMap.run(Number(vecResult.lastInsertRowid), id, groupFolder);
+        }
       }
 
       // Update file record
@@ -476,6 +532,21 @@ export class MemoryManager {
         this.db
           .prepare('DELETE FROM memory_chunks_fts WHERE id = ?')
           .run(old.id);
+
+        // Remove from vec0
+        if (this.hasVec0) {
+          const mapRow = this.db
+            .prepare('SELECT vec_rowid FROM memory_vec_map WHERE chunk_id = ?')
+            .get(old.id) as { vec_rowid: number } | undefined;
+          if (mapRow) {
+            this.db
+              .prepare('DELETE FROM memory_chunks_vec WHERE rowid = ?')
+              .run(mapRow.vec_rowid);
+            this.db
+              .prepare('DELETE FROM memory_vec_map WHERE vec_rowid = ?')
+              .run(mapRow.vec_rowid);
+          }
+        }
       }
 
       this.db
@@ -549,7 +620,76 @@ export class MemoryManager {
     return result;
   }
 
+  /**
+   * Vector search using sqlite-vec (vec0) when available,
+   * falling back to brute-force JS cosine similarity.
+   */
   private vectorSearch(
+    groupFolder: string,
+    queryEmbedding: number[],
+    maxCandidates: number,
+  ): Array<{ id: string; score: number }> {
+    if (this.hasVec0) {
+      return this.vectorSearchVec0(groupFolder, queryEmbedding, maxCandidates);
+    }
+    return this.vectorSearchBruteForce(groupFolder, queryEmbedding, maxCandidates);
+  }
+
+  /**
+   * Native vector search via sqlite-vec vec0 virtual table.
+   * Uses cosine distance internally, returns scores as 1 - distance.
+   */
+  private vectorSearchVec0(
+    groupFolder: string,
+    queryEmbedding: number[],
+    maxCandidates: number,
+  ): Array<{ id: string; score: number }> {
+    try {
+      const queryVec = new Float32Array(queryEmbedding);
+
+      // Get all rowids for this group from the mapping table
+      const groupRowids = this.db
+        .prepare('SELECT vec_rowid FROM memory_vec_map WHERE group_folder = ?')
+        .all(groupFolder) as Array<{ vec_rowid: number }>;
+
+      if (groupRowids.length === 0) return [];
+
+      // Query vec0 for nearest neighbors
+      // Note: vec0 doesn't support filtering by group, so we query broadly
+      // and filter afterward. For our corpus size this is fine.
+      const rows = this.db
+        .prepare(`
+          SELECT v.rowid, v.distance, m.chunk_id
+          FROM memory_chunks_vec v
+          INNER JOIN memory_vec_map m ON m.vec_rowid = v.rowid
+          WHERE v.embedding MATCH ?
+            AND k = ?
+            AND m.group_folder = ?
+          ORDER BY v.distance
+        `)
+        .all(Buffer.from(queryVec.buffer), maxCandidates, groupFolder) as Array<{
+        rowid: number;
+        distance: number;
+        chunk_id: string;
+      }>;
+
+      return rows.map((r) => ({
+        id: r.chunk_id,
+        // vec0 returns L2 distance by default; convert to similarity score (0-1)
+        // For normalized vectors, cosine distance ≈ 2*(1 - cosine_similarity)
+        // So similarity ≈ 1 - distance/2
+        score: Math.max(0, 1 - r.distance / 2),
+      }));
+    } catch (err) {
+      logger.debug({ err }, 'vec0 search failed, falling back to brute force');
+      return this.vectorSearchBruteForce(groupFolder, queryEmbedding, maxCandidates);
+    }
+  }
+
+  /**
+   * Fallback brute-force cosine similarity (original implementation).
+   */
+  private vectorSearchBruteForce(
     groupFolder: string,
     queryEmbedding: number[],
     maxCandidates: number,
@@ -634,4 +774,26 @@ export class MemoryManager {
       text: string;
     }>;
   }
+}
+
+/**
+ * Cosine similarity between two vectors (fallback for when vec0 is unavailable).
+ */
+function cosineSimilarity(a: number[], b: number[]): number {
+  if (a.length !== b.length) return 0;
+
+  let dotProduct = 0;
+  let normA = 0;
+  let normB = 0;
+
+  for (let i = 0; i < a.length; i++) {
+    dotProduct += a[i] * b[i];
+    normA += a[i] * a[i];
+    normB += b[i] * b[i];
+  }
+
+  const denominator = Math.sqrt(normA) * Math.sqrt(normB);
+  if (denominator === 0) return 0;
+
+  return dotProduct / denominator;
 }

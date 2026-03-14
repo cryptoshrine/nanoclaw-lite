@@ -6,6 +6,16 @@
       "headers": {
         "Authorization": "Bearer ${ZAPIER_MCP_TOKEN}"
       }
+    },
+    "heygen": {
+      "description": "HeyGen MCP — AI video generation via Remote OAuth (uses HeyGen plan credits)",
+      "command": "npx",
+      "args": ["-y", "mcp-remote", "https://mcp.heygen.com/mcp/v1/"]
+    },
+    "gmail": {
+      "description": "Gmail MCP — read, send, search, draft, label, and manage emails via Google Gmail API",
+      "command": "npx",
+      "args": ["@dev-hitesh-gupta/gmail-mcp-server"]
     }
   }
 }

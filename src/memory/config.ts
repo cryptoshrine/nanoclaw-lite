@@ -7,10 +7,10 @@ export const CHUNK_MAX_LINES = 40;
 export const CHUNK_MIN_LINES = 5;
 export const CHUNK_OVERLAP_LINES = 3;
 
-// Embedding
-export const EMBEDDING_MODEL = 'text-embedding-3-small';
-export const EMBEDDING_DIMENSIONS = 1536;
-export const EMBEDDING_BATCH_SIZE = 20;
+// Embedding (local model via @xenova/transformers)
+export const EMBEDDING_MODEL = 'Xenova/all-MiniLM-L6-v2';
+export const EMBEDDING_DIMENSIONS = 384;
+export const EMBEDDING_BATCH_SIZE = 16;
 
 // Search
 export const DEFAULT_MAX_RESULTS = 6;

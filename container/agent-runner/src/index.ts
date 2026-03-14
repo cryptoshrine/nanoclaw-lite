@@ -164,6 +164,12 @@ const COMPACTION_INSTRUCTIONS = `When summarizing this conversation, ALWAYS pres
 - Session handoff blocks (<handoff> content)
 - API keys, endpoint URLs, script paths (names only, never actual secrets)
 - Tool call results that informed decisions
+- References to any active/ credential files (e.g. "credentials saved to active/gumroad-creds.md")
+
+IMPORTANT — User-provided credentials:
+If the user shared login credentials, API keys, passwords, or tokens during this conversation,
+note that they were saved to an active/ file (include the filename) so the agent can re-read them.
+Never include the actual secret values in the summary — only reference the file path.
 
 Aggressively compress:
 - Verbose tool outputs (file listings, grep results) — keep only the relevant matches
