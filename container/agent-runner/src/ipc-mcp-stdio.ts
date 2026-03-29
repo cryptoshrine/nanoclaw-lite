@@ -615,7 +615,8 @@ server.tool(
   'create_team',
   `Create a new agent team. You become the team lead and can spawn teammates to work on tasks in parallel.
 
-Use this when you have a complex task that can be broken down into independent subtasks that can run concurrently.`,
+Use this when you have a complex task that can be broken down into independent subtasks that can run concurrently.
+Returns the team ID which you need for spawn_teammate.`,
   {
     name: z.string().describe('Unique name for the team (e.g., "refactor-auth-2024")'),
   },
@@ -627,30 +628,57 @@ Use this when you have a complex task that can be broken down into independent s
       };
     }
 
+    const requestId = `team-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const data = {
       type: 'create_team',
       teamName: args.name,
+      requestId,
       timestamp: new Date().toISOString(),
     };
 
     writeIpcFile(TASKS_DIR, data);
 
+    // Poll for the response (host writes team ID to responses dir)
+    const responsesDir = path.join(IPC_DIR, 'responses');
+    const responseFile = path.join(responsesDir, `${requestId}.json`);
+    const deadline = Date.now() + 5000;
+
+    while (Date.now() < deadline) {
+      if (fs.existsSync(responseFile)) {
+        try {
+          const resp = JSON.parse(fs.readFileSync(responseFile, 'utf-8'));
+          try { fs.unlinkSync(responseFile); } catch { /* ignore */ }
+          if (resp.error) {
+            return {
+              content: [{ type: 'text' as const, text: `Failed to create team: ${resp.error}` }],
+              isError: true,
+            };
+          }
+          return {
+            content: [{ type: 'text' as const, text: `Team created. ID: ${resp.teamId}\nUse this ID with spawn_teammate to add specialists.` }],
+          };
+        } catch { /* file may be partially written, retry */ }
+      }
+      await new Promise(r => setTimeout(r, 200));
+    }
+
     return {
-      content: [{ type: 'text' as const, text: `Team "${args.name}" creation requested. Use list_teams to see available teams.` }],
+      content: [{ type: 'text' as const, text: `Team "${args.name}" creation requested but no confirmation received. Use list_teams to find the team ID.` }],
     };
   },
 );
 
 server.tool(
   'spawn_teammate',
-  `Spawn a new teammate agent in a separate container. The teammate will work autonomously on the given task.
+  `Spawn a new teammate agent in a separate process. The teammate will work autonomously on the given task.
 
 Teammates have access to:
-- The team's shared /workspace/team directory
+- The team's shared workspace directory
 - Your group's files (read-only)
-- Team messaging and task tools
+- send_message tool to report results
 
-Teammates run with sonnet by default for cost efficiency. Use opus for complex reasoning tasks.`,
+Teammates run with sonnet by default for cost efficiency. Use opus for complex reasoning tasks.
+Returns confirmation with member ID, or an error if the spawn failed (e.g. team not found, concurrency cap).`,
   {
     team_id: z.string().describe('The team ID to add the teammate to'),
     name: z.string().describe('A short name for this teammate (e.g., "api-refactor", "test-writer")'),
@@ -665,6 +693,7 @@ Teammates run with sonnet by default for cost efficiency. Use opus for complex r
       };
     }
 
+    const requestId = `spawn-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const data = {
       type: 'spawn_teammate',
       teamId: args.team_id,
@@ -673,13 +702,337 @@ Teammates run with sonnet by default for cost efficiency. Use opus for complex r
       teammateModel: args.model,
       chatJid,
       sourceChannel,
+      requestId,
       timestamp: new Date().toISOString(),
     };
 
     writeIpcFile(TASKS_DIR, data);
 
+    // Poll for the response (host confirms spawn or returns error)
+    const responsesDir = path.join(IPC_DIR, 'responses');
+    const responseFile = path.join(responsesDir, `${requestId}.json`);
+    const deadline = Date.now() + 8000;
+
+    while (Date.now() < deadline) {
+      if (fs.existsSync(responseFile)) {
+        try {
+          const resp = JSON.parse(fs.readFileSync(responseFile, 'utf-8'));
+          try { fs.unlinkSync(responseFile); } catch { /* ignore */ }
+          if (resp.error) {
+            return {
+              content: [{ type: 'text' as const, text: `Failed to spawn teammate: ${resp.error}` }],
+              isError: true,
+            };
+          }
+          return {
+            content: [{ type: 'text' as const, text: `Teammate "${args.name}" spawned successfully.\nMember ID: ${resp.memberId}\nModel: ${resp.model}\nThe teammate is now working autonomously. Their messages will appear in chat.` }],
+          };
+        } catch { /* file may be partially written, retry */ }
+      }
+      await new Promise(r => setTimeout(r, 300));
+    }
+
     return {
-      content: [{ type: 'text' as const, text: `Teammate "${args.name}" spawn requested for team ${args.team_id}.` }],
+      content: [{ type: 'text' as const, text: `Teammate "${args.name}" spawn requested for team ${args.team_id}. No confirmation yet — use list_teams to check status.` }],
+    };
+  },
+);
+
+// ============ Team Status Tools (ported from SDK MCP) ============
+
+server.tool(
+  'list_teams',
+  `List all active teams and their members. Shows team ID, name, status, and member details.
+Use this after create_team to verify the team was created, or to find team IDs.`,
+  {},
+  async () => {
+    if (!isMain) {
+      return {
+        content: [{ type: 'text' as const, text: 'Only the main group can list teams.' }],
+        isError: true,
+      };
+    }
+
+    // Read team snapshot files from IPC directory
+    const groupIpcDir = path.dirname(TASKS_DIR); // IPC_DIR is the group's IPC dir
+    try {
+      const files = fs.existsSync(groupIpcDir)
+        ? fs.readdirSync(groupIpcDir).filter(f => f.startsWith('team-') && f.endsWith('.json'))
+        : [];
+
+      if (files.length === 0) {
+        return { content: [{ type: 'text' as const, text: 'No active teams found.' }] };
+      }
+
+      const teams = files.map(f => {
+        try {
+          return JSON.parse(fs.readFileSync(path.join(groupIpcDir, f), 'utf-8'));
+        } catch { return null; }
+      }).filter(Boolean);
+
+      if (teams.length === 0) {
+        return { content: [{ type: 'text' as const, text: 'No active teams found.' }] };
+      }
+
+      const formatted = teams.map((t: { team: { id: string; name: string; status: string }; members: Array<{ id: string; name: string; role: string; status: string }>; lastUpdated: string }) => {
+        const memberList = t.members
+          .map((m: { name: string; role: string; status: string; id: string }) => `  - ${m.name} (${m.role}) [${m.status}] id:${m.id}`)
+          .join('\n');
+        return `Team: ${t.team.name}\n  ID: ${t.team.id}\n  Status: ${t.team.status}\n  Members:\n${memberList}`;
+      }).join('\n\n');
+
+      return { content: [{ type: 'text' as const, text: formatted }] };
+    } catch (err) {
+      return {
+        content: [{ type: 'text' as const, text: `Error listing teams: ${err instanceof Error ? err.message : String(err)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  'cleanup_team',
+  'End a team and stop all active teammates. Use when the team has finished its work.',
+  {
+    team_id: z.string().describe('The team ID to clean up'),
+  },
+  async (args) => {
+    if (!isMain) {
+      return {
+        content: [{ type: 'text' as const, text: 'Only the main group can cleanup teams.' }],
+        isError: true,
+      };
+    }
+
+    const data = {
+      type: 'cleanup_team',
+      teamId: args.team_id,
+      timestamp: new Date().toISOString(),
+    };
+
+    writeIpcFile(TASKS_DIR, data);
+
+    // Clean up local snapshot file
+    const groupIpcDir = path.dirname(TASKS_DIR);
+    const snapshotFile = path.join(groupIpcDir, `team-${args.team_id}.json`);
+    try { if (fs.existsSync(snapshotFile)) fs.unlinkSync(snapshotFile); } catch { /* ignore */ }
+
+    return {
+      content: [{ type: 'text' as const, text: `Team ${args.team_id} cleanup requested. All active teammates will be stopped.` }],
+    };
+  },
+);
+
+server.tool(
+  'system_status',
+  `Check the current system status: active teams, running specialists, scheduled tasks, and queued messages.
+Use this to understand what's happening across the system.`,
+  {},
+  async () => {
+    if (!isMain) {
+      return {
+        content: [{ type: 'text' as const, text: 'Only the main group can check system status.' }],
+        isError: true,
+      };
+    }
+
+    const parts: string[] = [];
+
+    // Active teams from snapshots
+    const groupIpcDir = path.dirname(TASKS_DIR);
+    try {
+      const teamFiles = fs.existsSync(groupIpcDir)
+        ? fs.readdirSync(groupIpcDir).filter(f => f.startsWith('team-') && f.endsWith('.json'))
+        : [];
+      if (teamFiles.length > 0) {
+        const teamSummaries = teamFiles.map(f => {
+          try {
+            const t = JSON.parse(fs.readFileSync(path.join(groupIpcDir, f), 'utf-8'));
+            const active = t.members?.filter((m: { status: string }) => m.status === 'active').length || 0;
+            const total = t.members?.length || 0;
+            return `  ${t.team.name} (${t.team.id}): ${active}/${total} members active`;
+          } catch { return null; }
+        }).filter(Boolean);
+        parts.push(`*Teams (${teamFiles.length}):*\n${teamSummaries.join('\n')}`);
+      } else {
+        parts.push('*Teams:* None active');
+      }
+    } catch { parts.push('*Teams:* Error reading'); }
+
+    // Scheduled tasks
+    const tasksFile = path.join(IPC_DIR, 'current_tasks.json');
+    try {
+      if (fs.existsSync(tasksFile)) {
+        const tasks = JSON.parse(fs.readFileSync(tasksFile, 'utf-8'));
+        const active = tasks.filter((t: { status: string }) => t.status === 'active').length;
+        const paused = tasks.filter((t: { status: string }) => t.status === 'paused').length;
+        parts.push(`*Scheduled tasks:* ${active} active, ${paused} paused, ${tasks.length} total`);
+      } else {
+        parts.push('*Scheduled tasks:* None');
+      }
+    } catch { parts.push('*Scheduled tasks:* Error reading'); }
+
+    // Active teammate IPC directories (proxy for running specialists)
+    const teammatesDir = path.join(path.dirname(groupIpcDir), 'teammates');
+    try {
+      if (fs.existsSync(teammatesDir)) {
+        const memberDirs = fs.readdirSync(teammatesDir).filter(f => {
+          try { return fs.statSync(path.join(teammatesDir, f)).isDirectory(); } catch { return false; }
+        });
+        parts.push(`*Active specialist IPC dirs:* ${memberDirs.length}`);
+      } else {
+        parts.push('*Active specialists:* None');
+      }
+    } catch { parts.push('*Active specialists:* Error reading'); }
+
+    return {
+      content: [{ type: 'text' as const, text: parts.join('\n\n') }],
+    };
+  },
+);
+
+// ============ Self-Learning Tools ============
+
+const NANOCLAW_GROUP_DIR = process.env.NANOCLAW_GROUP_DIR || '/workspace/group';
+
+server.tool(
+  'record_learning',
+  `Record something you learned during this task. Write 1-5 cards after completing work.
+Use this to capture patterns, gotchas, tool tips, workflow insights, and architecture notes.
+These get stored as Aha Cards and are searchable by future agents via query_learnings.`,
+  {
+    title: z.string().describe('Short title (< 80 chars)'),
+    learning: z.string().describe('What you learned — specific and actionable'),
+    category: z.enum(['pattern', 'gotcha', 'tool-tip', 'workflow', 'architecture']),
+    context: z.string().describe('What task/file/situation triggered this learning'),
+    confidence: z.number().min(0).max(1).describe('How confident are you? 0.5=guess, 0.9=proven'),
+    portable: z.boolean().describe('True if this applies beyond this specific project'),
+    tags: z.array(z.string()).describe('Keywords for retrieval'),
+  },
+  async (args) => {
+    const groupDir = NANOCLAW_GROUP_DIR;
+    const cardsDir = path.join(groupDir, 'learnings', 'cards');
+    fs.mkdirSync(cardsDir, { recursive: true });
+
+    const date = new Date().toISOString().split('T')[0];
+    const card = {
+      id: `aha-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      timestamp: new Date().toISOString(),
+      source: process.env.NANOCLAW_AGENT_NAME || process.env.NANOCLAW_GROUP_FOLDER || 'klaw',
+      task_type: 'general',
+      ...args,
+    };
+
+    fs.appendFileSync(
+      path.join(cardsDir, `${date}.jsonl`),
+      JSON.stringify(card) + '\n',
+    );
+
+    return { content: [{ type: 'text' as const, text: `Recorded: "${args.title}" [${args.category}]` }] };
+  },
+);
+
+server.tool(
+  'query_learnings',
+  `Search past learnings (Aha Cards) for relevant patterns, gotchas, and tips before starting a task.
+Use this at the beginning of any implementation or debugging task to check if you or another agent already solved something similar.`,
+  {
+    query: z.string().describe('What are you about to work on? (keywords or description)'),
+    category: z.enum(['pattern', 'gotcha', 'tool-tip', 'workflow', 'architecture', 'all']).optional(),
+    limit: z.number().optional().default(10),
+  },
+  async (args) => {
+    const groupDir = NANOCLAW_GROUP_DIR;
+    const cardsDir = path.join(groupDir, 'learnings', 'cards');
+
+    if (!fs.existsSync(cardsDir)) {
+      return { content: [{ type: 'text' as const, text: 'No learnings recorded yet.' }] };
+    }
+
+    // Read last 30 days of cards
+    const files = fs.readdirSync(cardsDir)
+      .filter(f => f.endsWith('.jsonl'))
+      .sort()
+      .slice(-30);
+
+    const allCards: Array<{
+      title: string;
+      learning: string;
+      tags?: string[];
+      context: string;
+      category: string;
+      confidence: number;
+      source?: string;
+      timestamp?: string;
+    }> = [];
+    for (const file of files) {
+      const lines = fs.readFileSync(path.join(cardsDir, file), 'utf-8')
+        .split('\n')
+        .filter(Boolean);
+      for (const line of lines) {
+        try { allCards.push(JSON.parse(line)); } catch { /* skip corrupt lines */ }
+      }
+    }
+
+    // Simple keyword matching (upgrade to embeddings via sqlite-vec later if needed)
+    const queryWords = args.query.toLowerCase().split(/\s+/);
+    const scored = allCards.map(card => {
+      const text = `${card.title} ${card.learning} ${card.tags?.join(' ') || ''} ${card.context}`.toLowerCase();
+      const hits = queryWords.filter(w => text.includes(w)).length;
+      return { card, score: hits };
+    })
+    .filter(s => s.score > 0)
+    .filter(s => args.category === 'all' || !args.category || s.card.category === args.category)
+    .sort((a, b) => b.score - a.score || b.card.confidence - a.card.confidence)
+    .slice(0, args.limit);
+
+    if (scored.length === 0) {
+      return { content: [{ type: 'text' as const, text: `No relevant learnings found for "${args.query}". Proceed carefully.` }] };
+    }
+
+    const formatted = scored.map(s =>
+      `[${s.card.category}] ${s.card.title} (${(s.card.confidence * 100).toFixed(0)}% confidence)\n  ${s.card.learning}\n  Context: ${s.card.context}\n  Tags: ${s.card.tags?.join(', ') || 'none'}`,
+    ).join('\n\n');
+
+    return { content: [{ type: 'text' as const, text: `Found ${scored.length} relevant learnings:\n\n${formatted}` }] };
+  },
+);
+
+// Send a document/file to the chat
+server.tool(
+  'send_document',
+  'Send a document/file to the current group chat. Use this to share PDFs, spreadsheets, text files, or any non-image file. The file must exist on disk.',
+  {
+    file_path: z.string().describe('Absolute path to the file (PDF, DOCX, XLSX, CSV, TXT, etc.)'),
+    caption: z.string().optional().describe('Optional caption text to display with the document'),
+  },
+  async (args) => {
+    if (!fs.existsSync(args.file_path)) {
+      return {
+        content: [{
+          type: 'text' as const,
+          text: `Error: File not found at ${args.file_path}`,
+        }],
+      };
+    }
+
+    const data = {
+      type: 'document',
+      chatJid,
+      filePath: args.file_path,
+      caption: args.caption,
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    };
+
+    const filename = writeIpcFile(MESSAGES_DIR, data);
+
+    return {
+      content: [{
+        type: 'text' as const,
+        text: `Document queued for delivery (${filename})`,
+      }],
     };
   },
 );

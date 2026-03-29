@@ -117,10 +117,44 @@ async function readStdin(): Promise<string> {
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
 const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
 
+// Stream chunk sentinels: used to send incremental text to the parent process
+// so it can broadcast to KlawHQ in real-time (separate from the final output markers).
+const STREAM_CHUNK_MARKER = '---NANOCLAW_STREAM_CHUNK---';
+const STREAM_CHUNK_END = '---NANOCLAW_STREAM_END---';
+
 function writeOutput(output: ContainerOutput): void {
   console.log(OUTPUT_START_MARKER);
   console.log(JSON.stringify(output));
   console.log(OUTPUT_END_MARKER);
+}
+
+/**
+ * Write a streaming text chunk to stdout for real-time KlawHQ display.
+ * Debounced: only emits if enough text has accumulated or enough time has passed.
+ */
+let streamBuffer = '';
+let streamTimer: ReturnType<typeof setTimeout> | null = null;
+const STREAM_FLUSH_INTERVAL = 300; // ms
+const STREAM_MIN_CHARS = 40; // minimum chars before flushing
+
+function flushStreamBuffer(): void {
+  if (streamBuffer.length === 0) return;
+  const chunk = streamBuffer;
+  streamBuffer = '';
+  if (streamTimer) {
+    clearTimeout(streamTimer);
+    streamTimer = null;
+  }
+  console.log(`${STREAM_CHUNK_MARKER}${chunk}${STREAM_CHUNK_END}`);
+}
+
+function writeStreamChunk(text: string): void {
+  streamBuffer += text;
+  if (streamBuffer.length >= STREAM_MIN_CHARS) {
+    flushStreamBuffer();
+  } else if (!streamTimer) {
+    streamTimer = setTimeout(flushStreamBuffer, STREAM_FLUSH_INTERVAL);
+  }
 }
 
 function log(message: string): void {
@@ -354,6 +388,27 @@ function buildMemoryContext(groupDir: string): string | null {
       }
     } catch {
       // Non-fatal — active/ may not exist yet
+    }
+  }
+
+  // Learned patterns from Aha Cards (written by nightly consolidation cron)
+  const patternsPath = path.join(groupDir, 'learnings', 'patterns.json');
+  const patternsRaw = readFileSafe(patternsPath, 3000);
+  if (patternsRaw) {
+    try {
+      const { patterns } = JSON.parse(patternsRaw) as {
+        patterns: Array<{ title: string; frequency: number; confidence: number }>;
+      };
+      if (patterns?.length > 0) {
+        const topPatterns = patterns
+          .sort((a, b) => b.confidence - a.confidence)
+          .slice(0, 10)
+          .map(p => `- [${p.title}] (seen ${p.frequency}x, ${(p.confidence * 100).toFixed(0)}% confidence)`)
+          .join('\n');
+        addPart('Learned Patterns', topPatterns);
+      }
+    } catch {
+      // Non-fatal — patterns.json may be malformed
     }
   }
 
@@ -799,6 +854,16 @@ async function runQuery(
       lastAssistantUuid = (message as { uuid: string }).uuid;
     }
 
+    // Stream assistant text chunks to parent for real-time KlawHQ display
+    if (message.type === 'assistant' && 'message' in message) {
+      const msg = message as { message?: { content?: Array<{ type: string; text?: string }> } };
+      const textParts = msg.message?.content?.filter(c => c.type === 'text').map(c => c.text || '') || [];
+      const text = textParts.join('');
+      if (text.length > 0) {
+        writeStreamChunk(text);
+      }
+    }
+
     if (message.type === 'system' && message.subtype === 'init') {
       newSessionId = message.session_id;
       log(`Session initialized: ${newSessionId}`);
@@ -810,6 +875,9 @@ async function runQuery(
     }
 
     if (message.type === 'result') {
+      // Flush any remaining stream buffer before emitting the final result
+      flushStreamBuffer();
+
       resultCount++;
       const textResult = 'result' in message ? (message as { result?: string }).result : null;
       if (textResult) lastResultText = textResult;

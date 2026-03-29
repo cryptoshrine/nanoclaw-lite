@@ -18,6 +18,7 @@ import { Bot, InlineKeyboard } from 'grammy';
 
 import { DATA_DIR } from './config.js';
 import { logger } from './logger.js';
+import { broadcast as wsBroadcast } from './ws-server.js';
 
 export interface ApprovalRequest {
   /** Unique request ID */
@@ -86,6 +87,11 @@ export async function sendApprovalKeyboard(
     });
     request.telegramMessageId = msg.message_id;
     pendingApprovals.set(request.id, request);
+    wsBroadcast('approval.requested', {
+      requestId: request.id,
+      description: request.description,
+      group: request.groupFolder,
+    });
     logger.info({ requestId: request.id, chatId }, 'Approval keyboard sent');
   } catch (err) {
     logger.error({ requestId: request.id, err }, 'Failed to send approval keyboard');
@@ -126,6 +132,12 @@ export async function handleCallbackQuery(
     : choice === 'rejected' ? 'rejected'
     : 'approved';
   writeApprovalResponse(request, status, choice);
+
+  wsBroadcast('approval.responded', {
+    requestId,
+    approved: status === 'approved',
+    choice,
+  });
 
   // Update the Telegram message to show the result
   const resultIcon = status === 'approved' ? '✅' : '❌';
@@ -231,6 +243,29 @@ export async function processApprovalRequest(
   };
 
   await sendApprovalKeyboard(bot, request);
+}
+
+/**
+ * Respond to a pending approval from KlawHQ (WebSocket).
+ * Returns true if the approval was found and responded to.
+ */
+export function respondToApproval(requestId: string, approved: boolean): boolean {
+  const request = pendingApprovals.get(requestId);
+  if (!request) return false;
+
+  const status = approved ? 'approved' : 'rejected';
+  const choice = approved ? 'approved' : 'rejected';
+  writeApprovalResponse(request, status, choice);
+  pendingApprovals.delete(requestId);
+
+  wsBroadcast('approval.responded', {
+    requestId,
+    approved,
+    choice,
+  });
+
+  logger.info({ requestId, approved }, 'Approval responded via KlawHQ');
+  return true;
 }
 
 /**

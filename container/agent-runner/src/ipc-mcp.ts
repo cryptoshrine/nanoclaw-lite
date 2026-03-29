@@ -154,6 +154,43 @@ export function createIpcMcp(ctx: IpcMcpContext) {
       ),
 
       tool(
+        'send_document',
+        'Send a document/file to the current group chat. Use this to share PDFs, spreadsheets, text files, or any non-image file. The file must exist on disk.',
+        {
+          file_path: z.string().describe('Absolute path to the file (PDF, DOCX, XLSX, CSV, TXT, etc.)'),
+          caption: z.string().optional().describe('Optional caption text to display with the document'),
+        },
+        async (args) => {
+          if (!fs.existsSync(args.file_path)) {
+            return {
+              content: [{
+                type: 'text',
+                text: `Error: File not found at ${args.file_path}`
+              }]
+            };
+          }
+
+          const data = {
+            type: 'document',
+            chatJid,
+            filePath: args.file_path,
+            caption: args.caption,
+            groupFolder,
+            timestamp: new Date().toISOString()
+          };
+
+          const filename = writeIpcFile(MESSAGES_DIR, data);
+
+          return {
+            content: [{
+              type: 'text',
+              text: `Document queued for delivery (${filename})`
+            }]
+          };
+        }
+      ),
+
+      tool(
         'send_canvas',
         `Push a visual artifact to the Live Canvas in CENTCOMM. Artifacts appear as draggable/resizable cards on a spatial workspace.
 

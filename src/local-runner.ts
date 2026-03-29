@@ -12,6 +12,7 @@ import {
   CONTAINER_MAX_OUTPUT_SIZE,
   CONTAINER_TIMEOUT,
   DATA_DIR,
+  DEFAULT_TEAMMATE_MODEL,
   GROUPS_DIR,
   PROJECT_ROOT,
   TEAM_DIR,
@@ -19,11 +20,75 @@ import {
 } from './config.js';
 import { ContainerInput, ContainerOutput, TeammateContainerInput } from './container-runner.js';
 import { logger } from './logger.js';
+import { broadcast as wsBroadcast } from './ws-server.js';
 import { RegisteredGroup } from './types.js';
 
 // Sentinel markers for robust output parsing (must match agent-runner)
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
 const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
+
+// Stream chunk sentinels (must match agent-runner)
+const STREAM_CHUNK_MARKER = '---NANOCLAW_STREAM_CHUNK---';
+const STREAM_CHUNK_END = '---NANOCLAW_STREAM_END---';
+
+/**
+ * Per-process partial buffer for stream chunks that may span data events.
+ * Keyed by a unique run identifier (group folder is sufficient since only one
+ * agent runs per group at a time).
+ */
+const streamPartials = new Map<string, string>();
+
+/**
+ * Extract and process stream chunks from a raw stdout data string.
+ * Returns the data with stream chunks removed (so they don't pollute the output buffer).
+ * Handles chunks that span multiple data events via a partial buffer.
+ */
+function extractStreamChunks(data: string, groupId: string): string {
+  // Prepend any partial data from a previous event
+  const partial = streamPartials.get(groupId) || '';
+  let combined = partial + data;
+  streamPartials.delete(groupId);
+
+  let cleanData = '';
+  let cursor = 0;
+
+  while (cursor < combined.length) {
+    const startIdx = combined.indexOf(STREAM_CHUNK_MARKER, cursor);
+
+    if (startIdx === -1) {
+      // No more markers — rest is clean data
+      cleanData += combined.slice(cursor);
+      break;
+    }
+
+    // Add everything before the marker to clean data
+    cleanData += combined.slice(cursor, startIdx);
+
+    const endIdx = combined.indexOf(STREAM_CHUNK_END, startIdx);
+    if (endIdx === -1) {
+      // Incomplete chunk — save as partial for next data event
+      streamPartials.set(groupId, combined.slice(startIdx));
+      break;
+    }
+
+    // Complete chunk found — broadcast it
+    const chunkText = combined.slice(startIdx + STREAM_CHUNK_MARKER.length, endIdx);
+    if (chunkText.length > 0) {
+      wsBroadcast('chat.stream', {
+        groupId,
+        text: chunkText.slice(0, 500),
+        role: 'assistant',
+        delta: true,
+      });
+    }
+
+    cursor = endIdx + STREAM_CHUNK_END.length;
+    // Skip trailing newline from console.log
+    if (cursor < combined.length && combined[cursor] === '\n') cursor++;
+  }
+
+  return cleanData;
+}
 
 const ALLOWED_ENV_VARS = ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY', 'GITHUB_TOKEN', 'ZAPIER_MCP_TOKEN'];
 
@@ -217,7 +282,11 @@ export async function runLocalAgent(
 
     child.stdout.on('data', (data) => {
       if (stdoutTruncated) return;
-      const chunk = data.toString();
+      let chunk = data.toString();
+
+      // Extract and broadcast stream chunks before buffering
+      chunk = extractStreamChunks(chunk, group.folder);
+
       const remaining = CONTAINER_MAX_OUTPUT_SIZE - stdout.length;
       if (chunk.length > remaining) {
         stdout += chunk.slice(0, remaining);
@@ -277,6 +346,9 @@ export async function runLocalAgent(
     child.on('close', (code) => {
       clearTimeout(timeout);
       const duration = Date.now() - startTime;
+
+      // Clean up stream partial buffer
+      streamPartials.delete(group.folder);
 
       // Write log file
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
@@ -412,6 +484,7 @@ export async function runLocalTeammate(
     NANOCLAW_PROJECT_DIR: PROJECT_ROOT,
     NANOCLAW_CHAT_JID: input.chatJid || '',
     NANOCLAW_SOURCE_CHANNEL: input.sourceChannel || 'telegram',
+    NANOCLAW_MODEL: input.model || process.env.NANOCLAW_MODEL || DEFAULT_TEAMMATE_MODEL,
     HOME: teammateSessionsDir,
     USERPROFILE: teammateSessionsDir,
   };

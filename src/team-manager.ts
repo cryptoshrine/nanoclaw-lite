@@ -27,6 +27,7 @@ import { runTeammate as runTeammateDispatch } from './container-runner.js';
 import { logger } from './logger.js';
 import { Team, TeamMember } from './types.js';
 import { checkAndScheduleWorkflowContinuation } from './workflow-engine.js';
+import { broadcast as wsBroadcast } from './ws-server.js';
 
 // Track active teammate containers
 interface ActiveTeammate {
@@ -34,6 +35,7 @@ interface ActiveTeammate {
   teamId: string;
   name: string;
   chatJid: string;
+  leadGroup: string;
   sourceChannel: 'telegram' | 'discord';
   promise: Promise<void>;
   startTime: number;
@@ -86,6 +88,8 @@ export function createNewTeam(name: string, leadGroup: string): Team {
   fs.mkdirSync(teamDir, { recursive: true });
 
   logger.info({ teamId, name, leadGroup }, 'Team created');
+
+  wsBroadcast('team.created', { teamId, name });
 
   return team;
 }
@@ -148,6 +152,7 @@ export async function spawnTeammate(params: {
     teamId,
     name,
     chatJid: chatJid || '',
+    leadGroup,
     sourceChannel: sourceChannel || 'telegram',
     promise: containerPromise,
     startTime: Date.now(),
@@ -155,6 +160,13 @@ export async function spawnTeammate(params: {
 
   // Update status to active
   updateTeamMember(memberId, { status: 'active' });
+
+  wsBroadcast('team.member.spawned', {
+    teamId,
+    memberId,
+    name,
+    model: member.model,
+  });
 
   return member;
 }
@@ -186,11 +198,21 @@ async function runTeammateInContainer(
         'Teammate container failed',
       );
       updateTeamMember(member.id, { status: 'failed' });
+      wsBroadcast('team.member.done', {
+        teamId: member.team_id,
+        memberId: member.id,
+        status: 'failed',
+      });
     } else {
       logger.info({ memberId: member.id }, 'Teammate completed');
       updateTeamMember(member.id, {
         status: 'completed',
         session_id: output.newSessionId,
+      });
+      wsBroadcast('team.member.done', {
+        teamId: member.team_id,
+        memberId: member.id,
+        status: 'completed',
       });
 
       // Auto-continue any active workflows for this group
@@ -209,13 +231,23 @@ async function runTeammateInContainer(
   } catch (err) {
     logger.error({ memberId: member.id, err }, 'Teammate container error');
     updateTeamMember(member.id, { status: 'failed' });
+    wsBroadcast('team.member.done', {
+      teamId: member.team_id,
+      memberId: member.id,
+      status: 'failed',
+    });
   } finally {
     activeTeammates.delete(member.id);
+    // Update team snapshot to reflect final member status
+    try {
+      writeTeamSnapshot(member.team_id, leadGroup);
+    } catch { /* non-critical */ }
   }
 }
 
 /**
- * Shutdown a specific teammate (not implemented yet - would need container kill)
+ * Shutdown a specific teammate by writing a _close sentinel to its IPC dir.
+ * The teammate's agent-runner will detect this and exit gracefully.
  */
 export function shutdownTeammate(memberId: string): void {
   const active = activeTeammates.get(memberId);
@@ -224,9 +256,24 @@ export function shutdownTeammate(memberId: string): void {
     return;
   }
 
-  // Mark as completed (container will timeout or finish)
+  // Write _close sentinel to teammate's IPC input directory
+  const teammateIpcDir = path.join(DATA_DIR, 'ipc', 'teammates', memberId, 'input');
+  try {
+    fs.mkdirSync(teammateIpcDir, { recursive: true });
+    fs.writeFileSync(path.join(teammateIpcDir, '_close'), '');
+    logger.info({ memberId }, 'Wrote _close sentinel for teammate');
+  } catch (err) {
+    logger.warn({ memberId, err }, 'Failed to write _close sentinel');
+  }
+
+  // Mark as completed
   updateTeamMember(memberId, { status: 'completed' });
   activeTeammates.delete(memberId);
+
+  // Update team snapshot
+  try {
+    writeTeamSnapshot(active.teamId, active.leadGroup);
+  } catch { /* non-critical */ }
 
   logger.info({ memberId }, 'Teammate marked for shutdown');
 }
@@ -251,6 +298,8 @@ export function cleanupTeam(teamId: string): void {
 
   // Mark team as completed
   updateTeamStatus(teamId, 'completed');
+
+  wsBroadcast('team.cleanup', { teamId, name: team.name });
 
   logger.info({ teamId }, 'Team cleaned up');
 }

@@ -93,6 +93,7 @@ import {
 import { wireDiscordCallbacks } from './discord-callbacks.js';
 import { initExtendedChannels, postToAgentLine, type AgentLine } from './discord-channels.js';
 import { transcribeVoiceMessage } from './transcription.js';
+import { KlawEventServer, broadcast as wsBroadcast } from './ws-server.js';
 
 let bot: Bot;
 let botUserId: number | undefined;
@@ -282,12 +283,37 @@ async function processMessage(msg: NewMessage): Promise<void> {
   );
 
   await sendTyping(msg.chat_jid);
+
+  const runId = `run-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+  const agentId = `${group.folder}-main`;
+  wsBroadcast('agent.run.start', {
+    runId,
+    agentId,
+    name: group.name,
+    group: group.folder,
+  });
+
   const response = await runAgent(group, prompt, msg.chat_jid);
+
+  wsBroadcast('agent.run.end', {
+    runId,
+    agentId,
+    groupId: group.folder,
+    status: response ? 'success' : 'empty',
+  });
 
   if (response) {
     lastAgentTimestamp[msg.chat_jid] = msg.timestamp;
     const cleanResponse = formatOutbound(response);
     if (cleanResponse) {
+      // KlawHQ: final agent output
+      wsBroadcast('chat.stream', {
+        runId,
+        groupId: group.folder,
+        text: cleanResponse.slice(0, 500),
+        state: 'final',
+      });
+
       const fullResponse = `${ASSISTANT_NAME}: ${cleanResponse}`;
       await sendMessage(msg.chat_jid, fullResponse);
       // Store agent response in DB so CENTCOMM chat can see it
@@ -325,6 +351,11 @@ async function runAgent(
     return result.response;
   } catch (err) {
     logger.error({ group: group.name, err }, 'Pipeline error');
+    wsBroadcast('agent.error', {
+      agentId: `${group.folder}-main`,
+      group: group.folder,
+      error: err instanceof Error ? err.message : String(err),
+    });
     return null;
   }
 }
@@ -664,6 +695,56 @@ function startIpcWatcher(): void {
                   logger.warn(
                     { chatJid: data.chatJid, sourceGroup },
                     'Unauthorized IPC photo attempt blocked',
+                  );
+                }
+              } else if (data.type === 'document' && data.chatJid && data.filePath) {
+                const targetGroup = registeredGroups[data.chatJid];
+                if (
+                  isMain ||
+                  (targetGroup && targetGroup.folder === sourceGroup)
+                ) {
+                  const chatId = jidToChatId(data.chatJid);
+                  let docPath = data.filePath as string;
+
+                  if (docPath.startsWith('/workspace/group/')) {
+                    docPath = path.join(
+                      GROUPS_DIR,
+                      sourceGroup,
+                      docPath.slice('/workspace/group/'.length),
+                    );
+                  } else if (docPath.startsWith('/workspace/project/')) {
+                    docPath = path.join(
+                      GROUPS_DIR,
+                      '..',
+                      docPath.slice('/workspace/project/'.length),
+                    );
+                  }
+
+                  if (!fs.existsSync(docPath)) {
+                    logger.error(
+                      { chatJid: data.chatJid, filePath: docPath, originalPath: data.filePath, sourceGroup },
+                      'IPC document file not found on host',
+                    );
+                  } else {
+                    try {
+                      await bot.api.sendDocument(chatId, new InputFile(docPath), {
+                        caption: data.caption || undefined,
+                      });
+                      logger.info(
+                        { chatJid: data.chatJid, sourceGroup, filePath: docPath },
+                        'IPC document sent',
+                      );
+                    } catch (docErr) {
+                      logger.error(
+                        { chatJid: data.chatJid, sourceGroup, filePath: docPath, err: docErr },
+                        'Failed to send IPC document',
+                      );
+                    }
+                  }
+                } else {
+                  logger.warn(
+                    { chatJid: data.chatJid, sourceGroup },
+                    'Unauthorized IPC document attempt blocked',
                   );
                 }
               }
@@ -1084,8 +1165,24 @@ async function processTaskIpc(
         try {
           const team = createNewTeam(data.teamName, sourceGroup);
           logger.info({ teamId: team.id, name: data.teamName }, 'Team created via IPC');
+          // Write team snapshot so list_teams can find it
+          writeTeamSnapshot(team.id, sourceGroup);
+          // Write response so the MCP tool gets the team ID
+          if (data.requestId) {
+            const responsesDir = path.join(DATA_DIR, 'ipc', sourceGroup, 'responses');
+            fs.mkdirSync(responsesDir, { recursive: true });
+            const respFile = path.join(responsesDir, `${data.requestId}.json`);
+            fs.writeFileSync(respFile, JSON.stringify({ teamId: team.id, name: team.name }));
+          }
         } catch (err) {
           logger.error({ err, teamName: data.teamName }, 'Failed to create team');
+          // Write error response so the MCP tool knows it failed
+          if (data.requestId) {
+            const responsesDir = path.join(DATA_DIR, 'ipc', sourceGroup, 'responses');
+            fs.mkdirSync(responsesDir, { recursive: true });
+            const respFile = path.join(responsesDir, `${data.requestId}.json`);
+            fs.writeFileSync(respFile, JSON.stringify({ error: err instanceof Error ? err.message : String(err) }));
+          }
         }
       }
       break;
@@ -1105,7 +1202,7 @@ async function processTaskIpc(
             );
             teammateChatJid = mainJid?.[0] || '';
           }
-          await spawnTeammate({
+          const member = await spawnTeammate({
             teamId: data.teamId,
             name: data.teammateName,
             prompt: data.teammatePrompt,
@@ -1115,11 +1212,34 @@ async function processTaskIpc(
             sourceChannel: data.sourceChannel,
           });
           logger.info(
-            { teamId: data.teamId, name: data.teammateName },
+            { teamId: data.teamId, name: data.teammateName, memberId: member.id },
             'Teammate spawned via IPC',
           );
+          // Update team snapshot
+          writeTeamSnapshot(data.teamId, sourceGroup);
+          // Write response so the MCP tool confirms spawn
+          if (data.requestId) {
+            const responsesDir = path.join(DATA_DIR, 'ipc', sourceGroup, 'responses');
+            fs.mkdirSync(responsesDir, { recursive: true });
+            const respFile = path.join(responsesDir, `${data.requestId}.json`);
+            fs.writeFileSync(respFile, JSON.stringify({
+              memberId: member.id,
+              name: member.name,
+              model: member.model,
+              teamId: data.teamId,
+            }));
+          }
         } catch (err) {
           logger.error({ err, teamId: data.teamId }, 'Failed to spawn teammate');
+          // Write error response so the MCP tool knows it failed
+          if (data.requestId) {
+            const responsesDir = path.join(DATA_DIR, 'ipc', sourceGroup, 'responses');
+            fs.mkdirSync(responsesDir, { recursive: true });
+            const respFile = path.join(responsesDir, `${data.requestId}.json`);
+            fs.writeFileSync(respFile, JSON.stringify({
+              error: err instanceof Error ? err.message : String(err),
+            }));
+          }
         }
       }
       break;
@@ -1142,6 +1262,9 @@ async function processTaskIpc(
       }
       if (data.teamId) {
         cleanupTeam(data.teamId);
+        // Remove team snapshot file
+        const snapshotFile = path.join(DATA_DIR, 'ipc', sourceGroup, `team-${data.teamId}.json`);
+        try { if (fs.existsSync(snapshotFile)) fs.unlinkSync(snapshotFile); } catch { /* ignore */ }
         logger.info({ teamId: data.teamId }, 'Team cleaned up via IPC');
       }
       break;
@@ -1623,6 +1746,35 @@ function connectTelegram(): void {
       }
     }
 
+    // Handle photo messages
+    if (msg.photo && msg.photo.length > 0 && registeredGroups[jid]) {
+      const group = registeredGroups[jid];
+      const largestPhoto = msg.photo[msg.photo.length - 1]; // Telegram sends multiple sizes, last is largest
+      const caption = msg.caption || '';
+
+      try {
+        const uploadsDir = path.join(GROUPS_DIR, group.folder, 'uploads');
+        fs.mkdirSync(uploadsDir, { recursive: true });
+
+        const downloadedPath = await downloadTelegramFile(
+          largestPhoto.file_id,
+          uploadsDir,
+        );
+
+        const fileName = path.basename(downloadedPath);
+        content = caption
+          ? `${caption}\n\n[Photo: uploads/${fileName} - saved to uploads/${fileName}]`
+          : `[Photo: uploads/${fileName} - saved to uploads/${fileName}]`;
+
+        logger.info({ fileName, downloadedPath, width: largestPhoto.width, height: largestPhoto.height }, 'Photo downloaded from Telegram');
+      } catch (err) {
+        logger.error({ err }, 'Failed to download photo');
+        content = caption
+          ? `${caption}\n\n[Photo - failed to download]`
+          : '[Photo - failed to download]';
+      }
+    }
+
     // Handle voice messages
     if (msg.voice && registeredGroups[jid]) {
       try {
@@ -1657,6 +1809,13 @@ function connectTelegram(): void {
         content,
         timestamp,
         isFromMe: msg.from?.id === botUserId,
+      });
+
+      // KlawHQ: message received
+      wsBroadcast('message.received', {
+        groupId: registeredGroups[jid].folder,
+        text: content.slice(0, 200),
+        sender: senderName,
       });
     }
   });
@@ -1978,6 +2137,13 @@ async function main(): Promise<void> {
     getTeammateInfo,
   });
   progressStreamer.start();
+
+  // KlawHQ WebSocket event server (optional — if port busy, continues without it)
+  try {
+    new KlawEventServer(18800);
+  } catch (err) {
+    logger.warn({ err }, 'Failed to start KlawHQ WebSocket server (non-fatal)');
+  }
 
   connectTelegram();
 

@@ -27,6 +27,7 @@ import {
   postToMissionControl,
 } from './discord-channels.js';
 import { checkAndScheduleWorkflowContinuation } from './workflow-engine.js';
+import { broadcast as wsBroadcast } from './ws-server.js';
 
 export interface SchedulerDependencies {
   sendMessage: (jid: string, text: string) => Promise<void>;
@@ -61,6 +62,12 @@ async function runTask(
     { taskId: task.id, group: task.group_folder },
     'Running scheduled task',
   );
+
+  wsBroadcast('task.running', {
+    taskId: task.id,
+    group: task.group_folder,
+    prompt: task.prompt.slice(0, 200),
+  });
 
   const groups = deps.registeredGroups();
   const group = Object.values(groups).find(
@@ -167,6 +174,13 @@ async function runTask(
 
       updateTaskRetry(task.id, newRetryCount, retryTime, error);
 
+      wsBroadcast('task.completed', {
+        taskId: task.id,
+        status: 'retry',
+        retry: newRetryCount,
+        maxRetries,
+      });
+
       // Notify user about retry
       try {
         await deps.sendMessage(
@@ -185,6 +199,11 @@ async function runTask(
       );
 
       markTaskFailed(task.id, error);
+
+      wsBroadcast('task.completed', {
+        taskId: task.id,
+        status: 'failed',
+      });
 
       // Notify user about permanent failure
       try {
@@ -214,6 +233,12 @@ async function runTask(
 
   const resultSummary = result ? result.slice(0, 200) : 'Completed';
   updateTaskAfterRun(task.id, nextRun, resultSummary);
+
+  wsBroadcast('task.completed', {
+    taskId: task.id,
+    status: 'success',
+    durationMs,
+  });
 
   // Route task results to Discord channels based on prompt content
   if (result) {

@@ -248,6 +248,27 @@ Building first batch of X content using demo recorder + Remotion pipeline.
 
 **Reading active threads:** At session start, check `active/` for any in-progress work. Reference it in your responses when relevant.
 
+## Learning (MANDATORY)
+
+After each task that involves research, debugging, or implementation, use `record_learning` to capture what you learned. Even quick fixes often reveal something.
+
+**When to record:**
+- After debugging a tricky issue (capture the root cause as a gotcha)
+- After discovering a codebase pattern (capture it so future agents know)
+- After finding a tool trick that saved time (share the tip)
+- After completing a multi-step task (capture workflow insights)
+
+**When to skip:**
+- Pure Q&A or scheduling tasks
+- Tasks where you genuinely learned nothing new
+
+**Before starting complex work**, call `query_learnings` with task-relevant keywords to check if past agents already discovered something useful.
+
+**The learning loop:**
+```
+query_learnings (before) → do the work → record_learning (after)
+```
+
 ## Credential Handling
 
 When the user shares login credentials, API keys, passwords, or tokens:
