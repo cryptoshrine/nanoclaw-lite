@@ -74,3 +74,21 @@ export const MAX_CONCURRENT_SPECIALISTS = parseInt(
   process.env.MAX_CONCURRENT_SPECIALISTS || '3',
   10,
 );
+
+// OmX Autonomous Mode configuration
+export const OMX_SUPERVISOR_INTERVAL = 60_000;     // 60s between supervisor checks
+export const OMX_MAX_RETRIES_PER_STEP = 2;         // Retry failed specialists twice
+export const OMX_STEP_TIMEOUT = 900_000;           // 15min per specialist step
+export const OMX_MAX_TOTAL_DURATION = 3_600_000;   // 1hr max for entire workflow
+export const OMX_MAX_SPECIALISTS_PER_WORKFLOW = 10; // Budget cap per OmX run
+export const OMX_MAX_CONCURRENT_WORKFLOWS = 2;     // Max simultaneous OmX workflows
+export const OMX_REQUIRE_APPROVAL_FOR_PUSH = true; // Require human OK before push
+export const OMX_WORKFLOWS_DIR = path.resolve(DATA_DIR, 'omx-workflows');
+
+// OmX Codex Dispatch
+export const OMX_CODEX_ENABLED = process.env.OMX_CODEX_ENABLED !== 'false';
+export const OMX_CODEX_AGENT_TYPE = process.env.OMX_CODEX_AGENT_TYPE || 'codex';
+export const OMX_RUNTIME_CLI_PATH = process.env.OMX_RUNTIME_CLI_PATH ||
+  path.resolve('C:/claw/orchestration/OMC/oh-my-codex/dist/team/runtime-cli.js');
+export const OMX_CODEX_JOBS_DIR = process.env.OMX_CODEX_JOBS_DIR ||
+  path.join(HOME_DIR, '.omx', 'team-jobs');
