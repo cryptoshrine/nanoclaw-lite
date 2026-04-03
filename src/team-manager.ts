@@ -28,6 +28,7 @@ import { logger } from './logger.js';
 import { Team, TeamMember } from './types.js';
 import { checkAndScheduleWorkflowContinuation } from './workflow-engine.js';
 import { broadcast as wsBroadcast } from './ws-server.js';
+import { postToMissionControl } from './discord-channels.js';
 
 // Track active teammate containers
 interface ActiveTeammate {
@@ -90,6 +91,7 @@ export function createNewTeam(name: string, leadGroup: string): Team {
   logger.info({ teamId, name, leadGroup }, 'Team created');
 
   wsBroadcast('team.created', { teamId, name });
+  postToMissionControl('Team Created', `**${name}**\nID: \`${teamId}\``, 0x3b82f6).catch(() => {});
 
   return team;
 }
@@ -159,7 +161,11 @@ export async function spawnTeammate(params: {
   });
 
   // Update status to active
-  updateTeamMember(memberId, { status: 'active' });
+  try {
+    updateTeamMember(memberId, { status: 'active' });
+  } catch (dbErr) {
+    logger.error({ memberId, dbErr }, 'DB write failed when marking teammate as active');
+  }
 
   wsBroadcast('team.member.spawned', {
     teamId,
@@ -167,6 +173,7 @@ export async function spawnTeammate(params: {
     name,
     model: member.model,
   });
+  postToMissionControl('Specialist Spawned', `**${name}** on team \`${teamId}\`\nModel: ${member.model}`, 0x8b5cf6).catch(() => {});
 
   return member;
 }
@@ -197,23 +204,34 @@ async function runTeammateInContainer(
         { memberId: member.id, error: output.error },
         'Teammate container failed',
       );
-      updateTeamMember(member.id, { status: 'failed' });
+      try {
+        updateTeamMember(member.id, { status: 'failed' });
+      } catch (dbErr) {
+        logger.error({ memberId: member.id, dbErr }, 'DB write failed when marking teammate as failed');
+      }
       wsBroadcast('team.member.done', {
         teamId: member.team_id,
         memberId: member.id,
         status: 'failed',
       });
+      postToMissionControl('Specialist Failed', `**${member.name}** on team \`${member.team_id}\`\n${output.error || 'Unknown error'}`, 0xef4444).catch(() => {});
     } else {
       logger.info({ memberId: member.id }, 'Teammate completed');
-      updateTeamMember(member.id, {
-        status: 'completed',
-        session_id: output.newSessionId,
-      });
+      try {
+        updateTeamMember(member.id, {
+          status: 'completed',
+          session_id: output.newSessionId,
+        });
+      } catch (dbErr) {
+        logger.error({ memberId: member.id, dbErr }, 'DB write failed when marking teammate as completed');
+      }
       wsBroadcast('team.member.done', {
         teamId: member.team_id,
         memberId: member.id,
         status: 'completed',
       });
+      const elapsed = Math.round((Date.now() - (activeTeammates.get(member.id)?.startTime || Date.now())) / 1000);
+      postToMissionControl('Specialist Completed', `**${member.name}** on team \`${member.team_id}\`\nDuration: ${elapsed}s`, 0x22c55e).catch(() => {});
 
       // Auto-continue any active workflows for this group
       try {
@@ -230,12 +248,17 @@ async function runTeammateInContainer(
     }
   } catch (err) {
     logger.error({ memberId: member.id, err }, 'Teammate container error');
-    updateTeamMember(member.id, { status: 'failed' });
+    try {
+      updateTeamMember(member.id, { status: 'failed' });
+    } catch (dbErr) {
+      logger.error({ memberId: member.id, dbErr }, 'DB write failed when marking crashed teammate as failed');
+    }
     wsBroadcast('team.member.done', {
       teamId: member.team_id,
       memberId: member.id,
       status: 'failed',
     });
+    postToMissionControl('Specialist Crashed', `**${member.name}** on team \`${member.team_id}\`\n${err instanceof Error ? err.message : String(err)}`, 0xef4444).catch(() => {});
   } finally {
     activeTeammates.delete(member.id);
     // Update team snapshot to reflect final member status
@@ -300,6 +323,7 @@ export function cleanupTeam(teamId: string): void {
   updateTeamStatus(teamId, 'completed');
 
   wsBroadcast('team.cleanup', { teamId, name: team.name });
+  postToMissionControl('Team Cleaned Up', `**${team.name}**\nID: \`${teamId}\``, 0x6b7280).catch(() => {});
 
   logger.info({ teamId }, 'Team cleaned up');
 }
@@ -338,16 +362,52 @@ export function startTeamWatcher(): void {
           { memberId, teamId: active.teamId },
           'Teammate timed out',
         );
-        updateTeamMember(memberId, { status: 'failed' });
+        try {
+          updateTeamMember(memberId, { status: 'failed' });
+        } catch (err) {
+          logger.error({ memberId, err }, 'Failed to update timed-out teammate status in DB');
+        }
+        postToMissionControl('Specialist Timed Out', `**${active.name}** on team \`${active.teamId}\`\nRan for ${Math.round((now - active.startTime) / 1000)}s`, 0xf59e0b).catch(() => {});
         activeTeammates.delete(memberId);
       }
     }
 
-    // Check for teams with all teammates completed
+    // Zombie detector: find members marked 'active' in DB but missing from
+    // the in-memory activeTeammates map. This catches cases where the process
+    // died but the DB status was never updated (race conditions, OOM kills,
+    // segfaults, etc.).
     const teams = getActiveTeams();
     for (const team of teams) {
       const members = getTeamMembers(team.id);
       const teammates = members.filter((m) => m.role === 'teammate');
+
+      for (const member of teammates) {
+        if (
+          (member.status === 'active' || member.status === 'pending') &&
+          !activeTeammates.has(member.id)
+        ) {
+          // This member claims to be active/pending but has no live process.
+          // Check if it was created recently (< 10s) — it might just be
+          // starting up and hasn't been added to the map yet.
+          const createdAt = new Date(member.created_at).getTime();
+          if (now - createdAt > 10_000) {
+            logger.warn(
+              { memberId: member.id, teamId: team.id, name: member.name, dbStatus: member.status },
+              'Zombie specialist detected: active in DB but no live process — marking failed',
+            );
+            try {
+              updateTeamMember(member.id, { status: 'failed' });
+            } catch (err) {
+              logger.error({ memberId: member.id, err }, 'Failed to update zombie teammate status in DB');
+            }
+            postToMissionControl(
+              'Zombie Specialist Reaped',
+              `**${member.name}** on team \`${team.id}\`\nWas "${member.status}" in DB with no live process`,
+              0xf59e0b,
+            ).catch(() => {});
+          }
+        }
+      }
 
       if (teammates.length > 0) {
         const allDone = teammates.every(

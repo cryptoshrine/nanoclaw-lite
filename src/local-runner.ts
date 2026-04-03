@@ -562,14 +562,14 @@ export async function runLocalTeammate(
       }
     });
 
+    let timedOut = false;
     const timeout = setTimeout(() => {
       logger.error({ memberId: input.memberId }, 'Local teammate timeout, killing');
+      timedOut = true;
       child.kill('SIGKILL');
-      resolve({
-        status: 'error',
-        result: null,
-        error: `Local teammate timed out after ${TEAMMATE_TIMEOUT}ms`,
-      });
+      // Don't resolve here — let child.on('close') handle it so the
+      // finally block in runTeammateInContainer runs in the right order
+      // and DB status gets updated properly.
     }, TEAMMATE_TIMEOUT);
 
     child.on('close', (code) => {
@@ -587,6 +587,7 @@ export async function runLocalTeammate(
         `Member: ${input.memberName} (${input.memberId})`,
         `Duration: ${duration}ms`,
         `Exit Code: ${code}`,
+        `Timed Out: ${timedOut}`,
         ``,
         `=== Stderr ===`,
         stderr.slice(-2000),
@@ -603,6 +604,7 @@ export async function runLocalTeammate(
             memberId: input.memberId,
             code,
             duration,
+            timedOut,
             stderr: stderr.slice(-500),
           },
           'Local teammate exited with error',
@@ -614,7 +616,18 @@ export async function runLocalTeammate(
         );
       }
 
-      resolve(parseAgentOutput(stdout, code, stderr));
+      // Try to parse stdout even if killed by timeout — agent may have
+      // already written its response before entering the idle IPC wait loop.
+      const parsed = parseAgentOutput(stdout, code, stderr);
+      if (timedOut && parsed.status === 'error') {
+        resolve({
+          status: 'error',
+          result: null,
+          error: `Local teammate timed out after ${TEAMMATE_TIMEOUT}ms`,
+        });
+      } else {
+        resolve(parsed);
+      }
     });
 
     child.on('error', (err) => {
