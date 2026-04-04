@@ -289,6 +289,61 @@ export async function cleanupCodexJob(jobId: string): Promise<void> {
 }
 
 /**
+ * Nudge a running Codex job via tmux send-keys.
+ * Reads the panes file to find active tmux pane IDs, then sends a continuation
+ * message to each pane. Returns true if at least one nudge was sent.
+ *
+ * Pattern 4: Heartbeat + Auto-Nudge
+ */
+export function nudgeCodexJob(
+  jobId: string,
+  message = 'Continue working on your assigned task. If blocked, report status.',
+): boolean {
+  const panesPath = path.join(OMX_CODEX_JOBS_DIR, `${jobId}-panes.json`);
+
+  try {
+    if (!fs.existsSync(panesPath)) {
+      logger.debug({ jobId }, 'Codex nudge: no panes file found');
+      return false;
+    }
+
+    const panes = JSON.parse(fs.readFileSync(panesPath, 'utf-8')) as {
+      paneIds: string[];
+      leaderPaneId?: string;
+    };
+
+    if (!panes.paneIds || panes.paneIds.length === 0) {
+      logger.debug({ jobId }, 'Codex nudge: no pane IDs in file');
+      return false;
+    }
+
+    let nudged = false;
+    const { execSync } = require('child_process') as typeof import('child_process');
+
+    for (const paneId of panes.paneIds) {
+      if (!paneId) continue;
+      try {
+        // Escape the message for tmux send-keys
+        const escaped = message.replace(/"/g, '\\"');
+        execSync(`tmux send-keys -t "${paneId}" "${escaped}" Enter`, { timeout: 5000 });
+        nudged = true;
+        logger.debug({ jobId, paneId }, 'Codex nudge sent');
+      } catch {
+        // Pane may be dead — that's fine
+      }
+    }
+
+    if (nudged) {
+      logger.info({ jobId, paneCount: panes.paneIds.length }, 'Codex job nudged');
+    }
+    return nudged;
+  } catch (err) {
+    logger.warn({ jobId, error: String(err) }, 'Error nudging Codex job');
+    return false;
+  }
+}
+
+/**
  * Check if a string is a Codex job ID (starts with "codex-").
  */
 export function isCodexJobId(id: string): boolean {

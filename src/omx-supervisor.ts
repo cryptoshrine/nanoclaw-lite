@@ -26,12 +26,19 @@ import {
   startCodexJob,
   checkCodexJobStatus,
   cleanupCodexJob,
+  nudgeCodexJob,
 } from './codex-bridge.js';
 import { getTeamMember } from './db.js';
 import { logger } from './logger.js';
 import { spawnTeammate, cleanupTeam } from './team-manager.js';
 import { broadcast as wsBroadcast } from './ws-server.js';
 import { postToMissionControl } from './discord-channels.js';
+import { claimStep, transitionStep, reclaimExpiredSteps } from './omx-claim.js';
+import { createSnapshot, appendToSnapshot, readSnapshot } from './omx-context.js';
+import { initMailbox, getUnreadMessages, markDelivered } from './omx-mailbox.js';
+import { scoreStepClarity, isStepTooVague, isStepNeedsEnhancement, enhanceVagueStep } from './omx-ambiguity.js';
+import { detectSlop, shouldDeslop, buildDeslopPrompt } from './omx-deslop.js';
+import { createWorkflowBranch, mergeWorkflowBranch, cleanupBranch } from './omx-branch.js';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -59,6 +66,17 @@ export interface OmxStep {
   startedAt?: string;
   completedAt?: string;
   error?: string;
+  /** Claim-safe lifecycle (Pattern 1) */
+  version?: number;
+  claim?: { owner: string; token: string; leasedUntil: string };
+  claimToken?: string;
+  /** Pattern 4: Heartbeat — track when Codex nudge was sent (one per step) */
+  nudgedAt?: string;
+  /** Pattern 2: Ambiguity — clarity score 0-1 for this step */
+  clarityScore?: number;
+  /** Pattern 5: Deslop — tracks whether a cleanup pass is pending/running */
+  deslopPending?: boolean;
+  deslopMemberId?: string;
 }
 
 export type OmxPhaseStatus = 'pending' | 'in_progress' | 'done' | 'failed';
@@ -86,6 +104,13 @@ export interface OmxWorkflow {
   updatedAt: string;
   completedAt?: string;
   context: string;
+  /** Pattern 7: Branch Isolation — dedicated branch for this workflow */
+  branch?: string;
+  /** Pattern 8: Leader Activity Tracking */
+  lastSupervisorActionAt?: string;
+  lastSpecialistProgressAt?: string;
+  lastUserInteractionAt?: string;
+  staleAlertSentAt?: string;
 }
 
 // ── Persistence ───────────────────────────────────────────────────────────────
@@ -131,6 +156,57 @@ export function listActiveOmxWorkflows(): OmxWorkflow[] {
     } catch { /* skip corrupt */ }
   }
   return workflows;
+}
+
+// ── Leader Activity Tracking (Pattern 8) ──────────────────────────────────────
+
+/** A workflow is considered stale if all activity signals exceed this threshold. */
+const OMX_STALE_THRESHOLD = 5 * 60 * 1000; // 5 minutes
+/** Don't re-alert about the same stale workflow within this cooldown. */
+const OMX_STALE_ALERT_COOLDOWN = 10 * 60 * 1000; // 10 minutes
+
+/** Pattern 4: Specialist stall timeout — fail early instead of waiting full 15min. */
+const OMX_SPECIALIST_STALL_TIMEOUT = 5 * 60 * 1000; // 5 minutes
+/** Pattern 4: Codex nudge threshold — nudge idle workers after this period. */
+const OMX_CODEX_NUDGE_THRESHOLD = 3 * 60 * 1000; // 3 minutes
+
+/**
+ * Returns true when ALL three activity signals are stale (or unset).
+ * A single recent signal means something is still happening.
+ */
+export function isWorkflowStale(workflow: OmxWorkflow): boolean {
+  const now = Date.now();
+
+  function signalAge(ts: string | undefined): number {
+    return ts ? now - new Date(ts).getTime() : Infinity;
+  }
+
+  return (
+    signalAge(workflow.lastSupervisorActionAt) > OMX_STALE_THRESHOLD &&
+    signalAge(workflow.lastSpecialistProgressAt) > OMX_STALE_THRESHOLD &&
+    signalAge(workflow.lastUserInteractionAt) > OMX_STALE_THRESHOLD
+  );
+}
+
+/**
+ * Update supervisor action timestamp on the workflow.
+ */
+function touchSupervisorAction(workflow: OmxWorkflow): void {
+  workflow.lastSupervisorActionAt = new Date().toISOString();
+}
+
+/**
+ * Update specialist progress timestamp on the workflow.
+ */
+function touchSpecialistProgress(workflow: OmxWorkflow): void {
+  workflow.lastSpecialistProgressAt = new Date().toISOString();
+}
+
+/**
+ * Update user interaction timestamp on the workflow.
+ */
+function touchUserInteraction(workflow: OmxWorkflow): void {
+  workflow.lastUserInteractionAt = new Date().toISOString();
 }
 
 // ── Step Annotation Parser ────────────────────────────────────────────────────
@@ -252,6 +328,22 @@ export function createOmxWorkflow(params: {
   };
 
   saveOmxWorkflow(workflow);
+
+  // Pattern 7: Create a dedicated git branch for this workflow
+  try {
+    const branch = createWorkflowBranch(params.projectPath, id);
+    workflow.branch = branch;
+    saveOmxWorkflow(workflow);
+  } catch (err) {
+    logger.warn({ omxId: id, error: String(err) }, 'Pattern 7: Failed to create workflow branch — continuing without isolation');
+  }
+
+  // Pattern 6: Create initial context snapshot on disk
+  createSnapshot(id, params.taskDescription, params.projectPath, params.workflowContent);
+
+  // Pattern 3: Initialize mailbox directory for specialist ↔ supervisor messaging
+  initMailbox(id);
+
   logger.info({ omxId: id, steps: steps.length }, 'OmX workflow created');
 
   wsBroadcast('omx.created', { id, taskDescription: params.taskDescription, steps: steps.length });
@@ -267,7 +359,8 @@ export function createOmxWorkflow(params: {
 // ── Specialist Prompt Building ────────────────────────────────────────────────
 
 function buildSpecialistPrompt(workflow: OmxWorkflow, step: OmxStep): string {
-  const previousContext = workflow.context.slice(-4000);
+  // Pattern 6: Use file-based snapshot instead of in-memory string accumulator
+  const previousContext = readSnapshot(workflow.id) || workflow.context.slice(-4000);
   const specialistProfile = getSpecialistProfile(step.annotations.specialist);
 
   let prompt = '';
@@ -285,11 +378,23 @@ function buildSpecialistPrompt(workflow: OmxWorkflow, step: OmxStep): string {
 
   prompt += `YOUR STEP:\n${step.content}\n\n`;
   prompt += `PROJECT PATH: ${workflow.projectPath}\n\n`;
+  // Pattern 3: Mailbox for progress reporting
+  const mailboxPath = `data/omx-workflows/${workflow.id}/mailbox/${step.number}.json`;
+  prompt += `MAILBOX (progress reporting): ${mailboxPath}\n`;
+  prompt += `Write progress updates by appending JSON messages to this file. Format: array of { "id": "<uuid>", "from": "specialist", "to": "supervisor", "body": "<your update>", "created_at": "<iso timestamp>" }.\n`;
+  prompt += `The supervisor checks this file every 60s and forwards updates to the user.\n\n`;
+
+  // Pattern 7: Branch isolation — tell specialist which branch to work on
+  if (workflow.branch) {
+    prompt += `GIT BRANCH: You are working on branch ${workflow.branch}. Make sure you're on this branch before making changes (run: git checkout ${workflow.branch}).\n\n`;
+  }
+
   prompt += `INSTRUCTIONS:\n`;
   prompt += `1. Execute the step above thoroughly\n`;
   prompt += `2. Use send_message to report your results when done\n`;
   prompt += `3. If you hit a blocker, report it via send_message\n`;
   prompt += `4. Save any important output to files in the project\n`;
+  prompt += `5. Write progress updates to your mailbox file every 2-3 minutes to avoid being marked as stalled (the supervisor auto-fails steps with no progress for 5 minutes)\n`;
 
   return prompt;
 }
@@ -367,20 +472,22 @@ INSTRUCTIONS:
 // ── Commit Step ───────────────────────────────────────────────────────────────
 
 function buildCommitPrompt(workflow: OmxWorkflow): string {
-  return `You are an OmX commit agent. Your job is to commit and push changes.
+  const branch = workflow.branch || 'main';
+  return `You are an OmX commit agent. Your job is to commit changes on the workflow branch.
 
 PROJECT PATH: ${workflow.projectPath}
+BRANCH: ${branch}
 
 INSTRUCTIONS:
 1. cd to the project path
-2. Run: git add -A
-3. Run: git diff --staged --stat
-4. Run: git commit -m "feat(omx): ${workflow.taskDescription}"
-5. Run: git push origin main
+2. Run: git checkout ${branch}
+3. Run: git add -A
+4. Run: git diff --staged --stat
+5. Run: git commit -m "feat(omx): ${workflow.taskDescription}"
 6. Report the commit hash and summary via send_message
 7. Format: "COMMIT: <hash>\\n<summary of files changed>"
 
-If git push fails, report the error. Do NOT force push.
+Do NOT push. Do NOT merge. The supervisor handles branch merging after approval.
 `;
 }
 
@@ -462,7 +569,8 @@ async function spawnCodexForStep(workflow: OmxWorkflow, step: OmxStep): Promise<
  * Build a simpler prompt for Codex workers (no specialist profiles needed).
  */
 function buildCodexPrompt(workflow: OmxWorkflow, step: OmxStep): string {
-  const previousContext = workflow.context.slice(-4000);
+  // Pattern 6: Use file-based snapshot instead of in-memory string accumulator
+  const previousContext = readSnapshot(workflow.id) || workflow.context.slice(-4000);
   let prompt = `TASK: ${workflow.taskDescription}\n\n`;
   prompt += `STEP ${step.number}/${workflow.steps.length}: ${step.title}\n\n`;
   prompt += step.content + '\n\n';
@@ -470,7 +578,15 @@ function buildCodexPrompt(workflow: OmxWorkflow, step: OmxStep): string {
     prompt += `CONTEXT FROM PREVIOUS STEPS:\n${previousContext}\n\n`;
   }
   prompt += `WORKING DIRECTORY: ${workflow.projectPath}\n`;
-  prompt += `Run tests to verify your changes work correctly.\n`;
+  // Pattern 7: Branch isolation for Codex workers
+  if (workflow.branch) {
+    prompt += `GIT BRANCH: ${workflow.branch} — ensure you're on this branch before making changes.\n`;
+  }
+  prompt += `Run tests to verify your changes work correctly.\n\n`;
+  // Pattern 3: Mailbox for progress reporting
+  const mailboxPath = `data/omx-workflows/${workflow.id}/mailbox/${step.number}.json`;
+  prompt += `MAILBOX: ${mailboxPath}\n`;
+  prompt += `Write progress updates by appending JSON messages to this file. Format: array of { "id": "<uuid>", "from": "codex", "to": "supervisor", "body": "<update>", "created_at": "<timestamp>" }.\n`;
   return prompt;
 }
 
@@ -615,6 +731,29 @@ export async function supervisorTick(
   const now = Date.now();
   const elapsed = now - new Date(workflow.createdAt).getTime();
 
+  // Reclaim any steps with expired leases (Pattern 1: Claim-Safe)
+  const reclaimed = reclaimExpiredSteps(workflow);
+  if (reclaimed > 0) {
+    logger.info({ omxId: workflow.id, reclaimed }, 'Reclaimed expired step leases');
+    saveOmxWorkflow(workflow);
+  }
+
+  // Pattern 8: Stale workflow detection — alert user if nothing is happening
+  if (isWorkflowStale(workflow)) {
+    const cooldownOk = !workflow.staleAlertSentAt ||
+      now - new Date(workflow.staleAlertSentAt).getTime() > OMX_STALE_ALERT_COOLDOWN;
+    if (cooldownOk) {
+      const lastActivity = workflow.lastSupervisorActionAt || workflow.lastSpecialistProgressAt || workflow.createdAt;
+      const agoMin = Math.round((now - new Date(lastActivity).getTime()) / 60000);
+      await sendMessage(
+        workflow.chatJid,
+        `*OmX stall detected:* "${workflow.taskDescription}" — no activity for ${agoMin}min. Step ${workflow.currentStepIndex + 1}/${workflow.steps.length}.`,
+      );
+      workflow.staleAlertSentAt = new Date().toISOString();
+      saveOmxWorkflow(workflow);
+    }
+  }
+
   // Check total duration limit
   if (elapsed > OMX_MAX_TOTAL_DURATION) {
     workflow.status = 'failed';
@@ -649,6 +788,7 @@ export async function supervisorTick(
       try {
         const result = await checkApproval(workflow.approvalRequestId);
         if (result.status === 'approved') {
+          touchUserInteraction(workflow);
           workflow.status = 'active';
           workflow.approvalRequestId = undefined;
           // Find the commit step and proceed
@@ -660,6 +800,7 @@ export async function supervisorTick(
           }
           saveOmxWorkflow(workflow);
         } else if (result.status === 'rejected') {
+          touchUserInteraction(workflow);
           workflow.status = 'completed';
           workflow.approvalRequestId = undefined;
           saveOmxWorkflow(workflow);
@@ -694,6 +835,21 @@ export async function supervisorTick(
 
     case 'completed':
     case 'skipped':
+      // Pattern 5: Wait for deslop specialist to finish before advancing
+      if (currentStep.deslopPending && currentStep.deslopMemberId) {
+        const deslopMember = getTeamMember(currentStep.deslopMemberId);
+        if (deslopMember && (deslopMember.status === 'active' || deslopMember.status === 'pending')) {
+          // Deslop still running — wait for next tick
+          break;
+        }
+        // Deslop finished (completed or failed) — clear and advance
+        currentStep.deslopPending = false;
+        if (deslopMember?.status === 'completed') {
+          logger.info({ omxId: workflow.id, step: currentStep.number }, 'Pattern 5: Deslop cleanup complete');
+        } else {
+          logger.warn({ omxId: workflow.id, step: currentStep.number }, 'Pattern 5: Deslop specialist failed or missing — advancing anyway');
+        }
+      }
       // Advance to next step
       accumulateContext(workflow, currentStep);
       workflow.currentStepIndex++;
@@ -721,6 +877,56 @@ async function handlePendingStep(
       // Dependency not met — skip this tick
       return;
     }
+  }
+
+  // Claim the step before dispatching (Pattern 1: Claim-Safe)
+  const stepIndex = workflow.steps.indexOf(step);
+  const claimOwner = `supervisor-${workflow.id}`;
+  const token = claimStep(workflow, stepIndex, claimOwner);
+  if (!token) {
+    logger.warn({ omxId: workflow.id, step: step.number }, 'Failed to claim step — skipping tick');
+    return;
+  }
+  saveOmxWorkflow(workflow);
+
+  // Pattern 8: Record supervisor action (we claimed and are about to dispatch)
+  touchSupervisorAction(workflow);
+
+  // Pattern 2: Ambiguity Scoring — check step clarity before spawning
+  // (skip for gate/commit steps which have generated prompts, not user-written content)
+  if (step.annotations.specialist !== 'commit' && !step.annotations.gate) {
+    const clarity = scoreStepClarity(step.content);
+    step.clarityScore = clarity;
+
+    if (isStepTooVague(clarity)) {
+      // Too vague — release claim and ask user to clarify
+      step.status = 'pending';
+      step.claim = undefined;
+      step.claimToken = undefined;
+      saveOmxWorkflow(workflow);
+      await sendMessage(
+        workflow.chatJid,
+        `*OmX Step ${step.number}* ("${step.title}") is too vague (clarity: ${clarity}). Please clarify before I proceed.`,
+      );
+      logger.warn(
+        { omxId: workflow.id, step: step.number, clarity },
+        'Pattern 2: Step too vague — awaiting clarification',
+      );
+      return;
+    }
+
+    if (isStepNeedsEnhancement(clarity)) {
+      // Borderline — inject context from snapshot to help the specialist
+      const snapshot = readSnapshot(workflow.id);
+      if (snapshot) {
+        step.content = enhanceVagueStep(step.content, snapshot);
+        logger.info(
+          { omxId: workflow.id, step: step.number, clarity },
+          'Pattern 2: Step enhanced with context snapshot',
+        );
+      }
+    }
+    // clarity >= 0.7 → proceed as-is
   }
 
   // Gate steps run directly — no AI agent needed
@@ -762,8 +968,38 @@ async function handleInProgressStep(
   step: OmxStep,
   sendMessage: (jid: string, text: string) => Promise<void>,
 ): Promise<void> {
+  // Pattern 3: Check mailbox for unread specialist progress updates
+  try {
+    const unread = getUnreadMessages(workflow.id, step.number);
+    if (unread.length > 0) {
+      touchSpecialistProgress(workflow); // Pattern 8: mailbox activity
+    }
+    for (const msg of unread) {
+      await sendMessage(
+        workflow.chatJid,
+        `*OmX Step ${step.number} update:*\n${msg.body}`,
+      );
+      markDelivered(workflow.id, step.number, msg.id);
+    }
+  } catch {
+    // Mailbox read failure is non-fatal — continue with step monitoring
+  }
+
   // Codex job path — check job status from disk
   if (step.codexJobId) {
+    // Pattern 4: Nudge idle Codex workers once after threshold
+    const codexElapsed = Date.now() - new Date(step.startedAt || workflow.createdAt).getTime();
+    if (codexElapsed > OMX_CODEX_NUDGE_THRESHOLD && !step.nudgedAt) {
+      const nudged = nudgeCodexJob(step.codexJobId);
+      if (nudged) {
+        step.nudgedAt = new Date().toISOString();
+        saveOmxWorkflow(workflow);
+        logger.info(
+          { omxId: workflow.id, step: step.number, jobId: step.codexJobId },
+          'Pattern 4: Codex worker nudged after idle threshold',
+        );
+      }
+    }
     await checkCodexStepStatus(workflow, step, sendMessage);
     return;
   }
@@ -777,6 +1013,8 @@ async function handleInProgressStep(
   if (!step.memberId) {
     // In-progress but no member assigned — something went wrong, retry
     step.status = 'pending';
+    step.claim = undefined;
+    step.claimToken = undefined;
     saveOmxWorkflow(workflow);
     return;
   }
@@ -785,19 +1023,66 @@ async function handleInProgressStep(
   const member = getTeamMember(step.memberId);
   if (!member) {
     // Member gone — mark as failed for retry
-    step.status = 'failed';
+    const stepIndex = workflow.steps.indexOf(step);
+    if (step.claimToken) {
+      transitionStep(workflow, stepIndex, step.claimToken, 'failed');
+    } else {
+      step.status = 'failed';
+    }
     step.error = 'Specialist member not found in database';
     saveOmxWorkflow(workflow);
     return;
   }
+
+  const stepIndex = workflow.steps.indexOf(step);
 
   switch (member.status) {
     case 'active':
     case 'pending': {
       // Still running — check timeout
       const stepElapsed = Date.now() - new Date(step.startedAt || workflow.createdAt).getTime();
+
+      // Pattern 4: Early stall detection for specialists.
+      // If no mailbox progress in 5min, fail early instead of waiting full timeout.
+      if (
+        step.executionMode === 'specialist' &&
+        stepElapsed > OMX_SPECIALIST_STALL_TIMEOUT &&
+        stepElapsed <= OMX_STEP_TIMEOUT
+      ) {
+        // Check if there's been any recent progress via mailbox or activity timestamps
+        const lastProgress = workflow.lastSpecialistProgressAt
+          ? new Date(workflow.lastSpecialistProgressAt).getTime()
+          : 0;
+        const stepStartTime = new Date(step.startedAt || workflow.createdAt).getTime();
+        const progressSinceStart = lastProgress > stepStartTime;
+
+        if (!progressSinceStart) {
+          // No mailbox activity at all since step started — stalled
+          if (step.claimToken) {
+            transitionStep(workflow, stepIndex, step.claimToken, 'failed');
+          } else {
+            step.status = 'failed';
+          }
+          step.error = `Specialist stalled (no progress for ${Math.round(stepElapsed / 60000)}min)`;
+          saveOmxWorkflow(workflow);
+          logger.warn(
+            { omxId: workflow.id, step: step.number, elapsed: Math.round(stepElapsed / 1000) },
+            'Pattern 4: Specialist stall detected — failing early',
+          );
+          await sendMessage(
+            workflow.chatJid,
+            `*OmX Step ${step.number} stalled:* "${step.title}" — no progress for ${Math.round(stepElapsed / 60000)}min. Retrying...`,
+          );
+          break;
+        }
+      }
+
       if (stepElapsed > OMX_STEP_TIMEOUT) {
-        step.status = 'failed';
+        if (step.claimToken) {
+          transitionStep(workflow, stepIndex, step.claimToken, 'failed');
+        } else {
+          step.status = 'failed';
+        }
         step.error = `Step timed out after ${Math.round(stepElapsed / 60000)} minutes`;
         saveOmxWorkflow(workflow);
         logger.warn({ omxId: workflow.id, step: step.number }, 'OmX step timed out');
@@ -806,8 +1091,15 @@ async function handleInProgressStep(
     }
 
     case 'completed': {
-      // Specialist finished successfully
-      step.status = 'completed';
+      // Pattern 8: Record activity — specialist completed + supervisor acted
+      touchSpecialistProgress(workflow);
+      touchSupervisorAction(workflow);
+      // Specialist finished successfully — transition via claim token
+      if (step.claimToken) {
+        transitionStep(workflow, stepIndex, step.claimToken, 'completed');
+      } else {
+        step.status = 'completed';
+      }
       step.completedAt = new Date().toISOString();
       // Read output from team messages or specialist files if available
       step.output = `Step ${step.number} completed by specialist ${step.memberId}`;
@@ -830,12 +1122,56 @@ async function handleInProgressStep(
         }
       }
 
+      // Pattern 5: Deslop — detect sloppy output from dev/commit specialists
+      if (
+        shouldDeslop(step) &&
+        !step.deslopPending &&
+        !step.deslopMemberId &&
+        workflow.specialistsSpawned < OMX_MAX_SPECIALISTS_PER_WORKFLOW
+      ) {
+        try {
+          const slopReport = detectSlop(workflow.projectPath);
+          if (slopReport.hasIssues) {
+            const deslopPrompt = buildDeslopPrompt(slopReport, workflow.projectPath);
+            const deslopName = `omx-deslop-s${step.number}`;
+            const deslopMember = await spawnTeammate({
+              teamId: workflow.teamId,
+              name: deslopName,
+              prompt: deslopPrompt,
+              model: 'claude-haiku-4-5-20251001',
+              leadGroup: workflow.groupFolder,
+              chatJid: workflow.chatJid,
+            });
+            step.deslopPending = true;
+            step.deslopMemberId = deslopMember.id;
+            workflow.specialistsSpawned++;
+            logger.info(
+              { omxId: workflow.id, step: step.number, issues: slopReport.issues.length, memberId: deslopMember.id },
+              'Pattern 5: Deslop specialist spawned',
+            );
+          }
+        } catch (err) {
+          // Deslop is best-effort — don't block the pipeline on failure
+          logger.warn(
+            { omxId: workflow.id, step: step.number, err },
+            'Pattern 5: Deslop detection/spawn failed — continuing',
+          );
+        }
+      }
+
       saveOmxWorkflow(workflow);
       break;
     }
 
     case 'failed': {
-      step.status = 'failed';
+      // Pattern 8: Record activity — specialist reported failure + supervisor acted
+      touchSpecialistProgress(workflow);
+      touchSupervisorAction(workflow);
+      if (step.claimToken) {
+        transitionStep(workflow, stepIndex, step.claimToken, 'failed');
+      } else {
+        step.status = 'failed';
+      }
       step.error = `Specialist ${member.name} failed`;
       saveOmxWorkflow(workflow);
       break;
@@ -849,6 +1185,9 @@ async function handleFailedStep(
   sendMessage: (jid: string, text: string) => Promise<void>,
 ): Promise<void> {
   if (step.retryCount < OMX_MAX_RETRIES_PER_STEP) {
+    // Pattern 8: Record supervisor retry decision
+    touchSupervisorAction(workflow);
+
     // Clean up Codex job if present
     if (step.codexJobId) {
       await cleanupCodexJob(step.codexJobId).catch(() => {});
@@ -861,6 +1200,9 @@ async function handleFailedStep(
     step.codexJobId = undefined;
     step.executionMode = undefined;
     step.error = undefined;
+    step.claim = undefined;
+    step.claimToken = undefined;
+    step.nudgedAt = undefined; // Pattern 4: Reset nudge state on retry
     saveOmxWorkflow(workflow);
 
     logger.info(
@@ -1010,11 +1352,13 @@ async function spawnGateAgent(workflow: OmxWorkflow, step: OmxStep): Promise<voi
 
 function accumulateContext(workflow: OmxWorkflow, step: OmxStep): void {
   if (step.output) {
+    // In-memory accumulator (fallback)
     workflow.context += `\n\n--- Step ${step.number}: ${step.title} ---\n${step.output}`;
-    // Keep context under 8K to avoid bloating prompts
     if (workflow.context.length > 8000) {
       workflow.context = workflow.context.slice(-6000);
     }
+    // Pattern 6: Also persist to file-based snapshot
+    appendToSnapshot(workflow.id, step.number, step.title, step.output);
   }
 }
 
@@ -1026,6 +1370,21 @@ async function completeWorkflow(
   for (const step of workflow.steps) {
     if (step.codexJobId && step.status === 'in_progress') {
       await cleanupCodexJob(step.codexJobId).catch(() => {});
+    }
+  }
+
+  // Pattern 7: Merge workflow branch back to base
+  if (workflow.branch) {
+    const mergeResult = mergeWorkflowBranch(workflow.projectPath, workflow.id);
+    if (mergeResult.success) {
+      cleanupBranch(workflow.projectPath, workflow.id);
+      logger.info({ omxId: workflow.id, branch: workflow.branch }, 'Pattern 7: Branch merged and cleaned up');
+    } else {
+      await sendMessage(
+        workflow.chatJid,
+        `*OmX branch merge failed:* ${workflow.branch}\nError: ${mergeResult.error}\n\nThe branch is preserved for manual resolution.`,
+      );
+      logger.error({ omxId: workflow.id, branch: workflow.branch, error: mergeResult.error }, 'Pattern 7: Branch merge failed');
     }
   }
 
