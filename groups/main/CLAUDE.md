@@ -138,8 +138,91 @@ When a message arrives, classify it:
 | Marketing strategy | Delegate → Ball-AI Marketing | "plan the launch campaign" |
 | Content creation | Delegate → Ball-AI Copywriter | "write a newsletter about xG analysis" |
 | Approving specialist output | Review then publish | (specialist sends draft tweet) |
+| Autonomous multi-step task | OmX mode (see below) | "OmX: add HOPS integration", "do this overnight: refactor auth" |
+| Deliberative planning | OmX RALPLAN mode | "ralplan: design the auth system", "deliberate: API redesign" |
+| Iterative research/coding | OmX Autoresearch mode | "autoresearch: optimize query performance" |
+| Vague/ambiguous task | OmX Interview mode | "interview: improve the app", unclear multi-step requests |
 
 **Rule of thumb:** If it takes more than 60 seconds, delegate it.
+
+## OmX — Autonomous Mode
+
+OmX mode is fully autonomous multi-agent orchestration. You decompose a task into steps, then a supervisor loop handles everything: spawning specialists, monitoring progress, retrying failures, running test gates, and pushing code.
+
+**Trigger patterns:**
+- "OmX: [task description]" — standard step-based workflow
+- "do this overnight: [task]" — standard step-based workflow
+- "autonomous: [task]" — standard step-based workflow
+- "ralplan: [task]" or "deliberate: [task]" — RALPLAN-DR deliberative planning (3-agent dialectic: planner→architect→critic)
+- "autoresearch: [task]" — evaluator-driven iterative research (generate→evaluate→iterate)
+- "interview: [task]" — deep-interview Socratic pre-planning (7-dimension ambiguity scoring → targeted questions)
+- Or your own judgment that a delegated task is complex enough (3+ steps, multiple specialist types)
+
+**How to launch OmX:**
+
+1. **Acknowledge:** "OmX engaged. I'll handle this autonomously and report when done."
+2. **Generate workflow markdown** with OmX-annotated steps:
+
+```markdown
+# OmX: [Task Description]
+
+## Step 1: Research [specialist:research]
+Research what's needed.
+OUTPUT: summary of findings
+
+## Step 2: Implement [specialist:dev, model:sonnet]
+Build the feature following PIV workflow.
+ACCEPTANCE: Tests passing, types clean.
+
+## Step 3: Review [specialist:review]
+Adversarial review of Step 2 changes.
+ACCEPTANCE: PASS or PASS WITH CONCERNS.
+
+## Step 4: Fix Findings [specialist:dev, model:sonnet, depends:3]
+Fix critical/major findings from review.
+ACCEPTANCE: All findings addressed, tests passing.
+
+## Step 5: Test Gate [specialist:gate, gate:full]
+Run full test suite.
+ACCEPTANCE: All green.
+
+## Step 6: Push [specialist:commit]
+Commit and push changes.
+```
+
+3. **Save the workflow** to a file
+4. **Create team:** `create_team(name: "omx-[task-slug]")`
+5. **Call the OmX creation function** (via code in src/omx-supervisor.ts):
+
+```typescript
+import { createOmxWorkflow } from './omx-supervisor.js';
+
+const workflow = createOmxWorkflow({
+  workflowContent: markdownContent,
+  taskDescription: 'Add HOPS Integration',
+  groupFolder: 'main',
+  chatJid: chatJid,
+  teamId: team.id,
+  projectPath: 'C:/claw/ball-ai',
+});
+```
+
+The supervisor loop (runs every 60s in the scheduler) takes over from here.
+
+**Step annotations:**
+- `[specialist:dev]` — Which specialist to spawn (dev, research, review, gate, commit)
+- `[model:sonnet]` or `[model:opus]` — Override default model
+- `[depends:N]` — Wait for step N to complete before starting
+- `[gate:full]` — Run full test suite (pytest + mypy + ruff)
+- `[gate:quick]` — Run pytest only
+
+**Constraints (locked in):**
+- Push approval: YES (require human OK before push)
+- Budget cap: 10 specialists max per OmX run
+- Concurrent: 2 simultaneous OmX workflows
+- Scope: Code-only (skip research/content for now)
+- Max duration: 60 minutes per workflow
+- Max retries: 2 per step
 
 ## What You Can Do
 

@@ -8,7 +8,7 @@
  * Flow: Decompose → Execute (spawn/monitor/retry) → Gate (test) → Push → Report
  */
 
-import { spawn } from 'child_process';
+import { execSync, spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
@@ -39,6 +39,24 @@ import { initMailbox, getUnreadMessages, markDelivered } from './omx-mailbox.js'
 import { scoreStepClarity, isStepTooVague, isStepNeedsEnhancement, enhanceVagueStep } from './omx-ambiguity.js';
 import { detectSlop, shouldDeslop, buildDeslopPrompt } from './omx-deslop.js';
 import { createWorkflowBranch, mergeWorkflowBranch, cleanupBranch } from './omx-branch.js';
+
+// ── OmX v2 Capability Imports (guarded — files may not exist) ──────────────
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type AnyFn = (...args: any[]) => any;
+let emitEvent: AnyFn | null = null;
+let getAgent: AnyFn | null = null;
+let resolveModel: ((modelClass: string) => string) | null = null;
+let _runRalplan: AnyFn | null = null;
+let _runAutoresearch: AnyFn | null = null;
+let needsInterview: AnyFn | null = null;
+let startAsyncInterview: AnyFn | null = null;
+
+try { const m = await import('./omx-events.js'); emitEvent = m.emitEvent; } catch { /* omx-events not available */ }
+try { const m = await import('./omx-agents.js'); getAgent = m.getAgent; resolveModel = m.resolveModel; } catch { /* omx-agents not available */ }
+try { const m = await import('./omx-ralplan.js'); _runRalplan = m.runRalplan; } catch { /* omx-ralplan not available */ }
+try { const m = await import('./omx-autoresearch.js'); _runAutoresearch = m.runAutoresearch; } catch { /* omx-autoresearch not available */ }
+try { const m = await import('./omx-interview.js'); needsInterview = m.needsInterview; startAsyncInterview = m.startAsyncInterview; } catch { /* omx-interview not available */ }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -81,6 +99,9 @@ export interface OmxStep {
 
 export type OmxPhaseStatus = 'pending' | 'in_progress' | 'done' | 'failed';
 
+/** OmX execution mode — determines which engine handles the workflow */
+export type OmxMode = 'workflow' | 'ralplan' | 'autoresearch' | 'interview';
+
 export interface OmxWorkflow {
   id: string;
   taskDescription: string;
@@ -88,6 +109,8 @@ export interface OmxWorkflow {
   chatJid: string;
   teamId: string;
   projectPath: string;
+  /** Execution mode — 'workflow' (default) runs step-by-step, others delegate to specialized engines */
+  mode?: OmxMode;
   status: 'active' | 'completed' | 'failed' | 'awaiting_approval';
   steps: OmxStep[];
   currentStepIndex: number;
@@ -111,6 +134,10 @@ export interface OmxWorkflow {
   lastSpecialistProgressAt?: string;
   lastUserInteractionAt?: string;
   staleAlertSentAt?: string;
+  /** Pattern 9: Ralph PRD Contract — canonical artifact paths */
+  prdPath?: string;
+  progressPath?: string;
+  changedFiles?: Record<number, string[]>;
 }
 
 // ── Persistence ───────────────────────────────────────────────────────────────
@@ -207,6 +234,171 @@ function touchSpecialistProgress(workflow: OmxWorkflow): void {
  */
 function touchUserInteraction(workflow: OmxWorkflow): void {
   workflow.lastUserInteractionAt = new Date().toISOString();
+}
+
+// ── Pattern 9: Ralph PRD Contract ─────────────────────────────────────────────
+
+/**
+ * Generate a PRD (Project Requirements Document) from workflow content.
+ * Extracts acceptance criteria, scope boundaries, and step plan.
+ */
+function generatePrd(
+  workflowId: string,
+  taskDescription: string,
+  workflowContent: string,
+  steps: OmxStep[],
+): string {
+  const dir = path.join(OMX_WORKFLOWS_DIR, workflowId);
+  fs.mkdirSync(dir, { recursive: true });
+
+  // Extract acceptance criteria from step content (lines starting with ACCEPTANCE:)
+  const acceptanceCriteria: string[] = [];
+  const nonGoals: string[] = [];
+  for (const step of steps) {
+    const accMatch = step.content.match(/ACCEPTANCE:\s*(.+)/i);
+    if (accMatch) acceptanceCriteria.push(`Step ${step.number}: ${accMatch[1].trim()}`);
+    const ngMatch = step.content.match(/NON-GOAL[S]?:\s*(.+)/i);
+    if (ngMatch) nonGoals.push(ngMatch[1].trim());
+  }
+
+  const prd = [
+    `# PRD: ${taskDescription}`,
+    ``,
+    `**Workflow ID:** ${workflowId}`,
+    `**Created:** ${new Date().toISOString()}`,
+    ``,
+    `## Task Description`,
+    ``,
+    taskDescription,
+    ``,
+    `## Acceptance Criteria`,
+    ``,
+    acceptanceCriteria.length > 0
+      ? acceptanceCriteria.map(c => `- ${c}`).join('\n')
+      : '- All steps complete successfully',
+    ``,
+    ...(nonGoals.length > 0
+      ? [`## Non-Goals`, ``, ...nonGoals.map(n => `- ${n}`), ``]
+      : []),
+    `## Step Plan`,
+    ``,
+    ...steps.map(s => `${s.number}. **${s.title}** [${s.annotations.specialist}]`),
+    ``,
+    `## Full Workflow`,
+    ``,
+    workflowContent.slice(0, 6000),
+    ``,
+  ].join('\n');
+
+  const prdPath = path.join(dir, 'prd.md');
+  fs.writeFileSync(prdPath, prd, 'utf-8');
+  logger.debug({ workflowId }, 'Pattern 9: PRD generated');
+  return prdPath;
+}
+
+/**
+ * Generate initial progress.md with headers for each step.
+ */
+function generateProgressFile(workflowId: string, steps: OmxStep[]): string {
+  const dir = path.join(OMX_WORKFLOWS_DIR, workflowId);
+  fs.mkdirSync(dir, { recursive: true });
+
+  const progress = [
+    `# Progress: ${workflowId}`,
+    ``,
+    ...steps.map(s => [
+      `## Step ${s.number}: ${s.title}`,
+      `- Status: pending`,
+      `- Completed: —`,
+      `- Output: —`,
+      ``,
+    ].join('\n')),
+  ].join('\n');
+
+  const progressPath = path.join(dir, 'progress.md');
+  fs.writeFileSync(progressPath, progress, 'utf-8');
+
+  // Also initialize changed-files.json
+  const changedFilesPath = path.join(dir, 'changed-files.json');
+  fs.writeFileSync(changedFilesPath, '{}', 'utf-8');
+
+  logger.debug({ workflowId }, 'Pattern 9: Progress file initialized');
+  return progressPath;
+}
+
+/**
+ * Update progress.md after a step completes.
+ */
+function updateProgress(
+  workflowId: string,
+  stepNumber: number,
+  stepTitle: string,
+  status: string,
+  output?: string,
+): void {
+  const progressPath = path.join(OMX_WORKFLOWS_DIR, workflowId, 'progress.md');
+  try {
+    let content = fs.readFileSync(progressPath, 'utf-8');
+    const stepHeader = `## Step ${stepNumber}: ${stepTitle}`;
+    const idx = content.indexOf(stepHeader);
+    if (idx === -1) return;
+
+    // Find the end of this step's section (next ## or EOF)
+    const nextStepIdx = content.indexOf('\n## Step ', idx + stepHeader.length);
+    const sectionEnd = nextStepIdx >= 0 ? nextStepIdx : content.length;
+
+    const updatedSection = [
+      stepHeader,
+      `- Status: ${status}`,
+      `- Completed: ${new Date().toISOString()}`,
+      `- Output: ${(output || 'No output').slice(0, 500)}`,
+      ``,
+    ].join('\n');
+
+    content = content.slice(0, idx) + updatedSection + content.slice(sectionEnd);
+    fs.writeFileSync(progressPath, content, 'utf-8');
+  } catch {
+    // Progress tracking is best-effort
+  }
+}
+
+/**
+ * Capture files changed by a step via `git diff --name-only`.
+ * Stores results in changed-files.json and on the workflow object.
+ */
+function captureChangedFiles(
+  projectPath: string,
+  workflowId: string,
+  stepNumber: number,
+): string[] {
+  try {
+    // Capture both staged and unstaged changed files
+    let files: string[] = [];
+    try {
+      const staged = execSync('git diff --staged --name-only', { cwd: projectPath, timeout: 10000, encoding: 'utf-8' });
+      files.push(...staged.trim().split('\n').filter(Boolean));
+    } catch { /* no staged changes */ }
+    try {
+      const unstaged = execSync('git diff --name-only', { cwd: projectPath, timeout: 10000, encoding: 'utf-8' });
+      files.push(...unstaged.trim().split('\n').filter(Boolean));
+    } catch { /* no unstaged changes */ }
+    // Deduplicate
+    files = [...new Set(files)];
+
+    // Persist to changed-files.json
+    const cfPath = path.join(OMX_WORKFLOWS_DIR, workflowId, 'changed-files.json');
+    let existing: Record<string, string[]> = {};
+    try {
+      existing = JSON.parse(fs.readFileSync(cfPath, 'utf-8'));
+    } catch { /* start fresh */ }
+    existing[stepNumber] = files;
+    fs.writeFileSync(cfPath, JSON.stringify(existing, null, 2), 'utf-8');
+
+    logger.debug({ workflowId, stepNumber, fileCount: files.length }, 'Pattern 9: Changed files captured');
+    return files;
+  } catch {
+    return [];
+  }
 }
 
 // ── Step Annotation Parser ────────────────────────────────────────────────────
@@ -344,9 +536,25 @@ export function createOmxWorkflow(params: {
   // Pattern 3: Initialize mailbox directory for specialist ↔ supervisor messaging
   initMailbox(id);
 
+  // Pattern 9: Generate PRD + progress artifacts
+  try {
+    const prdPath = generatePrd(id, params.taskDescription, params.workflowContent, steps);
+    const progressPath = generateProgressFile(id, steps);
+    workflow.prdPath = prdPath;
+    workflow.progressPath = progressPath;
+    workflow.changedFiles = {};
+    saveOmxWorkflow(workflow);
+  } catch (err) {
+    logger.warn({ omxId: id, error: String(err) }, 'Pattern 9: Failed to generate PRD artifacts — continuing without');
+  }
+
   logger.info({ omxId: id, steps: steps.length }, 'OmX workflow created');
 
-  wsBroadcast('omx.created', { id, taskDescription: params.taskDescription, steps: steps.length });
+  if (emitEvent) {
+    emitEvent(id, 'workflow.created' as never, { taskDescription: params.taskDescription, steps: steps.length });
+  } else {
+    wsBroadcast('omx.created', { id, taskDescription: params.taskDescription, steps: steps.length });
+  }
   postToMissionControl(
     'OmX Workflow Started',
     `**${params.taskDescription}**\nID: \`${id}\`\nSteps: ${steps.length}`,
@@ -378,6 +586,10 @@ function buildSpecialistPrompt(workflow: OmxWorkflow, step: OmxStep): string {
 
   prompt += `YOUR STEP:\n${step.content}\n\n`;
   prompt += `PROJECT PATH: ${workflow.projectPath}\n\n`;
+  // Pattern 9: Reference the PRD so specialists can read full requirements
+  if (workflow.prdPath) {
+    prompt += `PRD: Read the full requirements at ${workflow.prdPath}\n\n`;
+  }
   // Pattern 3: Mailbox for progress reporting
   const mailboxPath = `data/omx-workflows/${workflow.id}/mailbox/${step.number}.json`;
   prompt += `MAILBOX (progress reporting): ${mailboxPath}\n`;
@@ -420,15 +632,29 @@ function getSpecialistProfile(type: OmxSpecialistType): string | null {
 }
 
 function getModelForStep(step: OmxStep): string {
+  // OmX v2: Use agent catalog for model resolution when available
+  if (resolveModel && step.annotations.model) {
+    return resolveModel(step.annotations.model);
+  }
+
   if (step.annotations.model) {
     const modelMap: Record<string, string> = {
       sonnet: 'claude-sonnet-4-6',
       opus: 'claude-opus-4-6',
+      haiku: 'claude-haiku-4-5-20251001',
     };
     return modelMap[step.annotations.model] || step.annotations.model;
   }
 
-  // Defaults by specialist type
+  // OmX v2: Check agent catalog for default model class
+  if (getAgent) {
+    const agentDef = getAgent(step.annotations.specialist);
+    if (agentDef && resolveModel) {
+      return resolveModel(agentDef.modelClass);
+    }
+  }
+
+  // Fallback defaults by specialist type
   const defaults: Record<string, string> = {
     dev: 'claude-sonnet-4-6',
     research: 'claude-sonnet-4-6',
@@ -548,12 +774,11 @@ async function spawnCodexForStep(workflow: OmxWorkflow, step: OmxStep): Promise<
       { omxId: workflow.id, step: step.number, jobId, pid },
       'OmX Codex job started',
     );
-    wsBroadcast('omx.step.spawned', {
-      id: workflow.id,
-      step: step.number,
-      specialist: 'codex',
-      jobId,
-    });
+    if (emitEvent) {
+      emitEvent(workflow.id, 'codex.started' as never, { step: step.number, jobId }, step.number);
+    } else {
+      wsBroadcast('omx.step.spawned', { id: workflow.id, step: step.number, specialist: 'codex', jobId });
+    }
   } catch (err) {
     step.status = 'failed';
     step.error = err instanceof Error ? err.message : String(err);
@@ -578,6 +803,10 @@ function buildCodexPrompt(workflow: OmxWorkflow, step: OmxStep): string {
     prompt += `CONTEXT FROM PREVIOUS STEPS:\n${previousContext}\n\n`;
   }
   prompt += `WORKING DIRECTORY: ${workflow.projectPath}\n`;
+  // Pattern 9: Reference the PRD for Codex workers
+  if (workflow.prdPath) {
+    prompt += `PRD: Read the full requirements at ${workflow.prdPath}\n`;
+  }
   // Pattern 7: Branch isolation for Codex workers
   if (workflow.branch) {
     prompt += `GIT BRANCH: ${workflow.branch} — ensure you're on this branch before making changes.\n`;
@@ -731,6 +960,109 @@ export async function supervisorTick(
   const now = Date.now();
   const elapsed = now - new Date(workflow.createdAt).getTime();
 
+  // ── OmX v2: Mode Router ─────────────────────────────────────────────
+  // Non-workflow modes delegate to their own engines and return early.
+  if (workflow.mode && workflow.mode !== 'workflow') {
+    switch (workflow.mode) {
+      case 'ralplan': {
+        if (!_runRalplan) {
+          workflow.status = 'failed';
+          saveOmxWorkflow(workflow);
+          await sendMessage(workflow.chatJid, '*OmX Failed:* RALPLAN engine not available (omx-ralplan.ts missing).');
+          return;
+        }
+        try {
+          const result = await _runRalplan({
+            taskDescription: workflow.taskDescription,
+            projectPath: workflow.projectPath,
+            groupFolder: workflow.groupFolder,
+            chatJid: workflow.chatJid,
+            teamId: workflow.teamId,
+          });
+          if (result) {
+            workflow.status = 'completed';
+            workflow.completedAt = new Date().toISOString();
+            saveOmxWorkflow(workflow);
+            await sendMessage(workflow.chatJid, `*RALPLAN complete:* ${workflow.taskDescription}\nADR: ${result.adrPath}`);
+            if (emitEvent) emitEvent(workflow.id, 'workflow.completed' as never, { mode: 'ralplan' });
+          }
+        } catch (err) {
+          workflow.status = 'failed';
+          saveOmxWorkflow(workflow);
+          await sendMessage(workflow.chatJid, `*RALPLAN failed:* ${err instanceof Error ? err.message : String(err)}`);
+          if (emitEvent) emitEvent(workflow.id, 'workflow.failed' as never, { mode: 'ralplan', error: String(err) });
+        }
+        return;
+      }
+
+      case 'autoresearch': {
+        if (!_runAutoresearch) {
+          workflow.status = 'failed';
+          saveOmxWorkflow(workflow);
+          await sendMessage(workflow.chatJid, '*OmX Failed:* Autoresearch engine not available (omx-autoresearch.ts missing).');
+          return;
+        }
+        try {
+          const result = await _runAutoresearch(
+            {
+              task: workflow.taskDescription,
+              evaluatorScript: ((workflow as unknown as Record<string, unknown>).evaluatorScript as string) || 'echo 0',
+              projectPath: workflow.projectPath,
+              workflowId: workflow.id,
+              groupFolder: workflow.groupFolder,
+              chatJid: workflow.chatJid,
+            },
+            sendMessage,
+          );
+          if (result) {
+            workflow.status = 'completed';
+            workflow.completedAt = new Date().toISOString();
+            saveOmxWorkflow(workflow);
+            if (emitEvent) emitEvent(workflow.id, 'workflow.completed' as never, { mode: 'autoresearch' });
+          }
+        } catch (err) {
+          workflow.status = 'failed';
+          saveOmxWorkflow(workflow);
+          await sendMessage(workflow.chatJid, `*Autoresearch failed:* ${err instanceof Error ? err.message : String(err)}`);
+          if (emitEvent) emitEvent(workflow.id, 'workflow.failed' as never, { mode: 'autoresearch', error: String(err) });
+        }
+        return;
+      }
+
+      case 'interview': {
+        if (!needsInterview || !startAsyncInterview) {
+          workflow.status = 'failed';
+          saveOmxWorkflow(workflow);
+          await sendMessage(workflow.chatJid, '*OmX Failed:* Interview engine not available (omx-interview.ts missing).');
+          return;
+        }
+        // Interview mode: start async interview, then transition to workflow/ralplan
+        try {
+          const interviewId = startAsyncInterview(workflow.taskDescription, {
+            groupFolder: workflow.groupFolder,
+            chatJid: workflow.chatJid,
+          });
+          await sendMessage(
+            workflow.chatJid,
+            `*Deep Interview started:* Gathering requirements for "${workflow.taskDescription}"\nInterview ID: ${interviewId}`,
+          );
+          // Mark workflow as awaiting interview completion — will be picked up by a future tick
+          workflow.status = 'completed';
+          workflow.completedAt = new Date().toISOString();
+          saveOmxWorkflow(workflow);
+          if (emitEvent) emitEvent(workflow.id, 'workflow.completed' as never, { mode: 'interview', interviewId });
+        } catch (err) {
+          workflow.status = 'failed';
+          saveOmxWorkflow(workflow);
+          await sendMessage(workflow.chatJid, `*Interview failed:* ${err instanceof Error ? err.message : String(err)}`);
+        }
+        return;
+      }
+    }
+  }
+
+  // ── Default: step-based workflow engine ──────────────────────────────
+
   // Reclaim any steps with expired leases (Pattern 1: Claim-Safe)
   const reclaimed = reclaimExpiredSteps(workflow);
   if (reclaimed > 0) {
@@ -760,7 +1092,11 @@ export async function supervisorTick(
     saveOmxWorkflow(workflow);
     await sendMessage(workflow.chatJid, `*OmX Failed: ${workflow.taskDescription}*\n\nExceeded maximum duration (${Math.round(OMX_MAX_TOTAL_DURATION / 60000)} minutes).`);
     cleanupTeam(workflow.teamId);
-    wsBroadcast('omx.failed', { id: workflow.id, reason: 'timeout' });
+    if (emitEvent) {
+      emitEvent(workflow.id, 'workflow.failed' as never, { reason: 'timeout' });
+    } else {
+      wsBroadcast('omx.failed', { id: workflow.id, reason: 'timeout' });
+    }
     return;
   }
 
@@ -1122,6 +1458,14 @@ async function handleInProgressStep(
         }
       }
 
+      // Pattern 9: Update progress tracker + capture changed files
+      updateProgress(workflow.id, step.number, step.title, 'completed', step.output);
+      const stepChangedFiles = captureChangedFiles(workflow.projectPath, workflow.id, step.number);
+      if (stepChangedFiles.length > 0) {
+        if (!workflow.changedFiles) workflow.changedFiles = {};
+        workflow.changedFiles[step.number] = stepChangedFiles;
+      }
+
       // Pattern 5: Deslop — detect sloppy output from dev/commit specialists
       if (
         shouldDeslop(step) &&
@@ -1210,11 +1554,11 @@ async function handleFailedStep(
       'OmX step retrying',
     );
 
-    wsBroadcast('omx.step.retry', {
-      id: workflow.id,
-      step: step.number,
-      retry: step.retryCount,
-    });
+    if (emitEvent) {
+      emitEvent(workflow.id, 'step.retried' as never, { retry: step.retryCount }, step.number);
+    } else {
+      wsBroadcast('omx.step.retry', { id: workflow.id, step: step.number, retry: step.retryCount });
+    }
   } else {
     // Max retries — escalate to user
 
@@ -1235,11 +1579,11 @@ async function handleFailedStep(
 
     cleanupTeam(workflow.teamId);
 
-    wsBroadcast('omx.failed', {
-      id: workflow.id,
-      step: step.number,
-      reason: 'max_retries',
-    });
+    if (emitEvent) {
+      emitEvent(workflow.id, 'workflow.failed' as never, { step: step.number, reason: 'max_retries' }, step.number);
+    } else {
+      wsBroadcast('omx.failed', { id: workflow.id, step: step.number, reason: 'max_retries' });
+    }
 
     postToMissionControl(
       'OmX Workflow Failed',
@@ -1291,12 +1635,11 @@ async function spawnForStep(workflow: OmxWorkflow, step: OmxStep): Promise<void>
       'OmX specialist spawned',
     );
 
-    wsBroadcast('omx.step.spawned', {
-      id: workflow.id,
-      step: step.number,
-      specialist: step.annotations.specialist,
-      memberId: member.id,
-    });
+    if (emitEvent) {
+      emitEvent(workflow.id, 'specialist.spawned' as never, { specialist: step.annotations.specialist, memberId: member.id }, step.number);
+    } else {
+      wsBroadcast('omx.step.spawned', { id: workflow.id, step: step.number, specialist: step.annotations.specialist, memberId: member.id });
+    }
   } catch (err) {
     step.status = 'failed';
     step.error = err instanceof Error ? err.message : String(err);
@@ -1422,12 +1765,11 @@ async function completeWorkflow(
 
   cleanupTeam(workflow.teamId);
 
-  wsBroadcast('omx.completed', {
-    id: workflow.id,
-    duration: elapsedMin,
-    specialistsUsed: workflow.specialistsSpawned,
-    completedSteps,
-  });
+  if (emitEvent) {
+    emitEvent(workflow.id, 'workflow.completed' as never, { duration: elapsedMin, specialistsUsed: workflow.specialistsSpawned, completedSteps });
+  } else {
+    wsBroadcast('omx.completed', { id: workflow.id, duration: elapsedMin, specialistsUsed: workflow.specialistsSpawned, completedSteps });
+  }
 
   postToMissionControl(
     'OmX Workflow Complete',

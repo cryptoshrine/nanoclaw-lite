@@ -28,6 +28,12 @@ import {
 } from './discord-channels.js';
 import { checkAndScheduleWorkflowContinuation } from './workflow-engine.js';
 import { broadcast as wsBroadcast } from './ws-server.js';
+import { runOmxSupervisor } from './omx-supervisor.js';
+
+// OmX v2: Event system (guarded import)
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let emitOmxEvent: ((...args: any[]) => any) | null = null;
+try { const m = await import('./omx-events.js'); emitOmxEvent = m.emitEvent; } catch { /* omx-events not available */ }
 
 export interface SchedulerDependencies {
   sendMessage: (jid: string, text: string) => Promise<void>;
@@ -302,6 +308,20 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
       }
     } catch (err) {
       logger.error({ err }, 'Error in scheduler loop');
+    }
+
+    // Run OmX supervisor tick (checks active autonomous workflows)
+    try {
+      await runOmxSupervisor(deps.sendMessage);
+      // OmX v2: Emit supervisor.tick event for observability
+      if (emitOmxEvent) {
+        try { emitOmxEvent('_system', 'supervisor.tick' as never, { timestamp: new Date().toISOString() }); } catch { /* non-critical */ }
+      }
+    } catch (err) {
+      logger.error({ err }, 'Error in OmX supervisor tick');
+      if (emitOmxEvent) {
+        try { emitOmxEvent('_system', 'supervisor.error' as never, { error: String(err) }); } catch { /* non-critical */ }
+      }
     }
 
     setTimeout(loop, SCHEDULER_POLL_INTERVAL);

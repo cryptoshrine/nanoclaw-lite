@@ -85,6 +85,9 @@ export const OMX_MAX_CONCURRENT_WORKFLOWS = 2;     // Max simultaneous OmX workf
 export const OMX_REQUIRE_APPROVAL_FOR_PUSH = true; // Require human OK before push
 export const OMX_WORKFLOWS_DIR = path.resolve(DATA_DIR, 'omx-workflows');
 
+// OmX Tmux Workers (Pattern 7a)
+export const OMX_TMUX_ENABLED = process.env.OMX_TMUX_ENABLED === 'true'; // Default: false (opt-in)
+
 // OmX Codex Dispatch
 export const OMX_CODEX_ENABLED = process.env.OMX_CODEX_ENABLED !== 'false';
 export const OMX_CODEX_AGENT_TYPE = process.env.OMX_CODEX_AGENT_TYPE || 'codex';

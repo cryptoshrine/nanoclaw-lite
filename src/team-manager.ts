@@ -13,6 +13,7 @@ import {
   TEAMMATE_TIMEOUT,
   DEFAULT_TEAMMATE_MODEL,
   MAX_CONCURRENT_SPECIALISTS,
+  OMX_TMUX_ENABLED,
 } from './config.js';
 import {
   createTeam,
@@ -29,6 +30,21 @@ import { Team, TeamMember } from './types.js';
 import { checkAndScheduleWorkflowContinuation } from './workflow-engine.js';
 import { broadcast as wsBroadcast } from './ws-server.js';
 import { postToMissionControl } from './discord-channels.js';
+
+// OmX v2: Tmux worker backend (guarded import — opt-in via OMX_TMUX_ENABLED)
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let spawnTmuxWorker: ((...args: any[]) => Promise<any>) | null = null;
+let isTmuxAvailable: (() => boolean) | null = null;
+if (OMX_TMUX_ENABLED) {
+  try {
+    const m = await import('./omx-tmux.js');
+    spawnTmuxWorker = m.spawnTmuxWorker;
+    isTmuxAvailable = m.isTmuxAvailable;
+    logger.info('OmX tmux worker backend loaded');
+  } catch {
+    logger.warn('OMX_TMUX_ENABLED=true but omx-tmux.ts not available — falling back to container runner');
+  }
+}
 
 // Track active teammate containers
 interface ActiveTeammate {
