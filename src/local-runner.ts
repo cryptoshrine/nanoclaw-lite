@@ -20,6 +20,7 @@ import {
 } from './config.js';
 import { ContainerInput, ContainerOutput, TeammateContainerInput } from './container-runner.js';
 import { logger } from './logger.js';
+import { startHeartbeat, stopHeartbeat } from './omx-heartbeat.js';
 import { broadcast as wsBroadcast } from './ws-server.js';
 import { RegisteredGroup } from './types.js';
 
@@ -522,6 +523,13 @@ export async function runLocalTeammate(
       env: childEnv,
     });
 
+    // Start heartbeat monitoring for this teammate
+    try {
+      startHeartbeat(input.memberId, 'teammate');
+    } catch (err) {
+      logger.warn({ memberId: input.memberId, err }, 'Failed to start heartbeat');
+    }
+
     let stdout = '';
     let stderr = '';
     let stdoutTruncated = false;
@@ -575,6 +583,13 @@ export async function runLocalTeammate(
     child.on('close', (code) => {
       clearTimeout(timeout);
       const duration = Date.now() - startTime;
+
+      // Stop heartbeat monitoring (covers normal exit, error, timeout, and signal kill)
+      try {
+        stopHeartbeat(input.memberId);
+      } catch {
+        // Best-effort — don't block process cleanup
+      }
 
       // Write log file
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
@@ -632,6 +647,8 @@ export async function runLocalTeammate(
 
     child.on('error', (err) => {
       clearTimeout(timeout);
+      // Stop heartbeat on spawn failure
+      try { stopHeartbeat(input.memberId); } catch { /* best-effort */ }
       logger.error({ memberId: input.memberId, error: err }, 'Local teammate spawn error');
       resolve({
         status: 'error',

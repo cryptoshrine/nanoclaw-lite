@@ -51,12 +51,18 @@ let _runRalplan: AnyFn | null = null;
 let _runAutoresearch: AnyFn | null = null;
 let needsInterview: AnyFn | null = null;
 let startAsyncInterview: AnyFn | null = null;
+let _startHeartbeat: AnyFn | null = null;
+let _readHeartbeat: AnyFn | null = null;
+let _isWorkerDead: AnyFn | null = null;
+let _isWorkerStuckInLoop: AnyFn | null = null;
+let _cleanupHeartbeat: AnyFn | null = null;
 
 try { const m = await import('./omx-events.js'); emitEvent = m.emitEvent; } catch { /* omx-events not available */ }
 try { const m = await import('./omx-agents.js'); getAgent = m.getAgent; resolveModel = m.resolveModel; } catch { /* omx-agents not available */ }
 try { const m = await import('./omx-ralplan.js'); _runRalplan = m.runRalplan; } catch { /* omx-ralplan not available */ }
 try { const m = await import('./omx-autoresearch.js'); _runAutoresearch = m.runAutoresearch; } catch { /* omx-autoresearch not available */ }
 try { const m = await import('./omx-interview.js'); needsInterview = m.needsInterview; startAsyncInterview = m.startAsyncInterview; } catch { /* omx-interview not available */ }
+try { const m = await import('./omx-heartbeat.js'); _startHeartbeat = m.startHeartbeat; _readHeartbeat = m.readHeartbeat; _isWorkerDead = m.isWorkerDead; _isWorkerStuckInLoop = m.isWorkerStuckInLoop; _cleanupHeartbeat = m.cleanupHeartbeat; } catch { /* omx-heartbeat not available */ }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -596,6 +602,10 @@ function buildSpecialistPrompt(workflow: OmxWorkflow, step: OmxStep): string {
   prompt += `Write progress updates by appending JSON messages to this file. Format: array of { "id": "<uuid>", "from": "specialist", "to": "supervisor", "body": "<your update>", "created_at": "<iso timestamp>" }.\n`;
   prompt += `The supervisor checks this file every 60s and forwards updates to the user.\n\n`;
 
+  // Pattern 4: Heartbeat instructions for specialist health monitoring
+  prompt += `HEARTBEAT: The supervisor monitors your health via heartbeat files at data/ipc/teammates/{memberId}/heartbeat.json.\n`;
+  prompt += `The heartbeat is started automatically when you're spawned. Write to your mailbox file every 2-3 minutes to show progress — the supervisor will mark you as stalled if no activity is detected for 5 minutes.\n\n`;
+
   // Pattern 7: Branch isolation — tell specialist which branch to work on
   if (workflow.branch) {
     prompt += `GIT BRANCH: You are working on branch ${workflow.branch}. Make sure you're on this branch before making changes (run: git checkout ${workflow.branch}).\n\n`;
@@ -768,6 +778,7 @@ async function spawnCodexForStep(workflow: OmxWorkflow, step: OmxStep): Promise<
     step.executionMode = 'codex';
     step.startedAt = new Date().toISOString();
     workflow.specialistsSpawned++;
+    // Note: Codex workers don't use file-based heartbeat — they're monitored via tmux + nudge
     saveOmxWorkflow(workflow);
 
     logger.info(
@@ -1321,6 +1332,35 @@ async function handleInProgressStep(
     // Mailbox read failure is non-fatal — continue with step monitoring
   }
 
+  // Pattern 4 (enhanced): Check heartbeat for dead/stuck specialists
+  if (step.executionMode === 'specialist' && step.memberId && _isWorkerDead && _isWorkerStuckInLoop && _cleanupHeartbeat) {
+    const stepIndex = workflow.steps.indexOf(step);
+    if (_isWorkerDead(step.memberId)) {
+      if (step.claimToken) {
+        transitionStep(workflow, stepIndex, step.claimToken, 'failed');
+      } else {
+        step.status = 'failed';
+      }
+      step.error = 'Specialist process died (heartbeat stopped)';
+      _cleanupHeartbeat(step.memberId);
+      saveOmxWorkflow(workflow);
+      if (emitEvent) emitEvent(workflow.id, 'specialist.heartbeat_stale' as never, { memberId: step.memberId }, step.number);
+      return;
+    }
+    if (_isWorkerStuckInLoop(step.memberId)) {
+      if (step.claimToken) {
+        transitionStep(workflow, stepIndex, step.claimToken, 'failed');
+      } else {
+        step.status = 'failed';
+      }
+      step.error = 'Specialist stuck in loop (turnCount not advancing)';
+      _cleanupHeartbeat(step.memberId);
+      saveOmxWorkflow(workflow);
+      if (emitEvent) emitEvent(workflow.id, 'specialist.stuck_loop' as never, { memberId: step.memberId }, step.number);
+      return;
+    }
+  }
+
   // Codex job path — check job status from disk
   if (step.codexJobId) {
     // Pattern 4: Nudge idle Codex workers once after threshold
@@ -1400,7 +1440,9 @@ async function handleInProgressStep(
             step.status = 'failed';
           }
           step.error = `Specialist stalled (no progress for ${Math.round(stepElapsed / 60000)}min)`;
+          if (step.memberId && _cleanupHeartbeat) _cleanupHeartbeat(step.memberId);
           saveOmxWorkflow(workflow);
+          if (emitEvent) emitEvent(workflow.id, 'specialist.stalled' as never, { elapsed: Math.round(stepElapsed / 1000) }, step.number);
           logger.warn(
             { omxId: workflow.id, step: step.number, elapsed: Math.round(stepElapsed / 1000) },
             'Pattern 4: Specialist stall detected — failing early',
@@ -1420,8 +1462,10 @@ async function handleInProgressStep(
           step.status = 'failed';
         }
         step.error = `Step timed out after ${Math.round(stepElapsed / 60000)} minutes`;
+        if (step.memberId && _cleanupHeartbeat) _cleanupHeartbeat(step.memberId);
         saveOmxWorkflow(workflow);
         logger.warn({ omxId: workflow.id, step: step.number }, 'OmX step timed out');
+        if (emitEvent) emitEvent(workflow.id, 'step.timeout' as never, { elapsed: Math.round(stepElapsed / 1000) }, step.number);
       }
       break;
     }
@@ -1430,6 +1474,8 @@ async function handleInProgressStep(
       // Pattern 8: Record activity — specialist completed + supervisor acted
       touchSpecialistProgress(workflow);
       touchSupervisorAction(workflow);
+      // Pattern 4: Clean up heartbeat on completion
+      if (step.memberId && _cleanupHeartbeat) _cleanupHeartbeat(step.memberId);
       // Specialist finished successfully — transition via claim token
       if (step.claimToken) {
         transitionStep(workflow, stepIndex, step.claimToken, 'completed');
@@ -1511,6 +1557,8 @@ async function handleInProgressStep(
       // Pattern 8: Record activity — specialist reported failure + supervisor acted
       touchSpecialistProgress(workflow);
       touchSupervisorAction(workflow);
+      // Pattern 4: Clean up heartbeat on failure
+      if (step.memberId && _cleanupHeartbeat) _cleanupHeartbeat(step.memberId);
       if (step.claimToken) {
         transitionStep(workflow, stepIndex, step.claimToken, 'failed');
       } else {
@@ -1547,6 +1595,7 @@ async function handleFailedStep(
     step.claim = undefined;
     step.claimToken = undefined;
     step.nudgedAt = undefined; // Pattern 4: Reset nudge state on retry
+    if (step.memberId && _cleanupHeartbeat) _cleanupHeartbeat(step.memberId); // Pattern 4: Clean up old heartbeat on retry
     saveOmxWorkflow(workflow);
 
     logger.info(
@@ -1566,6 +1615,13 @@ async function handleFailedStep(
     for (const s of workflow.steps) {
       if (s.codexJobId && s.status === 'in_progress') {
         await cleanupCodexJob(s.codexJobId).catch(() => {});
+      }
+    }
+
+    // Pattern 4: Clean up heartbeat files for all steps
+    if (_cleanupHeartbeat) {
+      for (const s of workflow.steps) {
+        if (s.memberId) _cleanupHeartbeat(s.memberId);
       }
     }
 
@@ -1628,6 +1684,16 @@ async function spawnForStep(workflow: OmxWorkflow, step: OmxStep): Promise<void>
     step.executionMode = 'specialist';
     step.startedAt = new Date().toISOString();
     workflow.specialistsSpawned++;
+
+    // Pattern 4: Start heartbeat for specialist health monitoring
+    if (_startHeartbeat) {
+      try {
+        _startHeartbeat(member.id, workflow.id, step.number);
+      } catch (err) {
+        logger.warn({ omxId: workflow.id, step: step.number, err }, 'Pattern 4: Failed to start heartbeat — non-fatal');
+      }
+    }
+
     saveOmxWorkflow(workflow);
 
     logger.info(
@@ -1636,6 +1702,7 @@ async function spawnForStep(workflow: OmxWorkflow, step: OmxStep): Promise<void>
     );
 
     if (emitEvent) {
+      emitEvent(workflow.id, 'step.spawned' as never, { specialist: step.annotations.specialist, memberId: member.id }, step.number);
       emitEvent(workflow.id, 'specialist.spawned' as never, { specialist: step.annotations.specialist, memberId: member.id }, step.number);
     } else {
       wsBroadcast('omx.step.spawned', { id: workflow.id, step: step.number, specialist: step.annotations.specialist, memberId: member.id });
@@ -1713,6 +1780,13 @@ async function completeWorkflow(
   for (const step of workflow.steps) {
     if (step.codexJobId && step.status === 'in_progress') {
       await cleanupCodexJob(step.codexJobId).catch(() => {});
+    }
+  }
+
+  // Pattern 4: Clean up heartbeat files for all steps
+  if (_cleanupHeartbeat) {
+    for (const step of workflow.steps) {
+      if (step.memberId) _cleanupHeartbeat(step.memberId);
     }
   }
 

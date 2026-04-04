@@ -16,6 +16,9 @@ import {
   MessageSquare,
   Layers,
   Megaphone,
+  Target,
+  CalendarDays,
+  Activity,
   ChevronLeft,
   ChevronRight,
 } from "lucide-react";
@@ -35,6 +38,9 @@ const navItems = [
   { href: "/betting", label: "Bet Finder", icon: TrendingUp },
   { href: "/model", label: "Betting Model", icon: Brain },
   { href: "/distribution", label: "Distribution", icon: Megaphone },
+  { href: "/outreach", label: "Outreach", icon: Target },
+  { href: "/daily", label: "Daily Memory", icon: CalendarDays },
+  { href: "/omx", label: "OmX Monitor", icon: Activity },
   { href: "/docs", label: "Docs", icon: BookOpen },
   { href: "/inbox", label: "Agent Inbox", icon: Inbox },
 ];

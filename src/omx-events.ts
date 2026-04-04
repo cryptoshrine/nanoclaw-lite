@@ -50,6 +50,8 @@ const OMX_EVENT_TYPES = [
   'specialist.failed',
   'specialist.stalled',
   'specialist.timeout',
+  'specialist.heartbeat_stale',
+  'specialist.stuck_loop',
   // Codex events
   'codex.started',
   'codex.completed',
@@ -69,7 +71,7 @@ const OMX_EVENT_TYPES = [
   'supervisor.error',
 ] as const;
 
-/** Union of all 36 OmX event types */
+/** Union of all 38 OmX event types */
 export type OmxEventType = (typeof OMX_EVENT_TYPES)[number];
 
 /** A single OmX event */

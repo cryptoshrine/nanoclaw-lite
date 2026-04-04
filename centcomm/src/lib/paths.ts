@@ -33,6 +33,10 @@ export const PATHS = {
     "areas",
     "x-engagement-log.md"
   ),
+  /** Daily logs directory */
+  dailyLogs: path.join(PROJECT_ROOT, "groups", "main", "daily"),
   /** Creator CSV */
   creatorCsv: "C:\\claw\\Ball_AI_Lead_List_Clean.csv",
+  /** OmX workflows directory */
+  omxWorkflows: path.join(PROJECT_ROOT, "data", "omx-workflows"),
 } as const;

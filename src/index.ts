@@ -2155,6 +2155,13 @@ async function main(): Promise<void> {
   if (generalOpsId) {
     setGeneralOpsChannel(generalOpsId);
 
+    // Register #klaw as interactive (two-way, routed to main)
+    const klawDirectLineId = process.env.DISCORD_CHANNEL_KLAW;
+    if (klawDirectLineId) {
+      addInteractiveChannels([klawDirectLineId]);
+      logger.info({ klawDirectLineId }, 'Klaw direct line channel registered as interactive');
+    }
+
     // Register Ideas channels as interactive (two-way)
     const ideasChannels = [
       process.env.DISCORD_CHANNEL_PIKA_TAMAGOTCHI,
