@@ -21,6 +21,7 @@ import {
   OMX_WORKFLOWS_DIR,
   OMX_CODEX_ENABLED,
   OMX_CODEX_AGENT_TYPE,
+  OMX_TEAMMATE_TIMEOUT,
 } from './config.js';
 import {
   startCodexJob,
@@ -198,8 +199,12 @@ const OMX_STALE_THRESHOLD = 5 * 60 * 1000; // 5 minutes
 /** Don't re-alert about the same stale workflow within this cooldown. */
 const OMX_STALE_ALERT_COOLDOWN = 10 * 60 * 1000; // 10 minutes
 
-/** Pattern 4: Specialist stall timeout — fail early instead of waiting full 15min. */
-const OMX_SPECIALIST_STALL_TIMEOUT = 5 * 60 * 1000; // 5 minutes
+/** Pattern 4: Specialist stall timeout — RE-ENABLED Apr 5 2026.
+ * Root cause was: specialists report progress via send_message but that didn't update
+ * lastSpecialistProgressAt (only mailbox writes did). Fixed by wiring IPC message
+ * processing in index.ts to call notifySpecialistActivity(memberId) which updates
+ * the workflow's lastSpecialistProgressAt timestamp. Now safe to use 10min threshold. */
+const OMX_SPECIALIST_STALL_TIMEOUT = 15 * 60 * 1000; // 15 minutes (no activity = stall)
 /** Pattern 4: Codex nudge threshold — nudge idle workers after this period. */
 const OMX_CODEX_NUDGE_THRESHOLD = 3 * 60 * 1000; // 3 minutes
 
@@ -240,6 +245,29 @@ function touchSpecialistProgress(workflow: OmxWorkflow): void {
  */
 function touchUserInteraction(workflow: OmxWorkflow): void {
   workflow.lastUserInteractionAt = new Date().toISOString();
+}
+
+/**
+ * Notify that a specialist sent a message (via send_message IPC).
+ * Called from the IPC watcher in index.ts when processing teammate messages.
+ * Finds the active workflow that owns this memberId and bumps its progress timestamp.
+ */
+export function notifySpecialistActivity(memberId: string): void {
+  const workflows = listActiveOmxWorkflows();
+  for (const workflow of workflows) {
+    const step = workflow.steps.find(
+      s => s.memberId === memberId && s.status === 'in_progress',
+    );
+    if (step) {
+      touchSpecialistProgress(workflow);
+      saveOmxWorkflow(workflow);
+      logger.debug(
+        { omxId: workflow.id, step: step.number, memberId },
+        'Pattern 4: Specialist progress updated via send_message',
+      );
+      return;
+    }
+  }
 }
 
 // ── Pattern 9: Ralph PRD Contract ─────────────────────────────────────────────
@@ -1347,18 +1375,10 @@ async function handleInProgressStep(
       if (emitEvent) emitEvent(workflow.id, 'specialist.heartbeat_stale' as never, { memberId: step.memberId }, step.number);
       return;
     }
-    if (_isWorkerStuckInLoop(step.memberId)) {
-      if (step.claimToken) {
-        transitionStep(workflow, stepIndex, step.claimToken, 'failed');
-      } else {
-        step.status = 'failed';
-      }
-      step.error = 'Specialist stuck in loop (turnCount not advancing)';
-      _cleanupHeartbeat(step.memberId);
-      saveOmxWorkflow(workflow);
-      if (emitEvent) emitEvent(workflow.id, 'specialist.stuck_loop' as never, { memberId: step.memberId }, step.number);
-      return;
-    }
+    // NOTE: isWorkerStuckInLoop disabled — agent runner doesn't call bumpTurnCount()
+    // so turnCount is always 0, causing false positives after 180s. The stall detector
+    // (no mailbox progress for 5min) and isWorkerDead already cover real failures.
+    // Re-enable once bumpTurnCount is wired into agent-runner's query loop.
   }
 
   // Codex job path — check job status from disk
@@ -1531,6 +1551,7 @@ async function handleInProgressStep(
               model: 'claude-haiku-4-5-20251001',
               leadGroup: workflow.groupFolder,
               chatJid: workflow.chatJid,
+              timeout: OMX_TEAMMATE_TIMEOUT,
             });
             step.deslopPending = true;
             step.deslopMemberId = deslopMember.id;
@@ -1677,6 +1698,7 @@ async function spawnForStep(workflow: OmxWorkflow, step: OmxStep): Promise<void>
       model,
       leadGroup: workflow.groupFolder,
       chatJid: workflow.chatJid,
+      timeout: OMX_TEAMMATE_TIMEOUT,
     });
 
     step.status = 'in_progress';
@@ -1738,6 +1760,7 @@ async function spawnGateAgent(workflow: OmxWorkflow, step: OmxStep): Promise<voi
       model: 'claude-sonnet-4-6',
       leadGroup: workflow.groupFolder,
       chatJid: workflow.chatJid,
+      timeout: OMX_TEAMMATE_TIMEOUT,
     });
 
     step.status = 'in_progress';

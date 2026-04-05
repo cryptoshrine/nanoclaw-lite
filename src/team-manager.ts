@@ -123,8 +123,9 @@ export async function spawnTeammate(params: {
   leadGroup: string;
   chatJid?: string;
   sourceChannel?: 'telegram' | 'discord';
+  timeout?: number;
 }): Promise<TeamMember> {
-  const { teamId, name, prompt, model, leadGroup, chatJid, sourceChannel } = params;
+  const { teamId, name, prompt, model, leadGroup, chatJid, sourceChannel, timeout } = params;
   const now = new Date().toISOString();
 
   // Enforce concurrency cap — prevent runaway specialist spawning
@@ -163,7 +164,7 @@ export async function spawnTeammate(params: {
   logger.info({ memberId, teamId, name }, 'Spawning teammate');
 
   // Start the container asynchronously
-  const containerPromise = runTeammateInContainer(member, leadGroup, chatJid, sourceChannel);
+  const containerPromise = runTeammateInContainer(member, leadGroup, chatJid, sourceChannel, timeout);
 
   activeTeammates.set(memberId, {
     memberId,
@@ -202,6 +203,7 @@ async function runTeammateInContainer(
   leadGroup: string,
   chatJid?: string,
   sourceChannel?: 'telegram' | 'discord',
+  timeout?: number,
 ): Promise<void> {
   try {
     const output = await runTeammateDispatch({
@@ -213,6 +215,7 @@ async function runTeammateInContainer(
       leadGroup,
       chatJid,
       sourceChannel,
+      timeout,
     });
 
     if (output.status === 'error') {

@@ -17,6 +17,7 @@ import {
   PROJECT_ROOT,
   TEAM_DIR,
   TEAMMATE_TIMEOUT,
+  TEAMMATE_GRACE_PERIOD,
 } from './config.js';
 import { ContainerInput, ContainerOutput, TeammateContainerInput } from './container-runner.js';
 import { logger } from './logger.js';
@@ -571,17 +572,32 @@ export async function runLocalTeammate(
     });
 
     let timedOut = false;
+    let graceTimeout: ReturnType<typeof setTimeout> | undefined;
+    const effectiveTimeout = input.timeout || TEAMMATE_TIMEOUT;
     const timeout = setTimeout(() => {
-      logger.error({ memberId: input.memberId }, 'Local teammate timeout, killing');
+      logger.error({ memberId: input.memberId, effectiveTimeout }, 'Local teammate timeout — attempting graceful shutdown');
       timedOut = true;
-      child.kill('SIGKILL');
-      // Don't resolve here — let child.on('close') handle it so the
-      // finally block in runTeammateInContainer runs in the right order
-      // and DB status gets updated properly.
-    }, TEAMMATE_TIMEOUT);
+
+      // Phase 1: Write _close sentinel for graceful exit
+      const teammateIpcInputDir = path.join(DATA_DIR, 'ipc', 'teammates', input.memberId, 'input');
+      try {
+        fs.mkdirSync(teammateIpcInputDir, { recursive: true });
+        fs.writeFileSync(path.join(teammateIpcInputDir, '_close'), '');
+        logger.info({ memberId: input.memberId }, 'Wrote _close sentinel for graceful timeout exit');
+      } catch (err) {
+        logger.warn({ memberId: input.memberId, err }, 'Failed to write _close sentinel on timeout');
+      }
+
+      // Phase 2: SIGKILL after grace period if process hasn't exited
+      graceTimeout = setTimeout(() => {
+        logger.error({ memberId: input.memberId }, 'Grace period expired, force-killing teammate');
+        child.kill('SIGKILL');
+      }, TEAMMATE_GRACE_PERIOD);
+    }, effectiveTimeout);
 
     child.on('close', (code) => {
       clearTimeout(timeout);
+      if (graceTimeout) clearTimeout(graceTimeout);
       const duration = Date.now() - startTime;
 
       // Stop heartbeat monitoring (covers normal exit, error, timeout, and signal kill)
@@ -603,6 +619,7 @@ export async function runLocalTeammate(
         `Duration: ${duration}ms`,
         `Exit Code: ${code}`,
         `Timed Out: ${timedOut}`,
+        `Effective Timeout: ${effectiveTimeout}ms`,
         ``,
         `=== Stderr ===`,
         stderr.slice(-2000),
@@ -620,6 +637,7 @@ export async function runLocalTeammate(
             code,
             duration,
             timedOut,
+            effectiveTimeout,
             stderr: stderr.slice(-500),
           },
           'Local teammate exited with error',
@@ -638,7 +656,7 @@ export async function runLocalTeammate(
         resolve({
           status: 'error',
           result: null,
-          error: `Local teammate timed out after ${TEAMMATE_TIMEOUT}ms`,
+          error: `Local teammate timed out after ${effectiveTimeout}ms`,
         });
       } else {
         resolve(parsed);

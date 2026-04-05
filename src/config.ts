@@ -68,7 +68,9 @@ export const MEMORY_IPC_TIMEOUT_MS = 30000;
 // Agent Teams configuration
 export const TEAM_DIR = path.resolve(DATA_DIR, 'teams');
 export const TEAM_POLL_INTERVAL = 2000; // Poll interval for teammate status checks
-export const TEAMMATE_TIMEOUT = 600000; // 10 minutes timeout for teammates
+export const TEAMMATE_TIMEOUT = 600_000; // 10 minutes timeout for regular teammates
+export const OMX_TEAMMATE_TIMEOUT = 1_800_000; // 30 minutes timeout for OmX specialists
+export const TEAMMATE_GRACE_PERIOD = 15_000; // 15s grace period before SIGKILL on timeout
 export const DEFAULT_TEAMMATE_MODEL = 'claude-sonnet-4-6';
 export const MAX_CONCURRENT_SPECIALISTS = parseInt(
   process.env.MAX_CONCURRENT_SPECIALISTS || '3',
@@ -78,8 +80,8 @@ export const MAX_CONCURRENT_SPECIALISTS = parseInt(
 // OmX Autonomous Mode configuration
 export const OMX_SUPERVISOR_INTERVAL = 60_000;     // 60s between supervisor checks
 export const OMX_MAX_RETRIES_PER_STEP = 2;         // Retry failed specialists twice
-export const OMX_STEP_TIMEOUT = 900_000;           // 15min per specialist step
-export const OMX_MAX_TOTAL_DURATION = 3_600_000;   // 1hr max for entire workflow
+export const OMX_STEP_TIMEOUT = 1_860_000;         // 31min per specialist step (> OMX_TEAMMATE_TIMEOUT + grace)
+export const OMX_MAX_TOTAL_DURATION = 7_200_000;   // 2hr max for entire workflow (8 steps × 30min worst case)
 export const OMX_MAX_SPECIALISTS_PER_WORKFLOW = 10; // Budget cap per OmX run
 export const OMX_MAX_CONCURRENT_WORKFLOWS = 2;     // Max simultaneous OmX workflows
 export const OMX_REQUIRE_APPROVAL_FOR_PUSH = true; // Require human OK before push
