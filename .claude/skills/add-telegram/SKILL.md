@@ -582,7 +582,7 @@ If user wants Telegram-only:
 
 ### Chat ID Formats
 
-- **WhatsApp**: `120363336345536173@g.us` (groups) or `1234567890@s.whatsapp.net` (DM)
+- **WhatsApp**: `123456789@g.us` (groups) or `1234567890@s.whatsapp.net` (DM)
 - **Telegram**: `tg:123456789` (positive for private) or `tg:-1001234567890` (negative for groups)
 
 ### Trigger Options
