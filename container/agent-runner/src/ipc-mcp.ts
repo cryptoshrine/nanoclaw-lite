@@ -8,8 +8,6 @@ import { z } from 'zod';
 import fs from 'fs';
 import path from 'path';
 import { CronExpressionParser } from 'cron-parser';
-// @ts-ignore - Copied during Docker build from .claude/skills/x-integration/
-import { createXTools } from './skills/x-integration/agent.js';
 
 const IPC_DIR = process.env.NANOCLAW_IPC_DIR || '/workspace/ipc';
 const MESSAGES_DIR = path.join(IPC_DIR, 'messages');
@@ -23,11 +21,6 @@ export interface IpcMcpContext {
   chatJid: string;
   groupFolder: string;
   isMain: boolean;
-  // Team context (for teammates)
-  isTeammate?: boolean;
-  teamId?: string;
-  memberId?: string;
-  memberName?: string;
 }
 
 function writeIpcFile(dir: string, data: object): string {
@@ -83,7 +76,7 @@ async function memoryIpcRequest(
 }
 
 export function createIpcMcp(ctx: IpcMcpContext) {
-  const { chatJid, groupFolder, isMain, isTeammate, teamId, memberId, memberName } = ctx;
+  const { chatJid, groupFolder, isMain } = ctx;
 
   return createSdkMcpServer({
     name: 'nanoclaw',
@@ -185,62 +178,6 @@ export function createIpcMcp(ctx: IpcMcpContext) {
             content: [{
               type: 'text',
               text: `Document queued for delivery (${filename})`
-            }]
-          };
-        }
-      ),
-
-      tool(
-        'send_canvas',
-        `Push a visual artifact to the Live Canvas in CENTCOMM. Artifacts appear as draggable/resizable cards on a spatial workspace.
-
-Supported types:
-- "markdown": Rendered markdown text
-- "code": Syntax-highlighted code block (set metadata.language)
-- "svg": Raw SVG markup
-- "image": URL or path to an image file
-- "chart": JSON chart data (Recharts-compatible)
-- "html": Raw HTML content
-
-Artifacts appear in real-time on the canvas. Use for sharing visualizations, code, research findings, or any visual content.`,
-        {
-          type: z.enum(['markdown', 'code', 'svg', 'image', 'chart', 'html']).describe('Artifact type'),
-          title: z.string().describe('Display title for the artifact card'),
-          content: z.string().describe('Content: markdown text, code, SVG markup, image URL/path, chart JSON, or HTML'),
-          metadata: z.record(z.string(), z.string()).optional().describe('Optional metadata (e.g., { language: "python" })'),
-          width: z.number().optional().describe('Width in pixels (default: 400)'),
-          height: z.number().optional().describe('Height in pixels (default: 300)'),
-        },
-        async (args) => {
-          const artifactId = `art-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-          const posX = 50 + Math.floor(Math.random() * 200);
-          const posY = 50 + Math.floor(Math.random() * 200);
-
-          const artifact = {
-            id: artifactId,
-            type: args.type,
-            title: args.title,
-            content: args.content,
-            metadata: args.metadata || {},
-            position: { x: posX, y: posY },
-            size: { width: args.width || 400, height: args.height || 300 },
-            sourceAgent: groupFolder,
-            createdAt: new Date().toISOString(),
-            updatedAt: new Date().toISOString(),
-          };
-
-          writeIpcFile(TASKS_DIR, {
-            type: 'canvas_update',
-            canvas_action: 'add',
-            artifact,
-            groupFolder,
-            timestamp: new Date().toISOString(),
-          });
-
-          return {
-            content: [{
-              type: 'text',
-              text: `Artifact "${args.title}" (${args.type}) pushed to canvas (${artifactId})`
             }]
           };
         }
@@ -574,383 +511,6 @@ Use available_groups.json to find the JID for a group. The folder name should be
         }
       ),
 
-      // ============ Agent Teams Tools ============
-
-      // Lead-only: Create a new team
-      tool(
-        'create_team',
-        `Create a new agent team. You become the team lead and can spawn teammates to work on tasks in parallel.
-
-Use this when you have a complex task that can be broken down into independent subtasks that can run concurrently.`,
-        {
-          name: z.string().describe('Unique name for the team (e.g., "refactor-auth-2024")')
-        },
-        async (args) => {
-          if (!isMain) {
-            return {
-              content: [{ type: 'text', text: 'Only the main group can create teams.' }],
-              isError: true
-            };
-          }
-
-          const data = {
-            type: 'create_team',
-            teamName: args.name,
-            timestamp: new Date().toISOString()
-          };
-
-          writeIpcFile(TASKS_DIR, data);
-
-          return {
-            content: [{
-              type: 'text',
-              text: `Team "${args.name}" creation requested. Use list_teams to see available teams.`
-            }]
-          };
-        }
-      ),
-
-      // Lead-only: Spawn a teammate
-      tool(
-        'spawn_teammate',
-        `Spawn a new teammate agent in a separate container. The teammate will work autonomously on the given task.
-
-Teammates have access to:
-- The team's shared /workspace/team directory
-- Your group's files (read-only)
-- Team messaging and task tools
-
-Teammates run with sonnet by default for cost efficiency. Use opus for complex reasoning tasks.`,
-        {
-          team_id: z.string().describe('The team ID to add the teammate to'),
-          name: z.string().describe('A short name for this teammate (e.g., "api-refactor", "test-writer")'),
-          prompt: z.string().describe('The task for this teammate to complete. Be specific and include all context needed.'),
-          model: z.enum(['claude-sonnet-4-6', 'claude-sonnet-4-20250514', 'claude-opus-4-6']).optional().describe('Model to use (default: claude-sonnet-4-6)')
-        },
-        async (args) => {
-          if (!isMain) {
-            return {
-              content: [{ type: 'text', text: 'Only the main group can spawn teammates.' }],
-              isError: true
-            };
-          }
-
-          const data = {
-            type: 'spawn_teammate',
-            teamId: args.team_id,
-            teammateName: args.name,
-            teammatePrompt: args.prompt,
-            teammateModel: args.model,
-            chatJid,
-            timestamp: new Date().toISOString()
-          };
-
-          writeIpcFile(TASKS_DIR, data);
-
-          return {
-            content: [{
-              type: 'text',
-              text: `Teammate "${args.name}" spawn requested for team ${args.team_id}.`
-            }]
-          };
-        }
-      ),
-
-      // Lead-only: List teammates
-      tool(
-        'list_teammates',
-        'List all teammates in a team with their current status.',
-        {
-          team_id: z.string().describe('The team ID')
-        },
-        async (args) => {
-          const teamFile = path.join(IPC_DIR, `team-${args.team_id}.json`);
-
-          try {
-            if (!fs.existsSync(teamFile)) {
-              return {
-                content: [{ type: 'text', text: `Team ${args.team_id} not found.` }],
-                isError: true
-              };
-            }
-
-            const snapshot = JSON.parse(fs.readFileSync(teamFile, 'utf-8'));
-            const members = snapshot.members || [];
-
-            if (members.length === 0) {
-              return {
-                content: [{ type: 'text', text: 'No teammates in this team yet.' }]
-              };
-            }
-
-            const formatted = members.map((m: { id: string; name: string; role: string; status: string }) =>
-              `- [${m.id}] ${m.name} (${m.role}): ${m.status}`
-            ).join('\n');
-
-            return {
-              content: [{
-                type: 'text',
-                text: `Team members:\n${formatted}\n\nLast updated: ${snapshot.lastUpdated}`
-              }]
-            };
-          } catch (err) {
-            return {
-              content: [{
-                type: 'text',
-                text: `Error reading team: ${err instanceof Error ? err.message : String(err)}`
-              }],
-              isError: true
-            };
-          }
-        }
-      ),
-
-      // Lead-only: Cleanup team
-      tool(
-        'cleanup_team',
-        'End a team and stop all running teammates. Use when the team\'s work is complete.',
-        {
-          team_id: z.string().describe('The team ID to cleanup')
-        },
-        async (args) => {
-          if (!isMain) {
-            return {
-              content: [{ type: 'text', text: 'Only the main group can cleanup teams.' }],
-              isError: true
-            };
-          }
-
-          const data = {
-            type: 'cleanup_team',
-            teamId: args.team_id,
-            timestamp: new Date().toISOString()
-          };
-
-          writeIpcFile(TASKS_DIR, data);
-
-          return {
-            content: [{
-              type: 'text',
-              text: `Team ${args.team_id} cleanup requested.`
-            }]
-          };
-        }
-      ),
-
-      // Team messaging: Send message to specific teammate or broadcast
-      tool(
-        'send_team_message',
-        `Send a message to a specific teammate or broadcast to all team members.
-Use this to coordinate work, share updates, or ask questions.`,
-        {
-          team_id: z.string().describe('The team ID'),
-          content: z.string().describe('The message content'),
-          to_member: z.string().optional().describe('Specific member ID to send to (omit to broadcast to all)')
-        },
-        async (args) => {
-          const fromMember = isTeammate && memberId ? memberId : 'lead';
-
-          const data = {
-            type: 'team_message',
-            teamId: args.team_id,
-            fromMember,
-            toMember: args.to_member || null,
-            content: args.content,
-            timestamp: new Date().toISOString()
-          };
-
-          writeIpcFile(TASKS_DIR, data);
-
-          const target = args.to_member ? `to ${args.to_member}` : 'to all';
-          return {
-            content: [{
-              type: 'text',
-              text: `Message sent ${target}.`
-            }]
-          };
-        }
-      ),
-
-      // Team messaging: Read unread messages
-      tool(
-        'read_team_messages',
-        'Read unread messages sent to you or broadcast to the team.',
-        {
-          team_id: z.string().describe('The team ID')
-        },
-        async (args) => {
-          const messagesFile = path.join(IPC_DIR, `team-${args.team_id}-messages.json`);
-
-          try {
-            if (!fs.existsSync(messagesFile)) {
-              return {
-                content: [{ type: 'text', text: 'No messages.' }]
-              };
-            }
-
-            const messages = JSON.parse(fs.readFileSync(messagesFile, 'utf-8'));
-
-            if (!messages || messages.length === 0) {
-              return {
-                content: [{ type: 'text', text: 'No messages.' }]
-              };
-            }
-
-            const formatted = messages.map((m: { from_member: string; content: string; created_at: string }) =>
-              `[${m.created_at}] ${m.from_member}: ${m.content}`
-            ).join('\n\n');
-
-            return {
-              content: [{
-                type: 'text',
-                text: `Messages:\n${formatted}`
-              }]
-            };
-          } catch (err) {
-            return {
-              content: [{
-                type: 'text',
-                text: `Error reading messages: ${err instanceof Error ? err.message : String(err)}`
-              }],
-              isError: true
-            };
-          }
-        }
-      ),
-
-      // Team tasks: List available tasks
-      tool(
-        'get_team_tasks',
-        'List all tasks for a team with their status and assignments.',
-        {
-          team_id: z.string().describe('The team ID')
-        },
-        async (args) => {
-          const tasksFile = path.join(IPC_DIR, `team-${args.team_id}-tasks.json`);
-
-          try {
-            if (!fs.existsSync(tasksFile)) {
-              return {
-                content: [{ type: 'text', text: 'No tasks defined yet.' }]
-              };
-            }
-
-            const tasks = JSON.parse(fs.readFileSync(tasksFile, 'utf-8'));
-
-            if (!tasks || tasks.length === 0) {
-              return {
-                content: [{ type: 'text', text: 'No tasks defined yet.' }]
-              };
-            }
-
-            const formatted = tasks.map((t: { id: string; title: string; status: string; assigned_to: string | null; priority: number }) =>
-              `- [${t.id}] ${t.title} (${t.status}${t.assigned_to ? `, assigned: ${t.assigned_to}` : ''}) priority: ${t.priority}`
-            ).join('\n');
-
-            return {
-              content: [{
-                type: 'text',
-                text: `Team tasks:\n${formatted}`
-              }]
-            };
-          } catch (err) {
-            return {
-              content: [{
-                type: 'text',
-                text: `Error reading tasks: ${err instanceof Error ? err.message : String(err)}`
-              }],
-              isError: true
-            };
-          }
-        }
-      ),
-
-      // Team tasks: Create a new task
-      tool(
-        'create_team_task',
-        'Create a new task for the team. Tasks can be claimed by teammates.',
-        {
-          team_id: z.string().describe('The team ID'),
-          title: z.string().describe('Short title for the task'),
-          description: z.string().optional().describe('Detailed description of what needs to be done'),
-          priority: z.number().optional().describe('Priority (higher = more important, default: 0)'),
-          depends_on: z.string().optional().describe('Task ID this task depends on')
-        },
-        async (args) => {
-          const data = {
-            type: 'create_team_task',
-            teamId: args.team_id,
-            taskTitle: args.title,
-            taskDescription: args.description,
-            priority: args.priority,
-            dependsOn: args.depends_on,
-            timestamp: new Date().toISOString()
-          };
-
-          writeIpcFile(TASKS_DIR, data);
-
-          return {
-            content: [{
-              type: 'text',
-              text: `Task "${args.title}" created.`
-            }]
-          };
-        }
-      ),
-
-      // Team tasks: Claim a task
-      tool(
-        'claim_team_task',
-        'Claim an available task to work on. Only one agent can claim a task.',
-        {
-          task_id: z.string().describe('The task ID to claim')
-        },
-        async (args) => {
-          const claimingMember = isTeammate && memberId ? memberId : 'lead';
-
-          const data = {
-            type: 'claim_team_task',
-            taskId: args.task_id,
-            memberId: claimingMember,
-            timestamp: new Date().toISOString()
-          };
-
-          writeIpcFile(TASKS_DIR, data);
-
-          return {
-            content: [{
-              type: 'text',
-              text: `Task ${args.task_id} claim requested.`
-            }]
-          };
-        }
-      ),
-
-      // Team tasks: Complete a task
-      tool(
-        'complete_team_task',
-        'Mark a task as completed.',
-        {
-          task_id: z.string().describe('The task ID to complete')
-        },
-        async (args) => {
-          const data = {
-            type: 'complete_team_task',
-            taskId: args.task_id,
-            timestamp: new Date().toISOString()
-          };
-
-          writeIpcFile(TASKS_DIR, data);
-
-          return {
-            content: [{
-              type: 'text',
-              text: `Task ${args.task_id} marked complete.`
-            }]
-          };
-        }
-      ),
-
       // ============ Memory Tools ============
 
       tool(
@@ -1045,48 +605,6 @@ Returns the most relevant text snippets with their source file and line numbers.
         }
       ),
 
-      // List active teams (for lead to see what teams exist)
-      tool(
-        'list_teams',
-        'List all active teams.',
-        {},
-        async () => {
-          // Look for team-*.json files in IPC directory
-          try {
-            const files = fs.readdirSync(IPC_DIR).filter(f => f.startsWith('team-') && f.endsWith('.json') && !f.includes('-messages') && !f.includes('-tasks'));
-
-            if (files.length === 0) {
-              return {
-                content: [{ type: 'text', text: 'No active teams.' }]
-              };
-            }
-
-            const teams = files.map(f => {
-              try {
-                const data = JSON.parse(fs.readFileSync(path.join(IPC_DIR, f), 'utf-8'));
-                return `- [${data.team?.id}] ${data.team?.name} (${data.team?.status}) - ${data.members?.length || 0} members`;
-              } catch {
-                return null;
-              }
-            }).filter(Boolean);
-
-            return {
-              content: [{
-                type: 'text',
-                text: `Active teams:\n${teams.join('\n')}`
-              }]
-            };
-          } catch (err) {
-            return {
-              content: [{
-                type: 'text',
-                text: `Error listing teams: ${err instanceof Error ? err.message : String(err)}`
-              }],
-              isError: true
-            };
-          }
-        }
-      ),
       // ============ Agent-to-Agent Messaging Tools ============
 
       tool(
@@ -1243,28 +761,6 @@ Use this when the user asks "what's running?", "status", or you need to check sy
             parts.push(`*System status error:* ${err instanceof Error ? err.message : String(err)}`);
           }
 
-          // Active teams
-          try {
-            const teamFiles = fs.readdirSync(IPC_DIR).filter(
-              f => f.startsWith('team-') && f.endsWith('.json') && !f.includes('-messages') && !f.includes('-tasks')
-            );
-            if (teamFiles.length > 0) {
-              const teams = teamFiles.map(f => {
-                try {
-                  const data = JSON.parse(fs.readFileSync(path.join(IPC_DIR, f), 'utf-8'));
-                  const memberCount = data.members?.length || 0;
-                  const activeMembers = data.members?.filter((m: { status: string }) => m.status === 'active').length || 0;
-                  return `  • ${data.team?.name} — ${activeMembers}/${memberCount} active`;
-                } catch {
-                  return null;
-                }
-              }).filter(Boolean);
-              parts.push(`*Active Teams:* ${teamFiles.length}\n${teams.join('\n')}`);
-            }
-          } catch {
-            // Ignore team listing errors
-          }
-
           // Scheduled tasks summary
           const tasksFile = path.join(IPC_DIR, 'current_tasks.json');
           try {
@@ -1288,7 +784,6 @@ Use this when the user asks "what's running?", "status", or you need to check sy
         }
       ),
 
-      ...createXTools({ groupFolder, isMain })
     ]
   });
 }

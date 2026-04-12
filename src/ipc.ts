@@ -11,7 +11,6 @@ import {
 } from './config.js';
 import { AvailableGroup } from './container-runner.js';
 import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
-import { sendToDiscordChannel } from './discord-pipeline.js';
 import { logger } from './logger.js';
 import { addToDmAllowlist, getDmAllowlist, removeFromDmAllowlist } from './dm-allowlist.js';
 import { RegisteredGroup } from './types.js';
@@ -204,17 +203,8 @@ export async function processTaskIpc(
     trigger?: string;
     requiresTrigger?: boolean;
     containerConfig?: RegisteredGroup['containerConfig'];
-    // For log_tweet
-    text?: string;
-    url?: string;
-    source?: string;
     // For dm_allowlist
     user_id?: string;
-    // For canvas_update
-    canvas_action?: string;
-    artifact?: Record<string, unknown>;
-    artifactId?: string;
-    changes?: Record<string, unknown>;
   },
   sourceGroup: string, // Verified identity from IPC directory
   isMain: boolean, // Verified from directory path
@@ -510,25 +500,6 @@ export async function processTaskIpc(
       }
       break;
 
-    case 'discord_post': {
-      const postedChannelId = process.env.DISCORD_CHANNEL_POSTED;
-      if (!postedChannelId) {
-        logger.warn('discord_post: DISCORD_CHANNEL_POSTED not set');
-        break;
-      }
-      const tweetText = data.text || 'No text provided';
-      const tweetUrl = data.url || '';
-      const source = data.source || 'autonomous';
-      const msg = `🐦 **Published to X** (${source})\n\n${tweetText}${tweetUrl ? `\n\n🔗 ${tweetUrl}` : ''}`;
-      try {
-        await sendToDiscordChannel(msg, postedChannelId);
-        logger.info({ url: tweetUrl, source }, 'discord_post: sent to #posted');
-      } catch (err) {
-        logger.error({ err }, 'discord_post: failed to send to #posted');
-      }
-      break;
-    }
-
     case 'dm_allowlist_add':
       if (!isMain) {
         logger.warn({ sourceGroup }, 'Unauthorized dm_allowlist_add attempt blocked');
@@ -563,111 +534,6 @@ export async function processTaskIpc(
       const responseFile = path.join(responseDir, `dm_allowlist_${Date.now()}.json`);
       fs.writeFileSync(responseFile, JSON.stringify(allowlist, null, 2));
       logger.info('dm_allowlist_list: wrote response');
-      break;
-    }
-
-    case 'canvas_update': {
-      const canvasDir = path.join(DATA_DIR, 'canvas', sourceGroup);
-      fs.mkdirSync(canvasDir, { recursive: true });
-
-      const canvasPath = path.join(canvasDir, 'canvas.json');
-      const eventsPath = path.join(canvasDir, 'events.json');
-
-      // Read current state
-      let state: {
-        id: string;
-        artifacts: Array<Record<string, unknown>>;
-        annotations: Array<Record<string, unknown>>;
-        viewport: { x: number; y: number; zoom: number };
-        lastUpdate: string;
-      } = {
-        id: sourceGroup,
-        artifacts: [],
-        annotations: [],
-        viewport: { x: 0, y: 0, zoom: 1 },
-        lastUpdate: '',
-      };
-      try {
-        if (fs.existsSync(canvasPath)) {
-          state = JSON.parse(fs.readFileSync(canvasPath, 'utf-8'));
-        }
-      } catch {
-        /* fresh start */
-      }
-
-      const action = data.canvas_action as string;
-      let event: Record<string, unknown> | null = null;
-
-      if (action === 'add' && data.artifact) {
-        // Normalize flat x/y/width/height into nested position/size
-        const art = data.artifact as Record<string, unknown>;
-        if (!art.position && (art.x !== undefined || art.y !== undefined)) {
-          art.position = { x: art.x ?? 0, y: art.y ?? 0 };
-          delete art.x;
-          delete art.y;
-        }
-        if (!art.size && (art.width !== undefined || art.height !== undefined)) {
-          art.size = { width: art.width ?? 400, height: art.height ?? 300 };
-          delete art.width;
-          delete art.height;
-        }
-        state.artifacts.push(art);
-        event = { type: 'artifact_add', artifact: art };
-      } else if (action === 'update' && data.artifactId && data.changes) {
-        const idx = state.artifacts.findIndex(
-          (a) => (a as { id: string }).id === data.artifactId,
-        );
-        if (idx >= 0) {
-          state.artifacts[idx] = {
-            ...state.artifacts[idx],
-            ...(data.changes as Record<string, unknown>),
-            updatedAt: new Date().toISOString(),
-          };
-          event = {
-            type: 'artifact_update',
-            artifactId: data.artifactId,
-            changes: data.changes,
-          };
-        }
-      } else if (action === 'remove' && data.artifactId) {
-        state.artifacts = state.artifacts.filter(
-          (a) => (a as { id: string }).id !== data.artifactId,
-        );
-        event = { type: 'artifact_remove', artifactId: data.artifactId };
-      }
-
-      if (event) {
-        state.lastUpdate = new Date().toISOString();
-        fs.writeFileSync(canvasPath, JSON.stringify(state, null, 2));
-
-        // Append event for SSE streaming (ring buffer, max 100)
-        let events: Array<Record<string, unknown>> = [];
-        try {
-          if (fs.existsSync(eventsPath)) {
-            events = JSON.parse(fs.readFileSync(eventsPath, 'utf-8'));
-          }
-        } catch {
-          /* empty */
-        }
-        const seq =
-          events.length > 0
-            ? ((events[events.length - 1].seq as number) || 0) + 1
-            : 1;
-        events.push({
-          ...event,
-          timestamp: new Date().toISOString(),
-          seq,
-        });
-        if (events.length > 100) {
-          events = events.slice(-100);
-        }
-        fs.writeFileSync(eventsPath, JSON.stringify(events));
-
-        logger.info(
-          { sourceGroup, action, artifactId: data.artifactId },
-          'Canvas update processed',
-        );
-      }
       break;
     }
 

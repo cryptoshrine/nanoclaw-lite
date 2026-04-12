@@ -1,4 +1,3 @@
-import { execSync } from 'child_process';
 import fs from 'fs';
 import https from 'https';
 import path from 'path';
@@ -18,7 +17,6 @@ import {
   AGENT_RUNNER_ENTRY,
   ASSISTANT_NAME,
   DATA_DIR,
-  EXECUTION_MODE,
   IPC_POLL_INTERVAL,
   MAIN_GROUP_FOLDER,
   MAX_HISTORY_AGE_MS,
@@ -35,65 +33,21 @@ import {
   getDb,
   getMessagesSince,
   getNewMessages,
-  getTaskById,
   initDatabase,
   storeChatMetadata,
   storeMessage,
-  // Team functions
-  getTeam,
-  getTeamMembers,
-  getTeamTasks,
-  getPendingTeamTasks,
-  createTeamTask,
-  claimTeamTask,
-  completeTeamTask,
-  updateTeamTask,
-  createTeamMessage,
-  getUnreadTeamMessages,
-  markTeamMessagesRead,
 } from './db.js';
 import { MemoryManager } from './memory/manager.js';
 import { MemoryIpcRequest, MemoryIpcResponse } from './memory/types.js';
 import { startSchedulerLoop } from './task-scheduler.js';
-import {
-  createNewTeam,
-  spawnTeammate,
-  shutdownTeammate,
-  cleanupTeam,
-  startTeamWatcher,
-  writeTeamSnapshot,
-  getTeammateInfo,
-} from './team-manager.js';
-import { ProgressStreamer } from './progress-streamer.js';
 import { addPendingRequest, addToDmAllowlist, dmRejectTimes, getDmAllowlist, loadDmAllowlist, removeFromDmAllowlist } from './dm-allowlist.js';
 import { registerCallbackHandler, processApprovalRequest, cleanupStaleApprovals } from './inline-keyboards.js';
-import {
-  createWorkflow,
-  advanceWorkflow,
-  loadWorkflow,
-  saveWorkflow,
-  buildContinuationPrompt,
-  listActiveWorkflows,
-} from './workflow-engine.js';
 import { startBrowserDaemon } from './browser-daemon.js';
-import { NewMessage, RegisteredGroup, Session, TeamTask } from './types.js';
+import { NewMessage, RegisteredGroup, Session } from './types.js';
 import { formatOutbound } from './router.js';
 import { loadJson, saveJson } from './utils.js';
 import { logger } from './logger.js';
-import {
-  startDiscordPipeline,
-  getKlawClient,
-  setDirectLineCallback,
-  setGeneralOpsChannel,
-  addInteractiveChannels,
-  sendToGeneralOps,
-  sendToDiscordChannel,
-  getActiveDiscordChannelId,
-} from './discord-pipeline.js';
-import { wireDiscordCallbacks } from './discord-callbacks.js';
-import { initExtendedChannels, postToAgentLine, type AgentLine } from './discord-channels.js';
 import { transcribeVoiceMessage } from './transcription.js';
-import { KlawEventServer, broadcast as wsBroadcast } from './ws-server.js';
 
 let bot: Bot;
 let botUserId: number | undefined;
@@ -105,41 +59,14 @@ let memoryManager: MemoryManager;
 let factExtractor: FactExtractor;
 let pipeline: MiddlewarePipeline;
 
-/**
- * Set of recently processed message IDs (format: "msgId:chatJid").
- * Prevents duplicate processing when the system crashes mid-loop and
- * the same message is re-fetched on restart (at-least-once → exactly-once).
- * We keep a bounded window to avoid unbounded memory growth.
- */
 const MAX_PROCESSED_IDS = 500;
 let processedMessageIds: Set<string> = new Set();
 
-/**
- * Track Telegram messages we've already seen in this session (format: "messageId:chatId").
- * When polling reconnects after an error, the library may re-deliver
- * the same messages. By tracking what we've seen we prevent duplicate storage
- * and downstream duplicate processing.
- */
 const seenUpdateIds: Set<string> = new Set();
 const MAX_SEEN_UPDATES = 1000;
 
-/**
- * Track messages currently being processed by an agent (in-flight).
- * Prevents the 2-second message loop from re-dispatching a message
- * while its agent container is still running.
- */
 const inFlightMessages: Set<string> = new Set();
-
-/**
- * Per-group agent lock. Only one agent runs per group at a time,
- * but different groups can run in parallel (cross-group parallelism).
- */
 const activeGroups: Set<string> = new Set();
-
-/**
- * Per-group message queue. Messages arriving while a group's agent
- * is busy get queued here for processing when the current run finishes.
- */
 const pendingGroupMessages: Map<string, NewMessage[]> = new Map();
 
 function loadState(): void {
@@ -151,14 +78,12 @@ function loadState(): void {
   }>(statePath, {});
   lastTimestamp = state.last_timestamp || '';
   lastAgentTimestamp = state.last_agent_timestamp || {};
-  // Restore processed message IDs from disk (prevents duplicates after crash/restart)
   processedMessageIds = new Set(state.processed_message_ids || []);
   sessions = loadJson(path.join(DATA_DIR, 'sessions.json'), {});
   registeredGroups = loadJson(
     path.join(DATA_DIR, 'registered_groups.json'),
     {},
   );
-  // Load DM allowlist
   const allowlist = loadDmAllowlist();
 
   logger.info(
@@ -172,7 +97,6 @@ function loadState(): void {
 }
 
 function saveState(): void {
-  // Trim processedMessageIds to bounded window before persisting
   if (processedMessageIds.size > MAX_PROCESSED_IDS) {
     const arr = Array.from(processedMessageIds);
     processedMessageIds = new Set(arr.slice(arr.length - MAX_PROCESSED_IDS));
@@ -189,11 +113,9 @@ function registerGroup(jid: string, group: RegisteredGroup): void {
   registeredGroups[jid] = group;
   saveJson(path.join(DATA_DIR, 'registered_groups.json'), registeredGroups);
 
-  // Create group folder
   const groupDir = path.join(DATA_DIR, '..', 'groups', group.folder);
   fs.mkdirSync(path.join(groupDir, 'logs'), { recursive: true });
 
-  // Start memory file watcher for the new group
   if (memoryManager) {
     memoryManager.watchGroup(group.folder);
   }
@@ -204,32 +126,18 @@ function registerGroup(jid: string, group: RegisteredGroup): void {
   );
 }
 
-/**
- * Convert a Telegram chat ID to a string JID for internal use.
- * Format: "{chatId}@telegram"
- */
 function chatIdToJid(chatId: number): string {
   return `${chatId}@telegram`;
 }
 
-/**
- * Extract the Telegram chat ID from a JID string.
- */
 function jidToChatId(jid: string): number {
   return parseInt(jid.split('@')[0], 10);
 }
 
-/**
- * Set registered groups (for testing only).
- */
 export function _setRegisteredGroups(groups: Record<string, RegisteredGroup>): void {
   registeredGroups = groups;
 }
 
-/**
- * Get available groups list for the agent.
- * Returns groups ordered by most recent activity.
- */
 export function getAvailableGroups(): AvailableGroup[] {
   const chats = getAllChats();
   const registeredJids = new Set(Object.keys(registeredGroups));
@@ -264,8 +172,6 @@ async function processMessage(msg: NewMessage): Promise<void> {
         .replace(/</g, '&lt;')
         .replace(/>/g, '&gt;')
         .replace(/"/g, '&quot;');
-    // Strip "klaw: " prefix from bot messages to avoid redundant attribution
-    // since the sender tag already identifies the source
     let content = m.content;
     if (content.startsWith(`${ASSISTANT_NAME}: `)) {
       content = content.slice(ASSISTANT_NAME.length + 2);
@@ -284,40 +190,14 @@ async function processMessage(msg: NewMessage): Promise<void> {
 
   await sendTyping(msg.chat_jid);
 
-  const runId = `run-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
-  const agentId = `${group.folder}-main`;
-  wsBroadcast('agent.run.start', {
-    runId,
-    agentId,
-    name: group.name,
-    group: group.folder,
-  });
-
   const response = await runAgent(group, prompt, msg.chat_jid);
-
-  wsBroadcast('agent.run.end', {
-    runId,
-    agentId,
-    groupId: group.folder,
-    status: response ? 'success' : 'empty',
-  });
 
   if (response) {
     lastAgentTimestamp[msg.chat_jid] = msg.timestamp;
     const cleanResponse = formatOutbound(response);
     if (cleanResponse) {
-      // KlawHQ: final agent output
-      wsBroadcast('chat.stream', {
-        runId,
-        groupId: group.folder,
-        text: cleanResponse.slice(0, 500),
-        state: 'final',
-      });
-
       const fullResponse = `${ASSISTANT_NAME}: ${cleanResponse}`;
       await sendMessage(msg.chat_jid, fullResponse);
-      // Store agent response in DB so CENTCOMM chat can see it
-      // (Telegram private chats don't echo bot's own messages back)
       storeMessage({
         id: `agent-resp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
         chatJid: msg.chat_jid,
@@ -335,14 +215,12 @@ async function runAgent(
   group: RegisteredGroup,
   prompt: string,
   chatJid: string,
-  options?: { sourceChannel?: 'telegram' | 'discord' },
 ): Promise<string | null> {
   const ctx = {
     group,
     chatJid,
     prompt,
     isMain: group.folder === MAIN_GROUP_FOLDER,
-    sourceChannel: options?.sourceChannel,
     meta: {} as Record<string, unknown>,
   };
 
@@ -351,11 +229,6 @@ async function runAgent(
     return result.response;
   } catch (err) {
     logger.error({ group: group.name, err }, 'Pipeline error');
-    wsBroadcast('agent.error', {
-      agentId: `${group.folder}-main`,
-      group: group.folder,
-      error: err instanceof Error ? err.message : String(err),
-    });
     return null;
   }
 }
@@ -427,10 +300,6 @@ async function sendMessage(jid: string, text: string): Promise<void> {
   logger.info({ jid, length: text.length, chunks: chunks.length }, 'Message sent');
 }
 
-/**
- * Download a file from Telegram to a local directory.
- * Replacement for node-telegram-bot-api's bot.downloadFile().
- */
 async function downloadTelegramFile(fileId: string, destDir: string): Promise<string> {
   const file = await bot.api.getFile(fileId);
   const token = process.env.TELEGRAM_BOT_TOKEN!;
@@ -459,130 +328,12 @@ function startIpcWatcher(): void {
     try {
       groupFolders = fs.readdirSync(ipcBaseDir).filter((f) => {
         const stat = fs.statSync(path.join(ipcBaseDir, f));
-        return stat.isDirectory() && f !== 'errors' && f !== 'teammates';
+        return stat.isDirectory() && f !== 'errors';
       });
     } catch (err) {
       logger.error({ err }, 'Error reading IPC base directory');
       setTimeout(processIpcFiles, IPC_POLL_INTERVAL);
       return;
-    }
-
-    // Process teammate IPC directories
-    const teammatesDir = path.join(ipcBaseDir, 'teammates');
-    if (fs.existsSync(teammatesDir)) {
-      try {
-        const teammateIds = fs.readdirSync(teammatesDir).filter((f) => {
-          const stat = fs.statSync(path.join(teammatesDir, f));
-          return stat.isDirectory();
-        });
-        for (const memberId of teammateIds) {
-          // Process teammate task IPC files
-          const teammateTasksDir = path.join(teammatesDir, memberId, 'tasks');
-          if (fs.existsSync(teammateTasksDir)) {
-            const taskFiles = fs
-              .readdirSync(teammateTasksDir)
-              .filter((f) => f.endsWith('.json'));
-            for (const file of taskFiles) {
-              const filePath = path.join(teammateTasksDir, file);
-              try {
-                const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-                await processTaskIpc(data, `teammate:${memberId}`, false);
-                fs.unlinkSync(filePath);
-              } catch (err) {
-                logger.error({ file, memberId, err }, 'Error processing teammate IPC');
-                const errorDir = path.join(ipcBaseDir, 'errors');
-                fs.mkdirSync(errorDir, { recursive: true });
-                fs.renameSync(filePath, path.join(errorDir, `teammate-${memberId}-${file}`));
-              }
-            }
-          }
-
-          // Process teammate message IPC files (send_message from specialists)
-          const teammateMessagesDir = path.join(teammatesDir, memberId, 'messages');
-          if (fs.existsSync(teammateMessagesDir)) {
-            const messageFiles = fs
-              .readdirSync(teammateMessagesDir)
-              .filter((f) => f.endsWith('.json'));
-            for (const file of messageFiles) {
-              const filePath = path.join(teammateMessagesDir, file);
-              try {
-                const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-                if (data.type === 'message' && data.text) {
-                  // Resolve chatJid: from message data, or fall back to main group
-                  let targetJid = data.chatJid;
-                  if (!targetJid) {
-                    const mainEntry = Object.entries(registeredGroups).find(
-                      ([, g]) => g.folder === MAIN_GROUP_FOLDER,
-                    );
-                    targetJid = mainEntry?.[0];
-                  }
-                  if (targetJid) {
-                    const senderLabel = data.sender || `teammate:${memberId}`;
-                    const cleanText = formatOutbound(data.text);
-                    if (!cleanText) { fs.unlinkSync(filePath); continue; }
-                    const messageText = `${ASSISTANT_NAME}: ${cleanText}`;
-                    const messageId = `teammate-${memberId}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-                    const timestamp = data.timestamp || new Date().toISOString();
-
-                    // Check sourceChannel: route to Discord if the originating session was Discord
-                    const teammateSourceChannel = data.sourceChannel || 'telegram';
-                    if (teammateSourceChannel === 'discord') {
-                      const discordTarget = data.discordChannelId || getActiveDiscordChannelId();
-                      await sendToDiscordChannel(data.text, discordTarget || undefined);
-                      logger.info(
-                        { memberId, sender: senderLabel, discordChannel: discordTarget },
-                        'Teammate message routed to Discord',
-                      );
-                    } else {
-                      await sendMessage(targetJid, messageText);
-                      logger.info(
-                        { memberId, chatJid: targetJid, sender: senderLabel },
-                        'Teammate message sent to Telegram',
-                      );
-                    }
-
-                    storeMessage({
-                      id: messageId,
-                      chatJid: targetJid,
-                      sender: senderLabel,
-                      senderName: senderLabel,
-                      content: messageText,
-                      timestamp,
-                      isFromMe: true,
-                    });
-
-                    // Route to Discord agent line channel
-                    const agentLineMap: Record<string, AgentLine> = {
-                      'dev': 'dev-agent',
-                      'research': 'research-agent',
-                      'copywriter': 'copywriter-agent',
-                    };
-                    const senderLower = senderLabel.toLowerCase();
-                    for (const [keyword, agentLine] of Object.entries(agentLineMap)) {
-                      if (senderLower.includes(keyword)) {
-                        postToAgentLine(agentLine, data.text, true).catch((err) =>
-                          logger.error({ err, agentLine }, 'Failed to post to Discord agent line'),
-                        );
-                        break;
-                      }
-                    }
-                  }
-                }
-                fs.unlinkSync(filePath);
-              } catch (err) {
-                logger.error({ file, memberId, err }, 'Error processing teammate message');
-                try {
-                  const errorDir = path.join(ipcBaseDir, 'errors');
-                  fs.mkdirSync(errorDir, { recursive: true });
-                  fs.renameSync(filePath, path.join(errorDir, `teammate-msg-${memberId}-${file}`));
-                } catch { /* ignore cleanup errors */ }
-              }
-            }
-          }
-        }
-      } catch (err) {
-        logger.error({ err }, 'Error processing teammate IPC directories');
-      }
     }
 
     for (const sourceGroup of groupFolders) {
@@ -607,38 +358,26 @@ function startIpcWatcher(): void {
                   isMain ||
                   (targetGroup && targetGroup.folder === sourceGroup)
                 ) {
-                  const isSteering = data.source === 'centcomm-steering';
-                  const isDiscord = data.sourceChannel === 'discord';
-                  const cleanIpcText = isSteering ? data.text : formatOutbound(data.text);
+                  const cleanIpcText = formatOutbound(data.text);
                   if (!cleanIpcText) { fs.unlinkSync(filePath); continue; }
-                  const messageText = isSteering ? cleanIpcText : `${ASSISTANT_NAME}: ${cleanIpcText}`;
+                  const messageText = `${ASSISTANT_NAME}: ${cleanIpcText}`;
                   const messageId = `ipc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
                   const timestamp = data.timestamp || new Date().toISOString();
 
-                  if (isDiscord) {
-                    // Route to the Discord channel that triggered this session
-                    const targetChannelId = data.discordChannelId || getActiveDiscordChannelId();
-                    await sendToDiscordChannel(data.text, targetChannelId || undefined);
-                    logger.info(
-                      { chatJid: data.chatJid, sourceGroup, discordChannel: targetChannelId },
-                      'IPC message routed to Discord',
-                    );
-                  } else {
-                    await sendMessage(data.chatJid, messageText);
-                  }
+                  await sendMessage(data.chatJid, messageText);
 
                   storeMessage({
                     id: messageId,
                     chatJid: data.chatJid,
-                    sender: isSteering ? 'centcomm' : sourceGroup,
-                    senderName: isSteering ? 'CENTCOMM' : sourceGroup,
+                    sender: sourceGroup,
+                    senderName: sourceGroup,
                     content: messageText,
                     timestamp,
-                    isFromMe: !isSteering,
+                    isFromMe: true,
                   });
 
                   logger.info(
-                    { chatJid: data.chatJid, sourceGroup, stored: true, isSteering, isDiscord },
+                    { chatJid: data.chatJid, sourceGroup, stored: true },
                     'IPC message sent and stored',
                   );
                 } else {
@@ -672,7 +411,7 @@ function startIpcWatcher(): void {
 
                   if (!fs.existsSync(photoPath)) {
                     logger.error(
-                      { chatJid: data.chatJid, filePath: photoPath, originalPath: data.filePath, sourceGroup },
+                      { chatJid: data.chatJid, filePath: photoPath },
                       'IPC photo file not found on host',
                     );
                   } else {
@@ -680,22 +419,13 @@ function startIpcWatcher(): void {
                       await bot.api.sendPhoto(chatId, new InputFile(photoPath), {
                         caption: data.caption || undefined,
                       });
-                      logger.info(
-                        { chatJid: data.chatJid, sourceGroup, filePath: photoPath },
-                        'IPC photo sent',
-                      );
                     } catch (photoErr) {
                       logger.error(
-                        { chatJid: data.chatJid, sourceGroup, filePath: photoPath, err: photoErr },
+                        { chatJid: data.chatJid, filePath: photoPath, err: photoErr },
                         'Failed to send IPC photo',
                       );
                     }
                   }
-                } else {
-                  logger.warn(
-                    { chatJid: data.chatJid, sourceGroup },
-                    'Unauthorized IPC photo attempt blocked',
-                  );
                 }
               } else if (data.type === 'document' && data.chatJid && data.filePath) {
                 const targetGroup = registeredGroups[data.chatJid];
@@ -722,7 +452,7 @@ function startIpcWatcher(): void {
 
                   if (!fs.existsSync(docPath)) {
                     logger.error(
-                      { chatJid: data.chatJid, filePath: docPath, originalPath: data.filePath, sourceGroup },
+                      { chatJid: data.chatJid, filePath: docPath },
                       'IPC document file not found on host',
                     );
                   } else {
@@ -730,22 +460,13 @@ function startIpcWatcher(): void {
                       await bot.api.sendDocument(chatId, new InputFile(docPath), {
                         caption: data.caption || undefined,
                       });
-                      logger.info(
-                        { chatJid: data.chatJid, sourceGroup, filePath: docPath },
-                        'IPC document sent',
-                      );
                     } catch (docErr) {
                       logger.error(
-                        { chatJid: data.chatJid, sourceGroup, filePath: docPath, err: docErr },
+                        { chatJid: data.chatJid, filePath: docPath, err: docErr },
                         'Failed to send IPC document',
                       );
                     }
                   }
-                } else {
-                  logger.warn(
-                    { chatJid: data.chatJid, sourceGroup },
-                    'Unauthorized IPC document attempt blocked',
-                  );
                 }
               }
               fs.unlinkSync(filePath);
@@ -890,50 +611,21 @@ async function processTaskIpc(
     groupFolder?: string;
     chatJid?: string;
     targetJid?: string;
-    // For register_group
     jid?: string;
     name?: string;
     folder?: string;
     trigger?: string;
     containerConfig?: RegisteredGroup['containerConfig'];
-    // For agent_message
     targetGroup?: string;
     message?: string;
     subject?: string;
     inReplyTo?: string;
-    // For team operations
-    teamId?: string;
-    teamName?: string;
-    teammateName?: string;
-    teammatePrompt?: string;
-    teammateModel?: string;
-    memberId?: string;
-    fromMember?: string;
-    toMember?: string;
-    content?: string;
-    taskTitle?: string;
-    taskDescription?: string;
-    taskStatus?: 'pending' | 'in_progress' | 'completed' | 'blocked';
-    priority?: number;
-    dependsOn?: string;
-    // For edit_task
     task_id?: string;
-    // For log_tweet / discord_post
     text?: string;
     url?: string;
     source?: string;
-    // For source channel routing (Discord → specialist → Discord)
-    sourceChannel?: 'telegram' | 'discord';
-    discordChannelId?: string;
-    // For dm_allowlist
     user_id?: number;
-    // For canvas_update
-    canvas_action?: string;
-    artifact?: Record<string, unknown>;
-    artifactId?: string;
-    changes?: Record<string, unknown>;
     requiresTrigger?: boolean;
-    // For request_approval
     requestId?: string;
     description?: string;
     approveLabel?: string;
@@ -1067,8 +759,6 @@ async function processTaskIpc(
         if (task && (isMain || task.group_folder === sourceGroup)) {
           updateTask(data.taskId, { status: 'paused' });
           logger.info({ taskId: data.taskId, sourceGroup }, 'Task paused via IPC');
-        } else {
-          logger.warn({ taskId: data.taskId, sourceGroup }, 'Unauthorized task pause attempt');
         }
       }
       break;
@@ -1079,8 +769,6 @@ async function processTaskIpc(
         if (task && (isMain || task.group_folder === sourceGroup)) {
           updateTask(data.taskId, { status: 'active' });
           logger.info({ taskId: data.taskId, sourceGroup }, 'Task resumed via IPC');
-        } else {
-          logger.warn({ taskId: data.taskId, sourceGroup }, 'Unauthorized task resume attempt');
         }
       }
       break;
@@ -1091,8 +779,6 @@ async function processTaskIpc(
         if (task && (isMain || task.group_folder === sourceGroup)) {
           deleteTask(data.taskId);
           logger.info({ taskId: data.taskId, sourceGroup }, 'Task cancelled via IPC');
-        } else {
-          logger.warn({ taskId: data.taskId, sourceGroup }, 'Unauthorized task cancel attempt');
         }
       }
       break;
@@ -1110,8 +796,6 @@ async function processTaskIpc(
           added_at: new Date().toISOString(),
           containerConfig: data.containerConfig,
         });
-      } else {
-        logger.warn({ data }, 'Invalid register_group request - missing required fields');
       }
       break;
 
@@ -1123,7 +807,7 @@ async function processTaskIpc(
         if (!targetGroupEntry) {
           logger.warn(
             { from: sourceGroup, targetGroup: data.targetGroup },
-            'agent_message: target group not registered, dropping',
+            'agent_message: target group not registered',
           );
           break;
         }
@@ -1146,190 +830,6 @@ async function processTaskIpc(
         const tmpPath = `${msgPath}.tmp`;
         fs.writeFileSync(tmpPath, JSON.stringify(payload, null, 2));
         fs.renameSync(tmpPath, msgPath);
-
-        logger.info(
-          { from: sourceGroup, to: data.targetGroup, msgId },
-          'Agent message routed to inbox',
-        );
-      } else {
-        logger.warn({ data }, 'agent_message: missing targetGroup or message');
-      }
-      break;
-
-    case 'create_team':
-      if (!isMain) {
-        logger.warn({ sourceGroup }, 'Unauthorized create_team attempt');
-        break;
-      }
-      if (data.teamName) {
-        try {
-          const team = createNewTeam(data.teamName, sourceGroup);
-          logger.info({ teamId: team.id, name: data.teamName }, 'Team created via IPC');
-          // Write team snapshot so list_teams can find it
-          writeTeamSnapshot(team.id, sourceGroup);
-          // Write response so the MCP tool gets the team ID
-          if (data.requestId) {
-            const responsesDir = path.join(DATA_DIR, 'ipc', sourceGroup, 'responses');
-            fs.mkdirSync(responsesDir, { recursive: true });
-            const respFile = path.join(responsesDir, `${data.requestId}.json`);
-            fs.writeFileSync(respFile, JSON.stringify({ teamId: team.id, name: team.name }));
-          }
-        } catch (err) {
-          logger.error({ err, teamName: data.teamName }, 'Failed to create team');
-          // Write error response so the MCP tool knows it failed
-          if (data.requestId) {
-            const responsesDir = path.join(DATA_DIR, 'ipc', sourceGroup, 'responses');
-            fs.mkdirSync(responsesDir, { recursive: true });
-            const respFile = path.join(responsesDir, `${data.requestId}.json`);
-            fs.writeFileSync(respFile, JSON.stringify({ error: err instanceof Error ? err.message : String(err) }));
-          }
-        }
-      }
-      break;
-
-    case 'spawn_teammate':
-      if (!isMain) {
-        logger.warn({ sourceGroup }, 'Unauthorized spawn_teammate attempt');
-        break;
-      }
-      if (data.teamId && data.teammateName && data.teammatePrompt) {
-        try {
-          // Resolve chatJid: use IPC data, or find the main group's JID
-          let teammateChatJid = data.chatJid;
-          if (!teammateChatJid) {
-            const mainJid = Object.entries(registeredGroups).find(
-              ([, g]) => g.folder === MAIN_GROUP_FOLDER,
-            );
-            teammateChatJid = mainJid?.[0] || '';
-          }
-          const member = await spawnTeammate({
-            teamId: data.teamId,
-            name: data.teammateName,
-            prompt: data.teammatePrompt,
-            model: data.teammateModel,
-            leadGroup: sourceGroup,
-            chatJid: teammateChatJid,
-            sourceChannel: data.sourceChannel,
-          });
-          logger.info(
-            { teamId: data.teamId, name: data.teammateName, memberId: member.id },
-            'Teammate spawned via IPC',
-          );
-          // Update team snapshot
-          writeTeamSnapshot(data.teamId, sourceGroup);
-          // Write response so the MCP tool confirms spawn
-          if (data.requestId) {
-            const responsesDir = path.join(DATA_DIR, 'ipc', sourceGroup, 'responses');
-            fs.mkdirSync(responsesDir, { recursive: true });
-            const respFile = path.join(responsesDir, `${data.requestId}.json`);
-            fs.writeFileSync(respFile, JSON.stringify({
-              memberId: member.id,
-              name: member.name,
-              model: member.model,
-              teamId: data.teamId,
-            }));
-          }
-        } catch (err) {
-          logger.error({ err, teamId: data.teamId }, 'Failed to spawn teammate');
-          // Write error response so the MCP tool knows it failed
-          if (data.requestId) {
-            const responsesDir = path.join(DATA_DIR, 'ipc', sourceGroup, 'responses');
-            fs.mkdirSync(responsesDir, { recursive: true });
-            const respFile = path.join(responsesDir, `${data.requestId}.json`);
-            fs.writeFileSync(respFile, JSON.stringify({
-              error: err instanceof Error ? err.message : String(err),
-            }));
-          }
-        }
-      }
-      break;
-
-    case 'shutdown_teammate':
-      if (!isMain) {
-        logger.warn({ sourceGroup }, 'Unauthorized shutdown_teammate attempt');
-        break;
-      }
-      if (data.memberId) {
-        shutdownTeammate(data.memberId);
-        logger.info({ memberId: data.memberId }, 'Teammate shutdown via IPC');
-      }
-      break;
-
-    case 'cleanup_team':
-      if (!isMain) {
-        logger.warn({ sourceGroup }, 'Unauthorized cleanup_team attempt');
-        break;
-      }
-      if (data.teamId) {
-        cleanupTeam(data.teamId);
-        // Remove team snapshot file
-        const snapshotFile = path.join(DATA_DIR, 'ipc', sourceGroup, `team-${data.teamId}.json`);
-        try { if (fs.existsSync(snapshotFile)) fs.unlinkSync(snapshotFile); } catch { /* ignore */ }
-        logger.info({ teamId: data.teamId }, 'Team cleaned up via IPC');
-      }
-      break;
-
-    case 'team_message':
-      if (data.teamId && data.fromMember && data.content) {
-        createTeamMessage({
-          team_id: data.teamId,
-          from_member: data.fromMember,
-          to_member: data.toMember || null,
-          content: data.content,
-          created_at: new Date().toISOString(),
-        });
-        logger.debug(
-          { teamId: data.teamId, from: data.fromMember, to: data.toMember },
-          'Team message created',
-        );
-      }
-      break;
-
-    case 'create_team_task':
-      if (data.teamId && data.taskTitle) {
-        const taskId = `ttask-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-        const newTask: TeamTask = {
-          id: taskId,
-          team_id: data.teamId,
-          title: data.taskTitle,
-          description: data.taskDescription || null,
-          status: 'pending',
-          assigned_to: null,
-          depends_on: data.dependsOn || null,
-          priority: data.priority || 0,
-          created_at: new Date().toISOString(),
-          completed_at: null,
-        };
-        createTeamTask(newTask);
-        logger.info({ taskId, teamId: data.teamId }, 'Team task created via IPC');
-      }
-      break;
-
-    case 'claim_team_task':
-      if (data.taskId && data.memberId) {
-        const claimed = claimTeamTask(data.taskId, data.memberId);
-        if (claimed) {
-          logger.info({ taskId: data.taskId, memberId: data.memberId }, 'Team task claimed');
-        } else {
-          logger.debug({ taskId: data.taskId, memberId: data.memberId }, 'Team task already taken');
-        }
-      }
-      break;
-
-    case 'complete_team_task':
-      if (data.taskId) {
-        completeTeamTask(data.taskId);
-        logger.info({ taskId: data.taskId }, 'Team task completed');
-      }
-      break;
-
-    case 'update_team_task':
-      if (data.taskId) {
-        updateTeamTask(data.taskId, {
-          status: data.taskStatus,
-          description: data.taskDescription,
-        });
-        logger.info({ taskId: data.taskId }, 'Team task updated');
       }
       break;
 
@@ -1355,7 +855,6 @@ async function processTaskIpc(
                 const interval = CronExpressionParser.parse(newScheduleValue, { tz: TIMEZONE });
                 updates.next_run = interval.next().toISOString();
               } catch {
-                logger.warn({ scheduleValue: newScheduleValue, taskId: editTaskId }, 'Invalid cron expression in edit_task');
                 break;
               }
             } else if (newScheduleType === 'interval') {
@@ -1379,28 +878,8 @@ async function processTaskIpc(
     case 'refresh_groups':
       if (isMain) {
         logger.info({ sourceGroup }, 'Group metadata refresh requested via IPC');
-        // Sync handled elsewhere — this is a no-op in index.ts context
       }
       break;
-
-    case 'discord_post': {
-      const postedChannelId = process.env.DISCORD_CHANNEL_POSTED;
-      if (!postedChannelId) {
-        logger.warn('discord_post: DISCORD_CHANNEL_POSTED not set');
-        break;
-      }
-      const tweetText = data.text || 'No text provided';
-      const tweetUrl = data.url || '';
-      const tweetSource = data.source || 'autonomous';
-      const discordMsg = `🐦 **Published to X** (${tweetSource})\n\n${tweetText}${tweetUrl ? `\n\n🔗 ${tweetUrl}` : ''}`;
-      try {
-        await sendToDiscordChannel(discordMsg, postedChannelId);
-        logger.info({ url: tweetUrl, source: tweetSource }, 'discord_post: sent to #posted');
-      } catch (err) {
-        logger.error({ err }, 'discord_post: failed to send to #posted');
-      }
-      break;
-    }
 
     case 'dm_allowlist_add':
       if (isMain && typeof data.user_id === 'number') {
@@ -1423,194 +902,20 @@ async function processTaskIpc(
       fs.mkdirSync(responseDir, { recursive: true });
       const responseFile = path.join(responseDir, `dm_allowlist_${Date.now()}.json`);
       fs.writeFileSync(responseFile, JSON.stringify(allowlist, null, 2));
-      logger.info('dm_allowlist_list: wrote response');
-      break;
-    }
-
-    case 'canvas_update': {
-      const canvasDir = path.join(DATA_DIR, 'canvas', sourceGroup);
-      fs.mkdirSync(canvasDir, { recursive: true });
-
-      const canvasPath = path.join(canvasDir, 'canvas.json');
-      const eventsPath = path.join(canvasDir, 'events.json');
-
-      let state: {
-        id: string;
-        artifacts: Array<Record<string, unknown>>;
-        annotations: Array<Record<string, unknown>>;
-        viewport: { x: number; y: number; zoom: number };
-        lastUpdate: string;
-      } = {
-        id: sourceGroup,
-        artifacts: [],
-        annotations: [],
-        viewport: { x: 0, y: 0, zoom: 1 },
-        lastUpdate: '',
-      };
-      try {
-        if (fs.existsSync(canvasPath)) {
-          state = JSON.parse(fs.readFileSync(canvasPath, 'utf-8'));
-        }
-      } catch { /* fresh start */ }
-
-      const action = data.canvas_action as string;
-      let event: Record<string, unknown> | null = null;
-
-      if (action === 'add' && data.artifact) {
-        state.artifacts.push(data.artifact as Record<string, unknown>);
-        event = { type: 'artifact_add', artifact: data.artifact };
-      } else if (action === 'update' && data.artifactId && data.changes) {
-        const idx = state.artifacts.findIndex(
-          (a) => (a as { id: string }).id === data.artifactId,
-        );
-        if (idx >= 0) {
-          state.artifacts[idx] = {
-            ...state.artifacts[idx],
-            ...(data.changes as Record<string, unknown>),
-            updatedAt: new Date().toISOString(),
-          };
-          event = { type: 'artifact_update', artifactId: data.artifactId, changes: data.changes };
-        }
-      } else if (action === 'remove' && data.artifactId) {
-        state.artifacts = state.artifacts.filter(
-          (a) => (a as { id: string }).id !== data.artifactId,
-        );
-        event = { type: 'artifact_remove', artifactId: data.artifactId };
-      }
-
-      if (event) {
-        state.lastUpdate = new Date().toISOString();
-        fs.writeFileSync(canvasPath, JSON.stringify(state, null, 2));
-
-        let events: Array<Record<string, unknown>> = [];
-        try {
-          if (fs.existsSync(eventsPath)) {
-            events = JSON.parse(fs.readFileSync(eventsPath, 'utf-8'));
-          }
-        } catch { /* empty */ }
-        const seq = events.length > 0
-          ? ((events[events.length - 1].seq as number) || 0) + 1
-          : 1;
-        events.push({ ...event, timestamp: new Date().toISOString(), seq });
-        if (events.length > 100) events = events.slice(-100);
-        fs.writeFileSync(eventsPath, JSON.stringify(events));
-
-        logger.info({ sourceGroup, action, artifactId: data.artifactId }, 'Canvas update processed');
-      }
-      break;
-    }
-
-    case 'start_workflow': {
-      const wfData = data as {
-        workflowPath?: string;
-        taskDescription?: string;
-        chatJid?: string;
-        groupFolder?: string;
-      };
-      if (wfData.workflowPath && wfData.taskDescription) {
-        try {
-          const workflow = createWorkflow(
-            wfData.workflowPath,
-            wfData.taskDescription,
-            wfData.groupFolder || sourceGroup,
-            wfData.chatJid || '',
-          );
-          // Mark step 1 as in_progress
-          if (workflow.steps.length > 0) {
-            workflow.steps[0].status = 'in_progress';
-            workflow.steps[0].startedAt = new Date().toISOString();
-            saveWorkflow(workflow);
-          }
-          // Write response for the agent to read
-          const responsesDir = path.join(DATA_DIR, 'ipc', sourceGroup, 'responses');
-          fs.mkdirSync(responsesDir, { recursive: true });
-          const respFile = path.join(responsesDir, `workflow-${workflow.id}.json`);
-          fs.writeFileSync(respFile, JSON.stringify({
-            workflowId: workflow.id,
-            totalSteps: workflow.steps.length,
-            currentStep: 1,
-            firstStep: workflow.steps[0],
-          }));
-          logger.info({ workflowId: workflow.id, steps: workflow.steps.length }, 'Workflow created via IPC');
-        } catch (err) {
-          logger.error({ err }, 'Failed to create workflow');
-        }
-      }
-      break;
-    }
-
-    case 'advance_workflow': {
-      const advData = data as { workflowId?: string; stepOutput?: string };
-      if (advData.workflowId && advData.stepOutput) {
-        try {
-          const result = advanceWorkflow(advData.workflowId, advData.stepOutput);
-          if (result) {
-            if (result.nextStep) {
-              logger.info(
-                { workflowId: advData.workflowId, nextStep: result.nextStep.number },
-                'Workflow advanced',
-              );
-            } else {
-              logger.info({ workflowId: advData.workflowId }, 'Workflow completed');
-              // Send completion notification
-              if (result.state.chatJid) {
-                const mainJid = Object.entries(registeredGroups).find(
-                  ([, g]) => g.folder === MAIN_GROUP_FOLDER,
-                )?.[0];
-                if (mainJid) {
-                  await sendMessage(mainJid, `${ASSISTANT_NAME}: ✅ Workflow completed: ${result.state.taskDescription}`);
-                }
-              }
-            }
-          }
-        } catch (err) {
-          logger.error({ err, workflowId: advData.workflowId }, 'Failed to advance workflow');
-        }
-      }
-      break;
-    }
-
-    case 'block_workflow': {
-      const blockData = data as { workflowId?: string; reason?: string; findings?: string };
-      if (blockData.workflowId && blockData.reason) {
-        try {
-          const workflow = loadWorkflow(blockData.workflowId);
-          if (workflow) {
-            workflow.status = 'blocked';
-            const idx = workflow.currentStep - 1;
-            if (idx >= 0 && idx < workflow.steps.length) {
-              workflow.steps[idx].status = 'blocked';
-            }
-            saveWorkflow(workflow);
-
-            // Notify user via Telegram
-            const mainJid = Object.entries(registeredGroups).find(
-              ([, g]) => g.folder === MAIN_GROUP_FOLDER,
-            )?.[0];
-            if (mainJid) {
-              const msg = `${ASSISTANT_NAME}: ⚠️ Workflow blocked: ${workflow.taskDescription}\n\nStep ${workflow.currentStep}: ${workflow.steps[idx]?.title || 'unknown'}\nReason: ${blockData.reason}${blockData.findings ? `\nFindings: ${blockData.findings}` : ''}`;
-              await sendMessage(mainJid, msg);
-            }
-            logger.info({ workflowId: blockData.workflowId, reason: blockData.reason }, 'Workflow blocked');
-          }
-        } catch (err) {
-          logger.error({ err, workflowId: blockData.workflowId }, 'Failed to block workflow');
-        }
-      }
       break;
     }
 
     case 'request_approval':
-      if (data.chatJid && (data as { description?: string }).description) {
+      if (data.chatJid && data.description) {
         try {
           await processApprovalRequest(bot, {
-            requestId: (data as { requestId?: string }).requestId || `approval-${Date.now()}`,
+            requestId: data.requestId || `approval-${Date.now()}`,
             chatJid: data.chatJid,
-            description: (data as { description?: string }).description!,
-            approveLabel: (data as { approveLabel?: string }).approveLabel,
-            rejectLabel: (data as { rejectLabel?: string }).rejectLabel,
-            options: (data as { options?: string[] }).options,
-            ipcDir: (data as { ipcDir?: string }).ipcDir || path.join(DATA_DIR, 'ipc', sourceGroup),
+            description: data.description,
+            approveLabel: data.approveLabel,
+            rejectLabel: data.rejectLabel,
+            options: data.options,
+            ipcDir: data.ipcDir || path.join(DATA_DIR, 'ipc', sourceGroup),
             groupFolder: sourceGroup,
           });
         } catch (err) {
@@ -1635,16 +940,13 @@ function connectTelegram(): void {
 
   bot = new Bot(token);
 
-  // Register inline keyboard callback handler (for approval buttons)
   registerCallbackHandler(bot);
 
   bot.on('message', async (ctx) => {
     const msg = ctx.message;
 
-    // Dedup at intake — grammy may re-deliver messages on reconnect
     const intakeKey = `${msg.message_id}:${msg.chat.id}`;
     if (seenUpdateIds.has(intakeKey)) {
-      logger.debug({ messageId: msg.message_id, chatId: msg.chat.id }, 'Skipping duplicate Telegram message at intake');
       return;
     }
     seenUpdateIds.add(intakeKey);
@@ -1666,13 +968,11 @@ function connectTelegram(): void {
       [msg.chat.first_name, msg.chat.last_name].filter(Boolean).join(' ') ||
       String(chatId);
 
-    // DM allowlist gate: block unknown private chat users
-    // Positive chatId = private/DM chat. Negative = group/supergroup.
+    // DM allowlist gate
     if (chatId > 0 && !registeredGroups[jid]) {
       const userId = msg.from?.id;
       const allowlist = getDmAllowlist();
       if (userId && !allowlist.allowed_user_ids.includes(userId)) {
-        // Rate-limit rejection reply (once per hour per user)
         const now = Date.now();
         const lastReject = dmRejectTimes.get(userId) || 0;
         if (now - lastReject > 3_600_000) {
@@ -1682,12 +982,7 @@ function connectTelegram(): void {
             'This bot is private. Contact the owner for access.',
           );
         }
-        // Log to pending requests (once per user)
         addPendingRequest(userId, msg.from?.username, msg.from?.first_name);
-        logger.info(
-          { userId, username: msg.from?.username },
-          'Blocked DM from unknown user',
-        );
         return;
       }
     }
@@ -1738,8 +1033,6 @@ function connectTelegram(): void {
         } else {
           content = `${caption}\n\n[Uploaded file: ${fileName} - saved to uploads/${fileName}]`;
         }
-
-        logger.info({ fileName, finalPath }, 'File downloaded from Telegram');
       } catch (err) {
         logger.error({ err, fileName }, 'Failed to download file');
         content = `${caption}\n\n[Failed to download file: ${fileName}]`;
@@ -1748,11 +1041,11 @@ function connectTelegram(): void {
 
     // Handle photo messages
     if (msg.photo && msg.photo.length > 0 && registeredGroups[jid]) {
-      const group = registeredGroups[jid];
-      const largestPhoto = msg.photo[msg.photo.length - 1]; // Telegram sends multiple sizes, last is largest
+      const largestPhoto = msg.photo[msg.photo.length - 1];
       const caption = msg.caption || '';
 
       try {
+        const group = registeredGroups[jid];
         const uploadsDir = path.join(GROUPS_DIR, group.folder, 'uploads');
         fs.mkdirSync(uploadsDir, { recursive: true });
 
@@ -1763,10 +1056,8 @@ function connectTelegram(): void {
 
         const fileName = path.basename(downloadedPath);
         content = caption
-          ? `${caption}\n\n[Photo: uploads/${fileName} - saved to uploads/${fileName}]`
-          : `[Photo: uploads/${fileName} - saved to uploads/${fileName}]`;
-
-        logger.info({ fileName, downloadedPath, width: largestPhoto.width, height: largestPhoto.height }, 'Photo downloaded from Telegram');
+          ? `${caption}\n\n[Photo: uploads/${fileName}]`
+          : `[Photo: uploads/${fileName}]`;
       } catch (err) {
         logger.error({ err }, 'Failed to download photo');
         content = caption
@@ -1783,10 +1074,6 @@ function connectTelegram(): void {
         content = caption
           ? `${caption}\n\n[Voice: ${transcript}]`
           : `[Voice: ${transcript}]`;
-        logger.info(
-          { chatId, duration: msg.voice.duration, chars: transcript.length },
-          'Voice message transcribed',
-        );
       } catch (err) {
         logger.error({ err, chatId }, 'Voice transcription failed');
         content = '[Voice Message - transcription failed]';
@@ -1810,17 +1097,9 @@ function connectTelegram(): void {
         timestamp,
         isFromMe: msg.from?.id === botUserId,
       });
-
-      // KlawHQ: message received
-      wsBroadcast('message.received', {
-        groupId: registeredGroups[jid].folder,
-        text: content.slice(0, 200),
-        sender: senderName,
-      });
     }
   });
 
-  // grammy's bot.start() handles reconnection automatically — no manual retry logic needed
   bot.start({
     onStart: async (botInfo) => {
       botUserId = botInfo.id;
@@ -1837,19 +1116,13 @@ function connectTelegram(): void {
       startIpcWatcher();
       startMessageLoop();
 
-      // Periodic cleanup of stale inline keyboard approvals (every 5 min)
       setInterval(() => cleanupStaleApprovals(), 5 * 60 * 1000);
 
-      // Start browser daemon for persistent Playwright sessions
       startBrowserDaemon();
     },
   });
 }
 
-/**
- * Process a single message and handle post-processing state updates.
- * Extracted to share between direct dispatch and queue drain.
- */
 async function dispatchMessage(msg: NewMessage): Promise<void> {
   const dedupKey = `${msg.id}:${msg.chat_jid}`;
   try {
@@ -1868,10 +1141,6 @@ async function dispatchMessage(msg: NewMessage): Promise<void> {
   }
 }
 
-/**
- * Drain queued messages for a group after its agent finishes.
- * Processes all queued messages as a single batch (agent sees full context).
- */
 async function drainGroupQueue(groupFolder: string): Promise<void> {
   const queued = pendingGroupMessages.get(groupFolder);
   if (!queued || queued.length === 0) {
@@ -1880,9 +1149,7 @@ async function drainGroupQueue(groupFolder: string): Promise<void> {
     return;
   }
 
-  // Take the latest message — agent will pick up full history via getMessagesSince
   const latest = queued[queued.length - 1];
-  // Mark all queued as processed (they'll be in the agent's context window)
   for (const m of queued) {
     const dk = `${m.id}:${m.chat_jid}`;
     processedMessageIds.add(dk);
@@ -1893,56 +1160,8 @@ async function drainGroupQueue(groupFolder: string): Promise<void> {
   pendingGroupMessages.set(groupFolder, []);
   saveState();
 
-  // Process the latest message (agent reads full history)
   await dispatchMessage(latest);
-
-  // Recurse to drain any messages that arrived during this run
   await drainGroupQueue(groupFolder);
-}
-
-/**
- * Write a system status snapshot to the IPC directory for agents to read.
- * Shows currently running agents, queued messages, and active teams.
- */
-function writeStatusSnapshot(): void {
-  const statusFile = path.join(DATA_DIR, 'ipc', 'main', 'system_status.json');
-  const now = Date.now();
-
-  const activeAgentsList = Array.from(activeGroups).map((groupFolder) => {
-    const group = Object.values(registeredGroups).find(
-      (g) => g.folder === groupFolder,
-    );
-    return {
-      group: groupFolder,
-      name: group?.name || groupFolder,
-    };
-  });
-
-  const queuedMessagesList = Array.from(pendingGroupMessages.entries()).map(
-    ([groupFolder, msgs]) => ({
-      group: groupFolder,
-      count: msgs.length,
-    }),
-  );
-
-  const status = {
-    timestamp: new Date().toISOString(),
-    activeAgents: activeAgentsList,
-    queuedMessages: queuedMessagesList,
-    totalActiveAgents: activeAgentsList.length,
-    totalQueuedMessages: queuedMessagesList.reduce(
-      (sum, q) => sum + q.count,
-      0,
-    ),
-  };
-
-  try {
-    const dir = path.dirname(statusFile);
-    fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(statusFile, JSON.stringify(status, null, 2));
-  } catch {
-    // Non-critical — don't log on every poll
-  }
 }
 
 async function startMessageLoop(): Promise<void> {
@@ -1959,29 +1178,19 @@ async function startMessageLoop(): Promise<void> {
       for (const msg of messages) {
         const dedupKey = `${msg.id}:${msg.chat_jid}`;
         if (processedMessageIds.has(dedupKey)) {
-          logger.debug(
-            { msgId: msg.id, chatJid: msg.chat_jid },
-            'Skipping already-processed message (dedup)',
-          );
           lastTimestamp = msg.timestamp;
           saveState();
           continue;
         }
 
         if (inFlightMessages.has(dedupKey)) {
-          logger.debug(
-            { msgId: msg.id, chatJid: msg.chat_jid },
-            'Skipping in-flight message (agent still running)',
-          );
           continue;
         }
 
-        // Resolve group folder for per-group locking
         const group = registeredGroups[msg.chat_jid];
         const groupFolder = group?.folder || msg.chat_jid;
 
         if (activeGroups.has(groupFolder)) {
-          // Group agent is busy — queue this message
           logger.info(
             { group: groupFolder, msgId: msg.id },
             'Agent busy, queuing message',
@@ -1990,13 +1199,11 @@ async function startMessageLoop(): Promise<void> {
             pendingGroupMessages.set(groupFolder, []);
           }
           pendingGroupMessages.get(groupFolder)!.push(msg);
-          // Advance timestamp so we don't re-fetch this message next poll
           lastTimestamp = msg.timestamp;
           saveState();
           continue;
         }
 
-        // Lock group and dispatch without awaiting (fire-and-forget)
         activeGroups.add(groupFolder);
         dispatchMessage(msg)
           .then(() => drainGroupQueue(groupFolder))
@@ -2009,45 +1216,7 @@ async function startMessageLoop(): Promise<void> {
     } catch (err) {
       logger.error({ err }, 'Error in message loop');
     }
-    writeStatusSnapshot();
     await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL));
-  }
-}
-
-function ensureDockerRunning(): void {
-  try {
-    execSync('docker info', { stdio: 'pipe', timeout: 10000 });
-    logger.debug('Docker daemon is running');
-  } catch {
-    logger.error('Docker daemon is not running');
-    console.error(
-      '\n╔════════════════════════════════════════════════════════════════╗',
-    );
-    console.error(
-      '║  FATAL: Docker is not running                                  ║',
-    );
-    console.error(
-      '║                                                                ║',
-    );
-    console.error(
-      '║  Agents cannot run without Docker. To fix:                     ║',
-    );
-    console.error(
-      '║  macOS: Start Docker Desktop                                   ║',
-    );
-    console.error(
-      '║  Linux: sudo systemctl start docker                            ║',
-    );
-    console.error(
-      '║                                                                ║',
-    );
-    console.error(
-      '║  Install from: https://docker.com/products/docker-desktop      ║',
-    );
-    console.error(
-      '╚════════════════════════════════════════════════════════════════╝\n',
-    );
-    throw new Error('Docker is required but not running');
   }
 }
 
@@ -2074,12 +1243,8 @@ function ensureAgentRunnerExists(): void {
 }
 
 async function main(): Promise<void> {
-  if (EXECUTION_MODE === 'docker') {
-    ensureDockerRunning();
-  } else {
-    ensureAgentRunnerExists();
-  }
-  logger.info({ executionMode: EXECUTION_MODE }, 'Execution mode');
+  ensureAgentRunnerExists();
+  logger.info('Execution mode: local');
   initDatabase();
   logger.info('Database initialized');
 
@@ -2088,7 +1253,6 @@ async function main(): Promise<void> {
 
   loadState();
 
-  // Initialize fact extractor and middleware pipeline
   factExtractor = new FactExtractor(getDb());
   const services: MiddlewareServices = {
     getSessions: () => sessions,
@@ -2112,172 +1276,7 @@ async function main(): Promise<void> {
     memoryManager.watchGroup(group.folder);
   }
 
-  startTeamWatcher();
-
-  // Progress streamer: real-time specialist progress in Telegram (DeerFlow Phase 2)
-  const progressStreamer = new ProgressStreamer({
-    sendProgressMessage: async (jid, text) => {
-      try {
-        const chatId = jidToChatId(jid);
-        const msg = await bot.api.sendMessage(chatId, text);
-        return msg.message_id;
-      } catch (err) {
-        logger.debug({ jid, err }, 'Progress sendMessage failed');
-        return null;
-      }
-    },
-    editMessage: async (jid, messageId, text) => {
-      try {
-        const chatId = jidToChatId(jid);
-        await bot.api.editMessageText(chatId, messageId, text);
-      } catch (err) {
-        logger.debug({ jid, messageId, err }, 'editMessageText failed');
-      }
-    },
-    getTeammateInfo,
-  });
-  progressStreamer.start();
-
-  // KlawHQ WebSocket event server (optional — if port busy, continues without it)
-  try {
-    new KlawEventServer(18800);
-  } catch (err) {
-    logger.warn({ err }, 'Failed to start KlawHQ WebSocket server (non-fatal)');
-  }
-
   connectTelegram();
-
-  // Wire Discord pipeline callbacks then start the pipeline
-  wireDiscordCallbacks();
-
-  // Wire direct line: interactive Discord channels → agent → Discord response
-  const generalOpsId = process.env.DISCORD_CHANNEL_GENERAL;
-  if (generalOpsId) {
-    setGeneralOpsChannel(generalOpsId);
-
-    // Register #klaw as interactive (two-way, routed to main)
-    const klawDirectLineId = process.env.DISCORD_CHANNEL_KLAW;
-    if (klawDirectLineId) {
-      addInteractiveChannels([klawDirectLineId]);
-      logger.info({ klawDirectLineId }, 'Klaw direct line channel registered as interactive');
-    }
-
-    // Register Ideas channels as interactive (two-way)
-    const ideasChannels = [
-      process.env.DISCORD_CHANNEL_PIKA_TAMAGOTCHI,
-      process.env.DISCORD_CHANNEL_SPORTS_PERP,
-    ].filter(Boolean) as string[];
-    if (ideasChannels.length > 0) {
-      addInteractiveChannels(ideasChannels);
-      logger.info({ ideasChannels }, 'Ideas channels registered as interactive');
-    }
-
-    // Register Klaw Projects channels as interactive (two-way)
-    const klawProjectChannels = [
-      process.env.DISCORD_CHANNEL_BETTING_INTELLIGENCE,
-      process.env.DISCORD_CHANNEL_INFO_PRODUCT_FACTORY,
-      process.env.DISCORD_CHANNEL_OPENCLAW_FOOTBALL_SKILLS,
-    ].filter(Boolean) as string[];
-
-    // Register Betting Model channels as interactive (two-way)
-    const bettingModelChannels = [
-      process.env.DISCORD_CHANNEL_MODEL_DEVELOPMENT,
-      process.env.DISCORD_CHANNEL_VALUE_BETS,
-    ].filter(Boolean) as string[];
-    if (bettingModelChannels.length > 0) {
-      addInteractiveChannels(bettingModelChannels);
-      logger.info({ bettingModelChannels }, 'Betting Model channels registered as interactive');
-    }
-    if (klawProjectChannels.length > 0) {
-      addInteractiveChannels(klawProjectChannels);
-      logger.info({ klawProjectChannels }, 'Klaw Projects channels registered as interactive');
-    }
-
-    // Map Discord channel IDs to dedicated groups (falls back to main)
-    const discordChannelGroupMap: Record<string, string> = {};
-    const bettingModelChannelIds = [
-      process.env.DISCORD_CHANNEL_MODEL_DEVELOPMENT,
-      process.env.DISCORD_CHANNEL_VALUE_BETS,
-    ].filter(Boolean) as string[];
-    for (const chId of bettingModelChannelIds) {
-      discordChannelGroupMap[chId] = 'betting-model';
-    }
-
-    setDirectLineCallback(async (text: string, author: string, channelId: string) => {
-      // Resolve which group to route this channel to
-      const targetFolder = discordChannelGroupMap[channelId] || MAIN_GROUP_FOLDER;
-      const targetEntry = Object.entries(registeredGroups).find(
-        ([, g]) => g.folder === targetFolder,
-      );
-      // Fall back to main if the dedicated group isn't registered
-      const fallbackEntry = targetFolder !== MAIN_GROUP_FOLDER
-        ? Object.entries(registeredGroups).find(([, g]) => g.folder === MAIN_GROUP_FOLDER)
-        : null;
-      const [targetJid, targetGroup] = targetEntry || fallbackEntry || [null, null];
-      if (!targetJid || !targetGroup) return null;
-
-      // Store the Discord message in our DB so it shows in history
-      const msgId = `discord-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      const timestamp = new Date().toISOString();
-      // Ensure the chat row exists (Discord groups may not have been synced into chats table)
-      storeChatMetadata(targetJid, timestamp, targetGroup.name);
-      storeMessage({
-        id: msgId,
-        chatJid: targetJid,
-        sender: author,
-        senderName: author,
-        content: text,
-        timestamp,
-        isFromMe: false,
-      });
-
-      // Mark as processed so the message loop doesn't pick it up and send to Telegram
-      const dedupKey = `${msgId}:${targetJid}`;
-      processedMessageIds.add(dedupKey);
-      inFlightMessages.add(dedupKey);
-
-      // Format and run through the agent (same as Telegram message processing)
-      const prompt = `<messages>\n<message sender="${author}" time="${timestamp}">${text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</message>\n</messages>`;
-      const rawResponse = await runAgent(targetGroup, prompt, targetJid, { sourceChannel: 'discord' });
-
-      // Strip <internal> and <handoff> tags — only return user-facing content
-      const response = rawResponse
-        ? rawResponse
-            .replace(/<internal>[\s\S]*?<\/internal>/g, '')
-            .replace(/<handoff>[\s\S]*?<\/handoff>/g, '')
-            .trim()
-        : null;
-
-      // Store the response
-      if (rawResponse) {
-        storeMessage({
-          id: `discord-resp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-          chatJid: targetJid,
-          sender: ASSISTANT_NAME,
-          senderName: ASSISTANT_NAME,
-          content: rawResponse,
-          timestamp: new Date().toISOString(),
-          isFromMe: true,
-        });
-      }
-
-      inFlightMessages.delete(dedupKey);
-      return response || null;
-    });
-    logger.info('Discord direct line wired with channel-to-group routing');
-  }
-
-  startDiscordPipeline()
-    .then(() => {
-      // Initialize extended channels using the Klaw bot client
-      const klawClient = getKlawClient();
-      if (klawClient) {
-        initExtendedChannels(klawClient);
-      }
-    })
-    .catch((err) => {
-      logger.error({ err }, 'Discord pipeline failed to start (non-fatal)');
-    });
 }
 
 main().catch((err) => {

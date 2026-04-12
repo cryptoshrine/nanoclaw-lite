@@ -1,7 +1,6 @@
 /**
- * Local Runner for NanoClaw
- * Spawns agent-runner as a direct Node.js child process (no Docker).
- * Mirrors container-runner.ts behavior but without Docker overhead.
+ * Local Runner for NanoClaw Lite
+ * Spawns agent-runner as a direct Node.js child process.
  */
 import { spawn } from 'child_process';
 import fs from 'fs';
@@ -12,95 +11,22 @@ import {
   CONTAINER_MAX_OUTPUT_SIZE,
   CONTAINER_TIMEOUT,
   DATA_DIR,
-  DEFAULT_TEAMMATE_MODEL,
   GROUPS_DIR,
   PROJECT_ROOT,
-  TEAM_DIR,
-  TEAMMATE_TIMEOUT,
-  TEAMMATE_GRACE_PERIOD,
 } from './config.js';
-import { ContainerInput, ContainerOutput, TeammateContainerInput } from './container-runner.js';
+import { ContainerInput, ContainerOutput } from './container-runner.js';
 import { logger } from './logger.js';
-import { startHeartbeat, stopHeartbeat } from './omx-heartbeat.js';
-import { broadcast as wsBroadcast } from './ws-server.js';
 import { RegisteredGroup } from './types.js';
 
 // Sentinel markers for robust output parsing (must match agent-runner)
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
 const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
 
-// Stream chunk sentinels (must match agent-runner)
-const STREAM_CHUNK_MARKER = '---NANOCLAW_STREAM_CHUNK---';
-const STREAM_CHUNK_END = '---NANOCLAW_STREAM_END---';
-
-/**
- * Per-process partial buffer for stream chunks that may span data events.
- * Keyed by a unique run identifier (group folder is sufficient since only one
- * agent runs per group at a time).
- */
-const streamPartials = new Map<string, string>();
-
-/**
- * Extract and process stream chunks from a raw stdout data string.
- * Returns the data with stream chunks removed (so they don't pollute the output buffer).
- * Handles chunks that span multiple data events via a partial buffer.
- */
-function extractStreamChunks(data: string, groupId: string): string {
-  // Prepend any partial data from a previous event
-  const partial = streamPartials.get(groupId) || '';
-  let combined = partial + data;
-  streamPartials.delete(groupId);
-
-  let cleanData = '';
-  let cursor = 0;
-
-  while (cursor < combined.length) {
-    const startIdx = combined.indexOf(STREAM_CHUNK_MARKER, cursor);
-
-    if (startIdx === -1) {
-      // No more markers — rest is clean data
-      cleanData += combined.slice(cursor);
-      break;
-    }
-
-    // Add everything before the marker to clean data
-    cleanData += combined.slice(cursor, startIdx);
-
-    const endIdx = combined.indexOf(STREAM_CHUNK_END, startIdx);
-    if (endIdx === -1) {
-      // Incomplete chunk — save as partial for next data event
-      streamPartials.set(groupId, combined.slice(startIdx));
-      break;
-    }
-
-    // Complete chunk found — broadcast it
-    const chunkText = combined.slice(startIdx + STREAM_CHUNK_MARKER.length, endIdx);
-    if (chunkText.length > 0) {
-      wsBroadcast('chat.stream', {
-        groupId,
-        text: chunkText.slice(0, 500),
-        role: 'assistant',
-        delta: true,
-      });
-    }
-
-    cursor = endIdx + STREAM_CHUNK_END.length;
-    // Skip trailing newline from console.log
-    if (cursor < combined.length && combined[cursor] === '\n') cursor++;
-  }
-
-  return cleanData;
-}
-
 const ALLOWED_ENV_VARS = ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY', 'GITHUB_TOKEN', 'ZAPIER_MCP_TOKEN'];
 
 /**
- * Progressive skill loading: instead of copying full skill files (~500K+),
- * generate lightweight stubs with just frontmatter. The agent reads the
- * full skill on demand via the Read tool when it needs to invoke one.
- *
- * Stub format preserves the YAML frontmatter (name, description, triggers)
- * and appends a pointer to the full file path.
+ * Progressive skill loading: generate lightweight stubs with just frontmatter.
+ * The agent reads the full skill on demand via the Read tool.
  */
 function syncSkillStubs(sourceDir: string, targetDir: string): void {
   fs.mkdirSync(targetDir, { recursive: true });
@@ -110,7 +36,6 @@ function syncSkillStubs(sourceDir: string, targetDir: string): void {
     const stat = fs.statSync(srcPath);
 
     if (stat.isDirectory()) {
-      // Skill in a subdirectory — find the .md file inside
       const mdFiles = fs.readdirSync(srcPath).filter(f => f.endsWith('.md'));
       if (mdFiles.length === 0) continue;
 
@@ -123,7 +48,6 @@ function syncSkillStubs(sourceDir: string, targetDir: string): void {
       fs.mkdirSync(targetSubDir, { recursive: true });
       fs.writeFileSync(path.join(targetSubDir, mdFile), stub);
     } else if (entry.endsWith('.md')) {
-      // Skill as a standalone .md file
       const content = fs.readFileSync(srcPath, 'utf-8');
       const stub = generateSkillStub(content, srcPath);
       fs.writeFileSync(path.join(targetDir, entry), stub);
@@ -131,25 +55,15 @@ function syncSkillStubs(sourceDir: string, targetDir: string): void {
   }
 }
 
-/**
- * Extract YAML frontmatter and generate a stub.
- * If no frontmatter exists, copy the first 500 chars as-is.
- */
 function generateSkillStub(content: string, fullPath: string): string {
   const fmMatch = content.match(/^---\n([\s\S]*?)\n---/);
   if (fmMatch) {
-    // Preserve full frontmatter, replace body with pointer
     return `${fmMatch[0]}\n\n<!-- Full skill content available at: ${fullPath} -->\n<!-- Use the Read tool to load the full skill when you need to invoke it. -->\n`;
   }
-
-  // No frontmatter — keep first 500 chars as context
   const preview = content.slice(0, 500);
   return `${preview}\n\n<!-- Full skill content available at: ${fullPath} -->\n<!-- Use the Read tool to load the full skill when you need to invoke it. -->\n`;
 }
 
-/**
- * Read allowed env vars from .env file, returning them as a record.
- */
 function loadAllowedEnvVars(): Record<string, string> {
   const envFile = path.join(PROJECT_ROOT, '.env');
   const vars: Record<string, string> = {};
@@ -171,11 +85,7 @@ function loadAllowedEnvVars(): Record<string, string> {
   return vars;
 }
 
-/**
- * Parse structured output from the agent-runner stdout using sentinel markers.
- */
 function parseAgentOutput(stdout: string, code: number | null, stderr: string): ContainerOutput {
-  // Try to extract structured output via sentinel markers
   const startIdx = stdout.indexOf(OUTPUT_START_MARKER);
   const endIdx = stdout.indexOf(OUTPUT_END_MARKER);
 
@@ -188,7 +98,6 @@ function parseAgentOutput(stdout: string, code: number | null, stderr: string): 
     }
   }
 
-  // Fallback: try last line (backwards compatibility)
   if (code === 0) {
     try {
       const lines = stdout.trim().split('\n');
@@ -217,27 +126,21 @@ export async function runLocalAgent(
   const groupDir = path.join(GROUPS_DIR, group.folder);
   fs.mkdirSync(groupDir, { recursive: true });
 
-  // Per-group IPC directory
   const groupIpcDir = path.join(DATA_DIR, 'ipc', group.folder);
   fs.mkdirSync(path.join(groupIpcDir, 'messages'), { recursive: true });
   fs.mkdirSync(path.join(groupIpcDir, 'tasks'), { recursive: true });
   fs.mkdirSync(path.join(groupIpcDir, 'memory'), { recursive: true });
 
-  // Per-group sessions directory (HOME for Claude SDK)
   const groupSessionsDir = path.join(DATA_DIR, 'sessions', group.folder);
   const groupClaudeDir = path.join(groupSessionsDir, '.claude');
   fs.mkdirSync(groupClaudeDir, { recursive: true });
 
-  // Progressive skill loading: generate lightweight stubs instead of
-  // copying full skill files. Saves ~500K+ of context per session.
-  // The agent reads the full skill file on demand when it needs to use it.
   const projectSkillsDir = path.join(PROJECT_ROOT, '.claude', 'skills');
   const sessionSkillsDir = path.join(groupClaudeDir, 'skills');
   if (fs.existsSync(projectSkillsDir)) {
     syncSkillStubs(projectSkillsDir, sessionSkillsDir);
   }
 
-  // Build environment: inherit full host env, then override specifics
   const envVars = loadAllowedEnvVars();
   const childEnv: Record<string, string | undefined> = {
     ...process.env,
@@ -284,10 +187,7 @@ export async function runLocalAgent(
 
     child.stdout.on('data', (data) => {
       if (stdoutTruncated) return;
-      let chunk = data.toString();
-
-      // Extract and broadcast stream chunks before buffering
-      chunk = extractStreamChunks(chunk, group.folder);
+      const chunk = data.toString();
 
       const remaining = CONTAINER_MAX_OUTPUT_SIZE - stdout.length;
       if (chunk.length > remaining) {
@@ -301,9 +201,6 @@ export async function runLocalAgent(
         stdout += chunk;
       }
 
-      // Once we see a complete output block (start + end markers), signal the
-      // agent to exit by writing the _close sentinel to its IPC input dir.
-      // Without this the agent loops forever waiting for more IPC messages.
       if (!closeSent && stdout.includes(OUTPUT_START_MARKER) && stdout.includes(OUTPUT_END_MARKER)) {
         closeSent = true;
         try {
@@ -327,10 +224,6 @@ export async function runLocalAgent(
       if (chunk.length > remaining) {
         stderr += chunk.slice(0, remaining);
         stderrTruncated = true;
-        logger.warn(
-          { group: group.name, size: stderr.length },
-          'Local agent stderr truncated due to size limit',
-        );
       } else {
         stderr += chunk;
       }
@@ -341,18 +234,12 @@ export async function runLocalAgent(
       logger.error({ group: group.name }, 'Local agent timeout, killing');
       timedOut = true;
       child.kill('SIGKILL');
-      // Don't resolve here — let child.on('close') handle it so we can
-      // attempt to parse any stdout that was already written before the kill.
     }, group.containerConfig?.timeout || CONTAINER_TIMEOUT);
 
     child.on('close', (code) => {
       clearTimeout(timeout);
       const duration = Date.now() - startTime;
 
-      // Clean up stream partial buffer
-      streamPartials.delete(group.folder);
-
-      // Write log file
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
       const logFile = path.join(logsDir, `local-${timestamp}.log`);
       const isVerbose =
@@ -365,8 +252,6 @@ export async function runLocalAgent(
         `IsMain: ${input.isMain}`,
         `Duration: ${duration}ms`,
         `Exit Code: ${code}`,
-        `Stdout Truncated: ${stdoutTruncated}`,
-        `Stderr Truncated: ${stderrTruncated}`,
         ``,
       ];
 
@@ -375,10 +260,10 @@ export async function runLocalAgent(
           `=== Input ===`,
           JSON.stringify(input, null, 2),
           ``,
-          `=== Stderr${stderrTruncated ? ' (TRUNCATED)' : ''} ===`,
+          `=== Stderr ===`,
           stderr,
           ``,
-          `=== Stdout${stdoutTruncated ? ' (TRUNCATED)' : ''} ===`,
+          `=== Stdout ===`,
           stdout,
         );
       } else {
@@ -399,17 +284,10 @@ export async function runLocalAgent(
       }
 
       fs.writeFileSync(logFile, logLines.join('\n'));
-      logger.debug({ logFile, verbose: isVerbose }, 'Local agent log written');
 
       if (code !== 0) {
         logger.error(
-          {
-            group: group.name,
-            code,
-            duration,
-            stderr: stderr.slice(-500),
-            logFile,
-          },
+          { group: group.name, code, duration, stderr: stderr.slice(-500), logFile },
           'Local agent exited with error',
         );
       } else {
@@ -419,11 +297,8 @@ export async function runLocalAgent(
         );
       }
 
-      // Try to parse stdout even if killed by timeout — agent may have already
-      // written its response before entering the idle IPC wait loop.
       const parsed = parseAgentOutput(stdout, code, stderr);
       if (timedOut && parsed.status === 'error') {
-        // Timeout killed the process but no parseable output — genuine timeout.
         resolve({
           status: 'error',
           result: null,
@@ -441,237 +316,6 @@ export async function runLocalAgent(
         status: 'error',
         result: null,
         error: `Local agent spawn error: ${err.message}`,
-      });
-    });
-  });
-}
-
-export async function runLocalTeammate(
-  input: TeammateContainerInput,
-): Promise<ContainerOutput> {
-  const startTime = Date.now();
-
-  // Team shared workspace
-  const teamDir = path.join(TEAM_DIR, input.teamId);
-  fs.mkdirSync(teamDir, { recursive: true });
-
-  // Lead group folder for context
-  const leadGroupDir = path.join(GROUPS_DIR, input.leadGroup);
-
-  // Teammate-specific sessions directory (HOME for Claude SDK)
-  const teammateSessionsDir = path.join(DATA_DIR, 'sessions', 'teammates', input.memberId);
-  const teammateClaudeDir = path.join(teammateSessionsDir, '.claude');
-  fs.mkdirSync(teammateClaudeDir, { recursive: true });
-
-  // Progressive skill loading for teammates
-  const projectSkillsDir = path.join(PROJECT_ROOT, '.claude', 'skills');
-  const sessionSkillsDir = path.join(teammateClaudeDir, 'skills');
-  if (fs.existsSync(projectSkillsDir)) {
-    syncSkillStubs(projectSkillsDir, sessionSkillsDir);
-  }
-
-  // Teammate IPC namespace
-  const teammateIpcDir = path.join(DATA_DIR, 'ipc', 'teammates', input.memberId);
-  fs.mkdirSync(path.join(teammateIpcDir, 'messages'), { recursive: true });
-  fs.mkdirSync(path.join(teammateIpcDir, 'tasks'), { recursive: true });
-
-  // Build environment: inherit full host env, then override specifics
-  const envVars = loadAllowedEnvVars();
-  const childEnv: Record<string, string | undefined> = {
-    ...process.env,
-    ...envVars,
-    NANOCLAW_IPC_DIR: teammateIpcDir,
-    NANOCLAW_GROUP_DIR: leadGroupDir,
-    NANOCLAW_TEAM_DIR: teamDir,
-    NANOCLAW_PROJECT_DIR: PROJECT_ROOT,
-    NANOCLAW_CHAT_JID: input.chatJid || '',
-    NANOCLAW_SOURCE_CHANNEL: input.sourceChannel || 'telegram',
-    NANOCLAW_MODEL: input.model || process.env.NANOCLAW_MODEL || DEFAULT_TEAMMATE_MODEL,
-    HOME: teammateSessionsDir,
-    USERPROFILE: teammateSessionsDir,
-  };
-
-  // Prepare teammate-specific input
-  const childInput = {
-    prompt: input.prompt,
-    groupFolder: input.leadGroup,
-    chatJid: input.chatJid || '', // Pass chatJid so teammate can send messages to originating chat
-    isMain: false,
-    isTeammate: true,
-    teamId: input.teamId,
-    memberId: input.memberId,
-    memberName: input.memberName,
-    teammateModel: input.model,
-    sourceChannel: input.sourceChannel || 'telegram',
-  };
-
-  logger.info(
-    {
-      memberId: input.memberId,
-      teamId: input.teamId,
-      name: input.memberName,
-    },
-    'Spawning local teammate',
-  );
-
-  const logsDir = path.join(TEAM_DIR, input.teamId, 'logs');
-  fs.mkdirSync(logsDir, { recursive: true });
-
-  return new Promise((resolve) => {
-    const child = spawn('node', [AGENT_RUNNER_ENTRY], {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      cwd: teamDir,
-      env: childEnv,
-    });
-
-    // Start heartbeat monitoring for this teammate
-    try {
-      startHeartbeat(input.memberId, 'teammate');
-    } catch (err) {
-      logger.warn({ memberId: input.memberId, err }, 'Failed to start heartbeat');
-    }
-
-    let stdout = '';
-    let stderr = '';
-    let stdoutTruncated = false;
-    let stderrTruncated = false;
-
-    child.stdin.write(JSON.stringify(childInput));
-    child.stdin.end();
-
-    child.stdout.on('data', (data) => {
-      if (stdoutTruncated) return;
-      const chunk = data.toString();
-      const remaining = CONTAINER_MAX_OUTPUT_SIZE - stdout.length;
-      if (chunk.length > remaining) {
-        stdout += chunk.slice(0, remaining);
-        stdoutTruncated = true;
-        logger.warn(
-          { memberId: input.memberId, size: stdout.length },
-          'Local teammate stdout truncated',
-        );
-      } else {
-        stdout += chunk;
-      }
-    });
-
-    child.stderr.on('data', (data) => {
-      const chunk = data.toString();
-      const lines = chunk.trim().split('\n');
-      for (const line of lines) {
-        if (line) logger.debug({ teammate: input.memberName }, line);
-      }
-      if (stderrTruncated) return;
-      const remaining = CONTAINER_MAX_OUTPUT_SIZE - stderr.length;
-      if (chunk.length > remaining) {
-        stderr += chunk.slice(0, remaining);
-        stderrTruncated = true;
-      } else {
-        stderr += chunk;
-      }
-    });
-
-    let timedOut = false;
-    let graceTimeout: ReturnType<typeof setTimeout> | undefined;
-    const effectiveTimeout = input.timeout || TEAMMATE_TIMEOUT;
-    const timeout = setTimeout(() => {
-      logger.error({ memberId: input.memberId, effectiveTimeout }, 'Local teammate timeout — attempting graceful shutdown');
-      timedOut = true;
-
-      // Phase 1: Write _close sentinel for graceful exit
-      const teammateIpcInputDir = path.join(DATA_DIR, 'ipc', 'teammates', input.memberId, 'input');
-      try {
-        fs.mkdirSync(teammateIpcInputDir, { recursive: true });
-        fs.writeFileSync(path.join(teammateIpcInputDir, '_close'), '');
-        logger.info({ memberId: input.memberId }, 'Wrote _close sentinel for graceful timeout exit');
-      } catch (err) {
-        logger.warn({ memberId: input.memberId, err }, 'Failed to write _close sentinel on timeout');
-      }
-
-      // Phase 2: SIGKILL after grace period if process hasn't exited
-      graceTimeout = setTimeout(() => {
-        logger.error({ memberId: input.memberId }, 'Grace period expired, force-killing teammate');
-        child.kill('SIGKILL');
-      }, TEAMMATE_GRACE_PERIOD);
-    }, effectiveTimeout);
-
-    child.on('close', (code) => {
-      clearTimeout(timeout);
-      if (graceTimeout) clearTimeout(graceTimeout);
-      const duration = Date.now() - startTime;
-
-      // Stop heartbeat monitoring (covers normal exit, error, timeout, and signal kill)
-      try {
-        stopHeartbeat(input.memberId);
-      } catch {
-        // Best-effort — don't block process cleanup
-      }
-
-      // Write log file
-      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-      const logFile = path.join(logsDir, `teammate-${input.memberName}-${timestamp}.log`);
-
-      const logLines = [
-        `=== Local Teammate Log ===`,
-        `Timestamp: ${new Date().toISOString()}`,
-        `Team: ${input.teamId}`,
-        `Member: ${input.memberName} (${input.memberId})`,
-        `Duration: ${duration}ms`,
-        `Exit Code: ${code}`,
-        `Timed Out: ${timedOut}`,
-        `Effective Timeout: ${effectiveTimeout}ms`,
-        ``,
-        `=== Stderr ===`,
-        stderr.slice(-2000),
-        ``,
-        `=== Stdout ===`,
-        stdout.slice(-2000),
-      ];
-
-      fs.writeFileSync(logFile, logLines.join('\n'));
-
-      if (code !== 0) {
-        logger.error(
-          {
-            memberId: input.memberId,
-            code,
-            duration,
-            timedOut,
-            effectiveTimeout,
-            stderr: stderr.slice(-500),
-          },
-          'Local teammate exited with error',
-        );
-      } else {
-        logger.info(
-          { memberId: input.memberId, duration },
-          'Local teammate completed',
-        );
-      }
-
-      // Try to parse stdout even if killed by timeout — agent may have
-      // already written its response before entering the idle IPC wait loop.
-      const parsed = parseAgentOutput(stdout, code, stderr);
-      if (timedOut && parsed.status === 'error') {
-        resolve({
-          status: 'error',
-          result: null,
-          error: `Local teammate timed out after ${effectiveTimeout}ms`,
-        });
-      } else {
-        resolve(parsed);
-      }
-    });
-
-    child.on('error', (err) => {
-      clearTimeout(timeout);
-      // Stop heartbeat on spawn failure
-      try { stopHeartbeat(input.memberId); } catch { /* best-effort */ }
-      logger.error({ memberId: input.memberId, error: err }, 'Local teammate spawn error');
-      resolve({
-        status: 'error',
-        result: null,
-        error: `Local teammate spawn error: ${err.message}`,
       });
     });
   });

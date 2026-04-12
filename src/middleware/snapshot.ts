@@ -37,12 +37,10 @@ export function createSnapshotMiddleware(services: MiddlewareServices): Middlewa
         );
 
         const availableGroups = services.getAvailableGroups();
-        const registeredJids = new Set(Object.keys(services.getRegisteredGroups()));
         writeGroupsSnapshot(
           ctx.group.folder,
           ctx.isMain,
           availableGroups,
-          registeredJids,
         );
       } catch (err) {
         logger.warn({ group: ctx.group.name, err }, 'Snapshot write failed (non-fatal)');

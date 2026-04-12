@@ -10,7 +10,7 @@
  *
  * Stdout protocol:
  *   Each result is wrapped in OUTPUT_START_MARKER / OUTPUT_END_MARKER pairs.
- *   Multiple results may be emitted (one per agent teams result).
+ *   Multiple results may be emitted (one per multi-turn result).
  *   Final marker after loop ends signals completion.
  */
 
@@ -27,7 +27,7 @@ interface ContainerInput {
   chatJid: string;
   isMain: boolean;
   isScheduledTask?: boolean;
-  sourceChannel?: 'telegram' | 'discord';
+  sourceChannel?: string;
   secrets?: Record<string, string>;
 }
 
@@ -61,7 +61,6 @@ interface SDKUserMessage {
 const GROUP_DIR = process.env.NANOCLAW_GROUP_DIR || '/workspace/group';
 const IPC_BASE_DIR = process.env.NANOCLAW_IPC_DIR || '/workspace/ipc';
 const PROJECT_DIR = process.env.NANOCLAW_PROJECT_DIR || '/workspace/project';
-const TEAM_DIR = process.env.NANOCLAW_TEAM_DIR || '';
 const MODEL = process.env.NANOCLAW_MODEL || 'claude-sonnet-4-6';
 
 const IPC_INPUT_DIR = path.join(IPC_BASE_DIR, 'input');
@@ -782,12 +781,6 @@ async function runQuery(
       }
     }
   }
-  // Shared workspace: let specialists access the team dir alongside the lead's group dir.
-  // CWD is already GROUP_DIR (lead's files), so adding TEAM_DIR gives read/write to shared workspace.
-  if (TEAM_DIR && fs.existsSync(TEAM_DIR)) {
-    extraDirs.push(TEAM_DIR);
-    log(`Shared workspace added: ${TEAM_DIR}`);
-  }
   if (extraDirs.length > 0) {
     log(`Additional directories: ${extraDirs.join(', ')}`);
   }
@@ -817,7 +810,6 @@ async function runQuery(
         'Read', 'Write', 'Edit', 'Glob', 'Grep',
         'WebSearch', 'WebFetch',
         'Task', 'TaskOutput', 'TaskStop',
-        'TeamCreate', 'TeamDelete', 'SendMessage',
         'TodoWrite', 'ToolSearch', 'Skill',
         'NotebookEdit',
         'mcp__nanoclaw__*',

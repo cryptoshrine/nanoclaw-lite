@@ -16,6 +16,11 @@
       "description": "Gmail MCP — read, send, search, draft, label, and manage emails via Google Gmail API",
       "command": "npx",
       "args": ["@dev-hitesh-gupta/gmail-mcp-server"]
+    },
+    "chrome-devtools": {
+      "description": "Chrome DevTools MCP — browser automation, debugging, screenshots, Lighthouse audits, network inspection",
+      "command": "npx",
+      "args": ["chrome-devtools-mcp@latest", "--no-performance-crux", "--no-usage-statistics"]
     }
   }
 }

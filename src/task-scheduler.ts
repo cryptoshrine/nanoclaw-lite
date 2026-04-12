@@ -21,19 +21,6 @@ import {
 } from './db.js';
 import { logger } from './logger.js';
 import { RegisteredGroup, ScheduledTask } from './types.js';
-import {
-  postDailyDigest,
-  postToProject,
-  postToMissionControl,
-} from './discord-channels.js';
-import { checkAndScheduleWorkflowContinuation } from './workflow-engine.js';
-import { broadcast as wsBroadcast } from './ws-server.js';
-import { runOmxSupervisor } from './omx-supervisor.js';
-
-// OmX v2: Event system (guarded import)
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-let emitOmxEvent: ((...args: any[]) => any) | null = null;
-try { const m = await import('./omx-events.js'); emitOmxEvent = m.emitEvent; } catch { /* omx-events not available */ }
 
 export interface SchedulerDependencies {
   sendMessage: (jid: string, text: string) => Promise<void>;
@@ -43,14 +30,11 @@ export interface SchedulerDependencies {
 
 /**
  * Calculate exponential backoff delay for retries.
- * Retry 1: 1 minute
- * Retry 2: 5 minutes
- * Retry 3: 15 minutes
  */
 function calculateBackoffDelay(retryCount: number): number {
   const delays = [
-    60 * 1000, // 1 minute
-    5 * 60 * 1000, // 5 minutes
+    60 * 1000,      // 1 minute
+    5 * 60 * 1000,  // 5 minutes
     15 * 60 * 1000, // 15 minutes
   ];
   return delays[Math.min(retryCount, delays.length - 1)];
@@ -68,12 +52,6 @@ async function runTask(
     { taskId: task.id, group: task.group_folder },
     'Running scheduled task',
   );
-
-  wsBroadcast('task.running', {
-    taskId: task.id,
-    group: task.group_folder,
-    prompt: task.prompt.slice(0, 200),
-  });
 
   const groups = deps.registeredGroups();
   const group = Object.values(groups).find(
@@ -163,7 +141,6 @@ async function runTask(
     const maxRetries = task.max_retries || 3;
 
     if (currentRetry < maxRetries) {
-      // Schedule retry with exponential backoff
       const backoffDelay = calculateBackoffDelay(currentRetry);
       const retryTime = new Date(Date.now() + backoffDelay).toISOString();
       const newRetryCount = currentRetry + 1;
@@ -180,14 +157,6 @@ async function runTask(
 
       updateTaskRetry(task.id, newRetryCount, retryTime, error);
 
-      wsBroadcast('task.completed', {
-        taskId: task.id,
-        status: 'retry',
-        retry: newRetryCount,
-        maxRetries,
-      });
-
-      // Notify user about retry
       try {
         await deps.sendMessage(
           task.chat_jid,
@@ -198,7 +167,6 @@ async function runTask(
       }
       return;
     } else {
-      // Max retries exceeded, mark as failed
       logger.error(
         { taskId: task.id, retries: currentRetry },
         'Task failed after max retries',
@@ -206,12 +174,6 @@ async function runTask(
 
       markTaskFailed(task.id, error);
 
-      wsBroadcast('task.completed', {
-        taskId: task.id,
-        status: 'failed',
-      });
-
-      // Notify user about permanent failure
       try {
         await deps.sendMessage(
           task.chat_jid,
@@ -239,44 +201,6 @@ async function runTask(
 
   const resultSummary = result ? result.slice(0, 200) : 'Completed';
   updateTaskAfterRun(task.id, nextRun, resultSummary);
-
-  wsBroadcast('task.completed', {
-    taskId: task.id,
-    status: 'success',
-    durationMs,
-  });
-
-  // Route task results to Discord channels based on prompt content
-  if (result) {
-    const promptLower = task.prompt.toLowerCase();
-    try {
-      if (promptLower.includes('heartbeat') || promptLower.includes('morning brief') || promptLower.includes('daily digest')) {
-        postDailyDigest(result).catch((err) =>
-          logger.error({ err }, 'Failed to post daily digest to Discord'),
-        );
-      }
-      if (promptLower.includes('bet value') || promptLower.includes('betting') || promptLower.includes('oddsportal')) {
-        postToProject('betting-signals', 'Betting Pipeline Result', result).catch((err) =>
-          logger.error({ err }, 'Failed to post betting signals to Discord'),
-        );
-      }
-    } catch (err) {
-      logger.error({ err }, 'Error routing task result to Discord');
-    }
-  }
-
-  // Auto-continue any active workflows for this group
-  try {
-    const continued = checkAndScheduleWorkflowContinuation(task.group_folder, task.chat_jid);
-    if (continued > 0) {
-      logger.info(
-        { taskId: task.id, groupFolder: task.group_folder, continued },
-        'Scheduled workflow continuation after task completed',
-      );
-    }
-  } catch (err) {
-    logger.error({ err, taskId: task.id }, 'Failed to check workflow continuation');
-  }
 }
 
 export function startSchedulerLoop(deps: SchedulerDependencies): void {
@@ -290,7 +214,6 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
       }
 
       for (const task of dueTasks) {
-        // Re-check task status in case it was paused/cancelled/failed
         const currentTask = getTaskById(task.id);
         if (
           !currentTask ||
@@ -299,7 +222,6 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
           continue;
         }
 
-        // Skip permanently failed tasks (status='failed' means max retries exceeded)
         if (currentTask.status === 'failed') {
           continue;
         }
@@ -308,20 +230,6 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
       }
     } catch (err) {
       logger.error({ err }, 'Error in scheduler loop');
-    }
-
-    // Run OmX supervisor tick (checks active autonomous workflows)
-    try {
-      await runOmxSupervisor(deps.sendMessage);
-      // OmX v2: Emit supervisor.tick event for observability
-      if (emitOmxEvent) {
-        try { emitOmxEvent('_system', 'supervisor.tick' as never, { timestamp: new Date().toISOString() }); } catch { /* non-critical */ }
-      }
-    } catch (err) {
-      logger.error({ err }, 'Error in OmX supervisor tick');
-      if (emitOmxEvent) {
-        try { emitOmxEvent('_system', 'supervisor.error' as never, { error: String(err) }); } catch { /* non-critical */ }
-      }
     }
 
     setTimeout(loop, SCHEDULER_POLL_INTERVAL);

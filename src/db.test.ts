@@ -150,32 +150,35 @@ describe('getMessagesSince', () => {
 
   it('returns messages after the given timestamp', () => {
     const msgs = getMessagesSince('group@g.us', '2024-01-01T00:00:02.000Z', 'Andy');
-    // Should exclude m1, m2 (before/at timestamp), m3 (bot message)
-    expect(msgs).toHaveLength(1);
-    expect(msgs[0].content).toBe('third');
+    // Should exclude m1, m2 (before/at timestamp). Includes m3 (bot) + m4 (user)
+    expect(msgs).toHaveLength(2);
+    expect(msgs[0].content).toBe('Andy: bot reply');
+    expect(msgs[1].content).toBe('third');
   });
 
-  it('excludes bot messages via content prefix', () => {
+  it('includes bot messages (full conversation thread)', () => {
     const msgs = getMessagesSince('group@g.us', '2024-01-01T00:00:00.000Z', 'Andy');
     const botMsgs = msgs.filter((m) => m.content === 'Andy: bot reply');
-    expect(botMsgs).toHaveLength(0);
+    // Bot messages are now included so agent sees the full thread
+    expect(botMsgs).toHaveLength(1);
   });
 
-  it('returns all non-bot messages when sinceTimestamp is empty', () => {
+  it('returns all messages when sinceTimestamp is empty', () => {
     const msgs = getMessagesSince('group@g.us', '', 'Andy');
-    // 3 user messages (bot message excluded)
-    expect(msgs).toHaveLength(3);
+    // All 4 messages (3 user + 1 bot)
+    expect(msgs).toHaveLength(4);
   });
 
-  it('filters pre-migration bot messages via content prefix backstop', () => {
-    // Simulate a message written before migration: has prefix but is_bot_message = 0
+  it('includes pre-migration bot messages in full thread', () => {
     store({
       id: 'm5', chat_jid: 'group@g.us', sender: 'Bot@s.whatsapp.net',
       sender_name: 'Bot', content: 'Andy: old bot reply',
       timestamp: '2024-01-01T00:00:05.000Z',
     });
     const msgs = getMessagesSince('group@g.us', '2024-01-01T00:00:04.000Z', 'Andy');
-    expect(msgs).toHaveLength(0);
+    // Bot messages are included in the full conversation thread
+    expect(msgs).toHaveLength(1);
+    expect(msgs[0].content).toBe('Andy: old bot reply');
   });
 });
 

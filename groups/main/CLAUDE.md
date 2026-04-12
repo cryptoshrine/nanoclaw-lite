@@ -166,15 +166,15 @@ OmX mode is fully autonomous multi-agent orchestration. You decompose a task int
 ```markdown
 # OmX: [Task Description]
 
-## Step 1: Research [specialist:research]
-Research what's needed.
+## Step 1: Research [specialist:research, heartbeat:600]
+Research what's needed. (10min heartbeat tolerance for API calls)
 OUTPUT: summary of findings
 
-## Step 2: Implement [specialist:dev, model:sonnet]
-Build the feature following PIV workflow.
+## Step 2: Implement [specialist:dev, model:sonnet, soft_depends:1]
+Build the feature following PIV workflow. (soft dep — proceeds even if research failed)
 ACCEPTANCE: Tests passing, types clean.
 
-## Step 3: Review [specialist:review]
+## Step 3: Review [specialist:review, depends:2]
 Adversarial review of Step 2 changes.
 ACCEPTANCE: PASS or PASS WITH CONCERNS.
 
@@ -212,9 +212,14 @@ The supervisor loop (runs every 60s in the scheduler) takes over from here.
 **Step annotations:**
 - `[specialist:dev]` — Which specialist to spawn (dev, research, review, gate, commit)
 - `[model:sonnet]` or `[model:opus]` — Override default model
-- `[depends:N]` — Wait for step N to complete before starting
+- `[depends:N]` — Hard dependency: wait for step N to complete before starting (blocks if N fails)
+- `[soft_depends:N]` — Soft dependency: wait for step N to finish, but proceed even if N failed
 - `[gate:full]` — Run full test suite (pytest + mypy + ruff)
 - `[gate:quick]` — Run pytest only
+- `[heartbeat:600]` — Override heartbeat dead threshold (seconds). Default: 180s for dev/gate/commit, 600s for research, 300s for review
+
+**Step failure recovery:**
+When a step fails after max retries (2), the supervisor asks the user to *skip* or *abort* instead of auto-failing the entire workflow. Skipped steps are marked `skipped` and downstream steps that use `[depends:N]` on a skipped step will proceed (dependency check accepts `completed` or `skipped`). Use `[soft_depends:N]` when a step should also proceed if N *failed* (not just skipped).
 
 **Constraints (locked in):**
 - Push approval: YES (require human OK before push)
