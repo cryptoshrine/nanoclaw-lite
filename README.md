@@ -25,10 +25,13 @@ NanoClaw gives you the same core functionality in a codebase you can understand 
 ```bash
 git clone https://github.com/gavrielc/nanoclaw.git
 cd nanoclaw
-claude
+npm install
+npm run setup    # Interactive wizard: Telegram token, Claude auth, assistant name
+npm run build
+npm start
 ```
 
-Then run `/setup`. Claude Code handles everything: dependencies, authentication, container setup, service configuration.
+The setup wizard walks you through everything interactively. Or run `claude` then `/setup` for AI-guided setup with troubleshooting.
 
 ## Philosophy
 
@@ -40,7 +43,7 @@ Then run `/setup`. Claude Code handles everything: dependencies, authentication,
 
 **Customization = code changes.** No configuration sprawl. Want different behavior? Modify the code. The codebase is small enough that this is safe.
 
-**AI-native.** No installation wizard; Claude Code guides setup. No monitoring dashboard; ask Claude what's happening. No debugging tools; describe the problem, Claude fixes it.
+**AI-native.** Minimal setup wizard for essentials, Claude Code guides everything else. No monitoring dashboard; ask Claude what's happening. No debugging tools; describe the problem, Claude fixes it.
 
 **Skills over features.** Contributors shouldn't add features (e.g. support for Telegram) to the codebase. Instead, they contribute [claude code skills](https://code.claude.com/docs/en/skills) like `/add-telegram` that transform your fork. You end up with clean code that does exactly what you need.
 
@@ -60,19 +63,19 @@ Then run `/setup`. Claude Code handles everything: dependencies, authentication,
 
 ## Usage
 
-Talk to your assistant with the trigger word (default: `@klaw`):
+Talk to your assistant with the trigger word (default: `@Andy`):
 
 ```
-@klaw send an overview of the sales pipeline every weekday morning at 9am
-@klaw review the git history for the past week each Friday and update the README if there's drift
-@klaw every Monday at 8am, compile news on AI developments from Hacker News and TechCrunch and message me a briefing
+@Andy send an overview of the sales pipeline every weekday morning at 9am
+@Andy review the git history for the past week each Friday and update the README if there's drift
+@Andy every Monday at 8am, compile news on AI developments from Hacker News and TechCrunch and message me a briefing
 ```
 
-From the main channel (your private chat), you can manage groups and tasks:
+From the main channel (your private chat), no trigger needed — just talk:
 ```
-@klaw list all scheduled tasks across groups
-@klaw pause the Monday briefing task
-@klaw add the Ball-AI Dev group
+list all scheduled tasks across groups
+pause the Monday briefing task
+what did we discuss yesterday?
 ```
 
 ## Customizing
@@ -101,12 +104,13 @@ Users then run `/add-telegram` on their fork and get clean code that does exactl
 Skills we'd love to see:
 
 **Communication Channels**
-- `/add-telegram` - Add Telegram as channel. Should give the user option to replace WhatsApp or add as additional channel. Also should be possible to add it as a control channel (where it can trigger actions) or just a channel that can be used in actions triggered elsewhere
-- `/add-slack` - Add Slack
-- `/add-discord` - Add Discord
+- `/add-slack` - Add Slack as a channel
+- `/add-discord` - Add Discord as a channel
+- `/add-whatsapp` - Add WhatsApp as a channel (via Baileys)
 
-**Platform Support**
-- `/setup-windows` - Windows via WSL2 + Docker
+**Integrations**
+- `/add-gmail` - Gmail read/send integration (skill exists, needs OAuth setup)
+- `/add-voice` - Voice message transcription via Whisper
 
 **Session Management**
 - `/add-clear` - Add a `/clear` command that compacts the conversation (summarizes context while preserving critical information in the same session). Requires figuring out how to trigger compaction programmatically via the Claude Agent SDK.
@@ -146,7 +150,7 @@ Key files:
 
 **Why Telegram?**
 
-This fork uses Telegram via `node-telegram-bot-api`. The upstream project originally used WhatsApp (Baileys). The channel is swappable via skills — run `/add-telegram` or `/add-whatsapp` to change it. That's the whole point of the skills approach.
+Telegram has a clean Bot API, no unofficial library hacks, and works on every platform. The channel is swappable via skills — run `/add-slack` or `/add-discord` to switch. That's the whole point of the skills approach.
 
 **What's local mode vs Docker mode?**
 
@@ -154,7 +158,7 @@ Local mode (`EXECUTION_MODE=local`) spawns agents as direct Node.js child proces
 
 **Can I run this on Windows?**
 
-Yes. This fork runs on Windows with Git Bash. Use local mode (no containers needed) or install Docker Desktop for container isolation.
+Yes. Runs natively on Windows (Git Bash recommended). Local mode works out of the box — no containers needed. Install Docker Desktop for container isolation if desired.
 
 **Can I run this on Linux?**
 

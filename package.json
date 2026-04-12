@@ -5,7 +5,10 @@
   "type": "module",
   "main": "dist/index.js",
   "scripts": {
-    "build": "tsc",
+    "setup": "tsx src/setup-wizard.ts",
+    "build": "tsc && cd container/agent-runner && npx tsc",
+    "build:main": "tsc",
+    "build:agent": "cd container/agent-runner && npx tsc",
     "start": "node --env-file=.env dist/index.js",
     "dev": "tsx --env-file=.env src/index.ts",
     "typecheck": "tsc --noEmit",

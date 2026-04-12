@@ -613,14 +613,14 @@ Returns the most relevant text snippets with their source file and line numbers.
 The message will appear in their inbox at the start of their next run.
 
 Use this to:
-- Delegate tasks to specialist agents (e.g., "ball-ai-dev", "ball-ai-analytics")
+- Delegate tasks to specialist agents (e.g., "dev-team", "analytics")
 - Share information across groups without going through Telegram
 - Reply to messages you received in your inbox
 
 The receiving agent will see the message in their "Agent Inbox" section.
 They can reply using the same tool with your group folder as the target.`,
         {
-          target_group: z.string().describe('Target group folder name (e.g., "ball-ai-dev", "ball-ai-analytics", "main")'),
+          target_group: z.string().describe('Target group folder name (e.g., "dev-team", "analytics", "main")'),
           message: z.string().describe('Message body to send to the agent'),
           subject: z.string().optional().describe('Optional subject line for the message'),
           in_reply_to: z.string().optional().describe('Message ID this is replying to (from inbox)'),

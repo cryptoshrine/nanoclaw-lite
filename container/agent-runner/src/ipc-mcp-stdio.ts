@@ -282,7 +282,7 @@ server.tool(
   'Log a posted tweet to the Discord #posted channel. Call this after posting any tweet via Zapier or the media script.',
   {
     text: z.string().describe('The tweet text that was posted'),
-    url: z.string().optional().describe('The tweet URL (e.g., https://x.com/Ball_AI_Agent/status/...)'),
+    url: z.string().optional().describe('The tweet URL (e.g., https://x.com/your_handle/status/...)'),
     source: z.string().optional().describe('How the tweet was posted (e.g., "zapier", "media-script", "autonomous-engagement")'),
   },
   async (args) => {
