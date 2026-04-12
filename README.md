@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  A stripped-down fork of <a href="https://github.com/gavrielc/nanoclaw">NanoClaw</a> — personal Claude assistant on Telegram. Lightweight and built to be understood.
+  A lightweight fork of <a href="https://github.com/qwibitai/nanoclaw">NanoClaw</a> — personal Claude assistant on Telegram. Stripped down, easier to extend.
 </p>
 
 <p align="center">
@@ -12,52 +12,51 @@
 
 ## What is NanoClaw Lite?
 
-This is a **community fork** of [NanoClaw](https://github.com/gavrielc/nanoclaw) with advanced modules stripped out to provide a clean, minimal starting point. If the original NanoClaw is the full toolkit, this is the essentials-only version.
+This is a **community fork** of [NanoClaw](https://github.com/qwibitai/nanoclaw) (27K+ stars) with the container-first architecture and credential proxy stripped out in favor of a simpler local-first approach. Same core — fewer moving parts.
 
-### What was removed
+### How it differs from the original
 
-| Removed Module | Why |
-|---|---|
-| OmX orchestration engine | Complex multi-agent orchestration system (8 patterns, 11K+ lines). Overkill for most users |
-| Specialist agent framework | Graduated retry, checkpoint-resume, leaner prompts — advanced reliability layer |
-| RALPH mode | Autonomous iteration mode for specialists |
-| Visual Verdict & Keyword Classifier | AI-powered content classification tools |
-| Parallel worktrees | Git worktree management for concurrent specialist work |
-| Autopilot pipeline | Fully autonomous task execution pipeline |
-| Council/voting system | Multi-agent consensus mechanism |
-| Advanced middleware (some) | Stripped middleware that depended on removed modules |
-| Session devlogs | Detailed development logging (DEVLOG.md) |
-| Test files for removed modules | Corresponding test suites |
+| Feature | [NanoClaw](https://github.com/qwibitai/nanoclaw) | NanoClaw Lite |
+|---|---|---|
+| **Execution model** | Container-first (Docker / Apple Container) | Local-first (Node.js child process), Docker optional |
+| **Credential security** | OneCLI Agent Vault proxy — agents never hold raw keys | Direct env vars — simpler, you trust your own machine |
+| **Channel support** | Multi-channel registry (auto-detects from env). Skills for Telegram, WhatsApp, Slack, Discord, Gmail, Emacs | Telegram built-in. Other channels via skills |
+| **Mount security** | `mount-security.ts` — validates container mount paths | Not needed (local mode has no mount boundary) |
+| **Remote control** | Host-level Claude Code access from inside containers | Not applicable (agents already run on host) |
+| **Container runtime** | Apple Container (macOS), Docker, Docker Sandboxes (micro VMs) | Docker optional, local mode is default |
+| **Skills** | 28 skills across 4 types (branch-based, utility, operational, container) | Core operational skills (`/setup`, `/customize`, `/debug`) + channel skills |
+| **Dependencies** | 3 prod deps (`@onecli-sh/sdk`, `better-sqlite3`, `cron-parser`) | No OneCLI dependency. Same SQLite + cron |
+| **Platform** | macOS-first (Apple Container), Linux (Docker), Windows (WSL2 required) | Windows-native (Git Bash), macOS, Linux — no WSL2 needed |
+| **Setup** | AI-guided (`/setup` skill) | Interactive CLI wizard + AI-guided `/setup` |
 
-### What's kept (everything you need)
+### What we added
 
-- Core Telegram bot + message routing
-- Claude Agent SDK integration (local + Docker modes)
-- Scheduled tasks & cron
-- Per-group isolation & memory
-- Hybrid search (BM25 + vector embeddings)
-- Fact extraction
-- Browser automation
-- Voice transcription
-- Inline approvals
-- Agent Swarms (teams)
-- All skills (`/setup`, `/customize`, `/add-telegram`, `/add-gmail`, etc.)
-- Interactive setup wizard
+- **Hybrid memory search** — BM25 keyword search (FTS5) + local vector embeddings (`all-MiniLM-L6-v2`, 384 dims) with `sqlite-vec`. Zero API cost
+- **Fact extraction** — automatic extraction and indexing of facts from conversations
+- **Middleware pipeline** — composable before/after hooks (metrics, prompt sanitization, session management, error recovery)
+- **Agent Swarms** — spin up teams of specialized agents that collaborate on tasks
+- **Inline approvals** — Telegram inline keyboards for human-in-the-loop flows
+- **Browser automation** — agent-browser CLI with Chromium
+- **Voice transcription** — transcribe voice messages via Whisper
+- **DM allowlist** — control which users can DM the bot
+- **Structured logging** — `pino`-based logger
 
 ### Why fork?
 
-The original NanoClaw evolved into a power-user system with 11K+ lines of orchestration code. This fork gives you:
-- **Faster onboarding** — fewer files to understand
-- **Cleaner base** — extend with only what you need
-- **Same foundation** — identical core architecture
+The original NanoClaw is designed around container isolation with a credential proxy — great for security, but adds complexity if you're running on your own machine and don't need OS-level sandboxing. This fork trades container isolation for simplicity:
 
-> If you want the full system with OmX, specialists, and autonomous pipelines, use the [original repo](https://github.com/gavrielc/nanoclaw).
+- **Runs anywhere** — Windows, macOS, Linux, no WSL2 or Docker required
+- **Faster startup** — no container image to build or pull
+- **Easier to hack on** — modify code, restart, see changes immediately
+- **Same foundation** — identical core architecture (SQLite, polling loop, Claude Agent SDK)
+
+> Want container isolation and the OneCLI credential proxy? Use the [original repo](https://github.com/qwibitai/nanoclaw).
 
 ## Origin
 
 [OpenClaw](https://github.com/openclaw/openclaw) is an impressive project with a great vision. But I can't sleep well running software I don't understand with access to my life. OpenClaw has 52+ modules, 8 config management files, 45+ dependencies, and abstractions for 15 channel providers. Security is application-level (allowlists, pairing codes) rather than OS isolation. Everything runs in one Node process with shared memory.
 
-NanoClaw gives you the same core functionality in a codebase you can understand in 8 minutes. One process. A handful of files. Agents run in actual Linux containers with filesystem isolation, not behind permission checks.
+NanoClaw gives you the same core functionality in a codebase you can understand in 8 minutes. One process. A handful of files. NanoClaw Lite takes it further — no containers to manage, just a local process you can start and stop.
 
 ## Quick Start
 
@@ -96,7 +95,7 @@ The setup wizard walks you through everything interactively. Or run `claude` the
 - **Scheduled tasks** - Recurring jobs that run Claude and can message you back
 - **Web access** - Search and fetch content
 - **Two execution modes** - Local (direct Node.js child process) or Docker/Apple Container for full OS-level isolation
-- **Agent Swarms** - Spin up teams of specialized agents that collaborate on complex tasks (first personal AI assistant to support this)
+- **Agent Swarms** - Spin up teams of specialized agents that collaborate on complex tasks
 - **Middleware pipeline** - Composable before/after hook system for metrics, prompt sanitization, session management, error recovery, and more
 - **Hybrid memory search** - BM25 keyword search (FTS5) + local vector embeddings (`all-MiniLM-L6-v2`, 384 dims via `@xenova/transformers`) with `sqlite-vec`. Zero external API cost
 - **Fact extraction** - Automatic extraction and indexing of facts from conversations for long-term memory
@@ -142,9 +141,9 @@ The codebase is small enough that Claude can safely modify it.
 
 **Don't add features. Add skills.**
 
-If you want to add Telegram support, don't create a PR that adds Telegram alongside WhatsApp. Instead, contribute a skill file (`.claude/skills/add-telegram/SKILL.md`) that teaches Claude Code how to transform a NanoClaw installation to use Telegram.
+If you want to add Slack support, don't create a PR that adds Slack alongside Telegram. Instead, contribute a skill file (`.claude/skills/add-slack/SKILL.md`) that teaches Claude Code how to transform a NanoClaw installation to use Slack.
 
-Users then run `/add-telegram` on their fork and get clean code that does exactly what they need, not a bloated system trying to support every use case.
+Users then run `/add-slack` on their fork and get clean code that does exactly what they need, not a bloated system trying to support every use case.
 
 ### RFS (Request for Skills)
 
@@ -229,13 +228,17 @@ Telegram has a clean Bot API, no unofficial library hacks, and works on every pl
 
 Local mode (`EXECUTION_MODE=local`) spawns agents as direct Node.js child processes — no Docker needed, works on any OS. Docker mode spawns agents inside Linux containers for full OS-level isolation. Choose based on your security needs and platform.
 
+**How is this different from the original NanoClaw?**
+
+The [original](https://github.com/qwibitai/nanoclaw) is container-first with an OneCLI credential proxy for enterprise-grade isolation. This fork strips that out for a simpler local-first experience — same core, fewer moving parts. We also added hybrid memory search, fact extraction, a middleware pipeline, and agent swarms.
+
 **Can I run this on Windows?**
 
-Yes. Runs natively on Windows (Git Bash recommended). Local mode works out of the box — no containers needed. Install Docker Desktop for container isolation if desired.
+Yes. Runs natively on Windows (Git Bash recommended). Local mode works out of the box — no containers or WSL2 needed. The original NanoClaw requires WSL2 on Windows for Docker; this fork doesn't.
 
 **Can I run this on Linux?**
 
-Yes. Run `/setup` and it will automatically configure Docker as the container runtime. Thanks to [@dotsetgreg](https://github.com/dotsetgreg) for contributing the `/convert-to-docker` skill.
+Yes. Run `/setup` and it will automatically configure Docker as the container runtime.
 
 **Is this secure?**
 
@@ -243,7 +246,7 @@ In Docker mode, agents run in containers with OS-level isolation — they can on
 
 **Why no configuration files?**
 
-We don't want configuration sprawl. Every user should customize it to so that the code matches exactly what they want rather than configuring a generic system. If you like having config files, tell Claude to add them.
+We don't want configuration sprawl. Every user should customize it so that the code matches exactly what they want rather than configuring a generic system. If you like having config files, tell Claude to add them.
 
 **How do I debug issues?**
 
@@ -251,7 +254,7 @@ Ask Claude Code. "Why isn't the scheduler running?" "What's in the recent logs?"
 
 **Why isn't the setup working for me?**
 
-I don't know. Run `claude`, then run `/debug`. If claude finds an issue that is likely affecting other users, open a PR to modify the setup SKILL.md.
+Run `claude`, then run `/debug`. If Claude finds an issue that is likely affecting other users, open a PR to modify the setup SKILL.md.
 
 **What changes will be accepted into the codebase?**
 
