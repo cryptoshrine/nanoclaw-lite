@@ -1,20 +1,59 @@
 <p align="center">
-  <img src="assets/nanoclaw-logo.png" alt="NanoClaw" width="400">
+  <img src="assets/nanoclaw-logo.png" alt="NanoClaw Lite" width="400">
 </p>
 
 <p align="center">
-  My personal Claude assistant. Lightweight and built to be understood and customized for your own needs.
+  A stripped-down fork of <a href="https://github.com/gavrielc/nanoclaw">NanoClaw</a> — personal Claude assistant on Telegram. Lightweight and built to be understood.
 </p>
 
 <p align="center">
-  <a href="README_zh.md">中文</a>&nbsp; • &nbsp;
-  <a href="https://discord.gg/VGWXrf8x"><img src="https://img.shields.io/discord/1470188214710046894?label=Discord&logo=discord&v=2" alt="Discord" valign="middle"></a>&nbsp; • &nbsp;
-  <a href="repo-tokens"><img src="repo-tokens/badge.svg" alt="35.5k tokens, 18% of context window" valign="middle"></a>
+  <a href="https://discord.gg/VGWXrf8x"><img src="https://img.shields.io/discord/1470188214710046894?label=Discord&logo=discord&v=2" alt="Discord" valign="middle"></a>
 </p>
 
-**New:** First AI assistant to support [Agent Swarms](https://code.claude.com/docs/en/agent-teams). Spin up teams of agents that collaborate in your chat.
+## What is NanoClaw Lite?
 
-## Why I Built This
+This is a **community fork** of [NanoClaw](https://github.com/gavrielc/nanoclaw) with advanced modules stripped out to provide a clean, minimal starting point. If the original NanoClaw is the full toolkit, this is the essentials-only version.
+
+### What was removed
+
+| Removed Module | Why |
+|---|---|
+| OmX orchestration engine | Complex multi-agent orchestration system (8 patterns, 11K+ lines). Overkill for most users |
+| Specialist agent framework | Graduated retry, checkpoint-resume, leaner prompts — advanced reliability layer |
+| RALPH mode | Autonomous iteration mode for specialists |
+| Visual Verdict & Keyword Classifier | AI-powered content classification tools |
+| Parallel worktrees | Git worktree management for concurrent specialist work |
+| Autopilot pipeline | Fully autonomous task execution pipeline |
+| Council/voting system | Multi-agent consensus mechanism |
+| Advanced middleware (some) | Stripped middleware that depended on removed modules |
+| Session devlogs | Detailed development logging (DEVLOG.md) |
+| Test files for removed modules | Corresponding test suites |
+
+### What's kept (everything you need)
+
+- Core Telegram bot + message routing
+- Claude Agent SDK integration (local + Docker modes)
+- Scheduled tasks & cron
+- Per-group isolation & memory
+- Hybrid search (BM25 + vector embeddings)
+- Fact extraction
+- Browser automation
+- Voice transcription
+- Inline approvals
+- Agent Swarms (teams)
+- All skills (`/setup`, `/customize`, `/add-telegram`, `/add-gmail`, etc.)
+- Interactive setup wizard
+
+### Why fork?
+
+The original NanoClaw evolved into a power-user system with 11K+ lines of orchestration code. This fork gives you:
+- **Faster onboarding** — fewer files to understand
+- **Cleaner base** — extend with only what you need
+- **Same foundation** — identical core architecture
+
+> If you want the full system with OmX, specialists, and autonomous pipelines, use the [original repo](https://github.com/gavrielc/nanoclaw).
+
+## Origin
 
 [OpenClaw](https://github.com/openclaw/openclaw) is an impressive project with a great vision. But I can't sleep well running software I don't understand with access to my life. OpenClaw has 52+ modules, 8 config management files, 45+ dependencies, and abstractions for 15 channel providers. Security is application-level (allowlists, pairing codes) rather than OS isolation. Everything runs in one Node process with shared memory.
 
@@ -23,8 +62,8 @@ NanoClaw gives you the same core functionality in a codebase you can understand 
 ## Quick Start
 
 ```bash
-git clone https://github.com/gavrielc/nanoclaw.git
-cd nanoclaw
+git clone https://github.com/cryptoshrine/nanoclaw-lite.git
+cd nanoclaw-lite
 npm install
 npm run setup    # Interactive wizard: Telegram token, Claude auth, assistant name
 npm run build
