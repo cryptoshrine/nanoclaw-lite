@@ -30,3 +30,13 @@ groups/global/*
 .vscode/
 
 agents-sdk-docs
+
+# Runtime artifacts
+output/
+ipc/
+
+# Private scripts (not part of core)
+scripts/
+
+# Dev log (contains session history)
+DEVLOG.md
