@@ -9,7 +9,7 @@
 <p align="center">
   <a href="README_zh.md">中文</a>&nbsp; • &nbsp;
   <a href="https://discord.gg/VGWXrf8x"><img src="https://img.shields.io/discord/1470188214710046894?label=Discord&logo=discord&v=2" alt="Discord" valign="middle"></a>&nbsp; • &nbsp;
-  <a href="repo-tokens"><img src="repo-tokens/badge.svg" alt="34.9k tokens, 17% of context window" valign="middle"></a>
+  <a href="repo-tokens"><img src="repo-tokens/badge.svg" alt="35.5k tokens, 18% of context window" valign="middle"></a>
 </p>
 
 **New:** First AI assistant to support [Agent Swarms](https://code.claude.com/docs/en/agent-teams). Spin up teams of agents that collaborate in your chat.
@@ -58,7 +58,15 @@ The setup wizard walks you through everything interactively. Or run `claude` the
 - **Web access** - Search and fetch content
 - **Two execution modes** - Local (direct Node.js child process) or Docker/Apple Container for full OS-level isolation
 - **Agent Swarms** - Spin up teams of specialized agents that collaborate on complex tasks (first personal AI assistant to support this)
+- **Middleware pipeline** - Composable before/after hook system for metrics, prompt sanitization, session management, error recovery, and more
+- **Hybrid memory search** - BM25 keyword search (FTS5) + local vector embeddings (`all-MiniLM-L6-v2`, 384 dims via `@xenova/transformers`) with `sqlite-vec`. Zero external API cost
+- **Fact extraction** - Automatic extraction and indexing of facts from conversations for long-term memory
 - **Browser automation** - agent-browser CLI with Chromium for web scraping and interaction
+- **Voice transcription** - Transcribe voice messages so the agent can read and respond to them
+- **Inline approvals** - Telegram inline keyboards for human-in-the-loop approval flows
+- **DM allowlist** - Control which users can DM the bot directly
+- **Structured logging** - `pino`-based structured logger across the entire system
+- **Interactive setup wizard** - Guided first-run setup for Telegram token, Claude auth, and assistant name
 - **Optional integrations** - Add Gmail (`/add-gmail`) and more via skills
 
 ## Usage
@@ -144,7 +152,33 @@ Key files:
 - `src/group-queue.ts` - Per-group queue with global concurrency limit
 - `src/task-scheduler.ts` - Runs scheduled tasks
 - `src/db.ts` - SQLite operations (messages, groups, sessions, state)
+- `src/setup-wizard.ts` - Interactive first-run setup (Telegram token, Claude auth, assistant name)
+- `src/logger.ts` - Structured logging (`pino`)
+- `src/inline-keyboards.ts` - Telegram inline keyboards for approval flows
+- `src/dm-allowlist.ts` - DM access control
+- `src/transcription.ts` - Voice message transcription
+- `src/browser-daemon.ts` - Persistent browser daemon for automation
 - `groups/*/CLAUDE.md` - Per-group memory
+
+Middleware pipeline (`src/middleware/`):
+- `pipeline.ts` - Ordered before/after hook execution (like Express/Koa)
+- `metrics.ts` - Timing and logging
+- `snapshot.ts` - Write task/group/fact snapshots to IPC
+- `memory-sync.ts` - Sync memory index before agent runs
+- `prompt-sanitize.ts` - Strip triggers, truncate uploads, remove base64
+- `clarification.ts` - Catch empty or incomplete prompts
+- `session.ts` - Resolve and persist session IDs
+- `agent.ts` - Invoke the agent (core middleware)
+- `memory-queue.ts` - Queue conversations for fact extraction
+- `error-recovery.ts` - Clear failed sessions
+
+Memory system (`src/memory/`):
+- `manager.ts` - File indexing, embedding, and hybrid search
+- `hybrid.ts` - BM25 + vector merge with configurable weights
+- `embeddings.ts` - Local embeddings via `@xenova/transformers` (all-MiniLM-L6-v2)
+- `chunker.ts` - Markdown chunking for embedding
+- `fact-extractor.ts` - Extract facts from conversations for long-term memory
+- `schema.ts` - SQLite schema for FTS5 + `sqlite-vec` tables
 
 ## FAQ
 
