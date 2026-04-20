@@ -1,0 +1,34 @@
+[Unit]
+Description=Browser Harness CDP Daemon
+Documentation=https://github.com/cryptoshrine/nanoclaw
+After=network.target
+
+[Service]
+Type=simple
+User=nanoclaw
+Group=nanoclaw
+ExecStart=/opt/nanoclaw/browser-harness/.venv/bin/browser-harness
+Restart=always
+RestartSec=5
+
+# Environment
+EnvironmentFile=-/opt/nanoclaw/.env
+Environment=BROWSER_HARNESS_SOCKET=/run/browser-harness/daemon.sock
+Environment=CHROME_PATH=/usr/bin/chromium-browser
+
+# Runtime directory (created automatically with correct permissions)
+RuntimeDirectory=browser-harness
+RuntimeDirectoryMode=0750
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/run/browser-harness /home/nanoclaw/.browser-harness
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target

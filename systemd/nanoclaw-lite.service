@@ -1,0 +1,29 @@
+[Unit]
+Description=NanoClaw Lite — Personal AI Assistant
+Documentation=https://github.com/cryptoshrine/nanoclaw
+After=network.target browser-harness.service
+Wants=browser-harness.service
+
+[Service]
+Type=simple
+User=nanoclaw
+Group=nanoclaw
+WorkingDirectory=/opt/nanoclaw
+ExecStart=/usr/bin/node dist/index.js
+Restart=always
+RestartSec=10
+
+# Environment
+EnvironmentFile=/opt/nanoclaw/.env
+
+# Resource limits
+LimitNOFILE=4096
+
+# Security
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/nanoclaw/store /opt/nanoclaw/groups /opt/nanoclaw/data
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

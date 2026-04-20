@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "browser-harness"
+version = "0.1.0"
+description = "Persistent CDP browser daemon with skill accumulation for NanoClaw"
+requires-python = ">=3.11"
+dependencies = [
+    "websockets>=12.0",
+    "aiohttp>=3.9",
+]
+
+[project.scripts]
+browser-harness = "browser_harness.daemon:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
