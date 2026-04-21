@@ -1,0 +1,19 @@
+{
+  "name": "Clawhip",
+  "version": "0.1.0",
+  "description": "Discord bridge for agent lifecycle events. Posts color-coded embeds to #mission-control when specialists spawn, complete, fail, or crash.",
+  "requires": [],
+  "npmDependencies": {
+    "discord.js": "^14.16.0"
+  },
+  "env": {
+    "DISCORD_BOT_TOKEN": { "default": "", "description": "Discord bot token (required)" },
+    "DISCORD_GUILD_ID": { "default": "", "description": "Discord server/guild ID" },
+    "DISCORD_CHANNEL_MISSION_CONTROL": { "default": "", "description": "Channel ID for lifecycle events (required)" }
+  },
+  "install": {
+    "copies": [
+      { "from": "lifecycle-bridge.ts", "to": "src/lifecycle-bridge.ts" }
+    ]
+  }
+}

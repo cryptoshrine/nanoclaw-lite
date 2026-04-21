@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "addons": {
+    "oh-my-codex": {
+      "name": "Oh My Codex",
+      "description": "Routes OmX coding steps through Codex/Claude/Gemini CLI workers instead of Claude SDK specialists. Workers run in tmux panes and persist independently, solving the ~50% specialist death rate.",
+      "version": "0.1.0",
+      "status": "available",
+      "requires": ["omx-tmux"],
+      "env": {
+        "OMX_CODEX_ENABLED": { "default": "true", "description": "Enable Codex CLI dispatch" },
+        "OMX_CODEX_AGENT_TYPE": { "default": "codex", "description": "Default agent type: codex | claude | gemini" },
+        "OMX_RUNTIME_CLI_PATH": { "default": "", "description": "Path to OMC runtime-cli.js (required)" },
+        "OMX_CODEX_JOBS_DIR": { "default": "~/.omx/team-jobs", "description": "Directory for job state files" }
+      },
+      "files": {
+        "src": ["addons/oh-my-codex/codex-bridge.ts"],
+        "config": ["addons/oh-my-codex/addon.json"]
+      }
+    },
+    "clawhip": {
+      "name": "Clawhip",
+      "description": "Discord bridge for agent lifecycle events. Posts color-coded embeds to #mission-control when specialists spawn, complete, fail, or crash.",
+      "version": "0.1.0",
+      "status": "available",
+      "requires": [],
+      "env": {
+        "DISCORD_BOT_TOKEN": { "default": "", "description": "Discord bot token (required)" },
+        "DISCORD_CHANNEL_MISSION_CONTROL": { "default": "", "description": "Channel ID for lifecycle events" }
+      },
+      "files": {
+        "src": ["addons/clawhip/lifecycle-bridge.ts"],
+        "config": ["addons/clawhip/addon.json"]
+      }
+    }
+  }
+}

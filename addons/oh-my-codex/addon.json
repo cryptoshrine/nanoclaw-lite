@@ -1,0 +1,25 @@
+{
+  "name": "Oh My Codex",
+  "version": "0.1.0",
+  "description": "Routes OmX coding steps through Codex/Claude/Gemini CLI workers instead of Claude SDK specialists. Workers run in tmux panes and persist independently.",
+  "requires": ["omx-tmux"],
+  "env": {
+    "OMX_CODEX_ENABLED": { "default": "true", "description": "Enable Codex CLI dispatch" },
+    "OMX_CODEX_AGENT_TYPE": { "default": "codex", "description": "Default agent type: codex | claude | gemini" },
+    "OMX_RUNTIME_CLI_PATH": { "default": "", "description": "Absolute path to OMC runtime-cli.js (required)" },
+    "OMX_CODEX_JOBS_DIR": { "default": "~/.omx/team-jobs", "description": "Directory for job state files" }
+  },
+  "install": {
+    "copies": [
+      { "from": "codex-bridge.ts", "to": "src/codex-bridge.ts" }
+    ],
+    "configAdds": {
+      "src/config.ts": [
+        "export const OMX_CODEX_ENABLED = process.env.OMX_CODEX_ENABLED !== 'false';",
+        "export const OMX_CODEX_AGENT_TYPE = process.env.OMX_CODEX_AGENT_TYPE || 'codex';",
+        "export const OMX_RUNTIME_CLI_PATH = process.env.OMX_RUNTIME_CLI_PATH || '';",
+        "export const OMX_CODEX_JOBS_DIR = process.env.OMX_CODEX_JOBS_DIR || path.join(os.homedir(), '.omx', 'team-jobs');"
+      ]
+    }
+  }
+}
