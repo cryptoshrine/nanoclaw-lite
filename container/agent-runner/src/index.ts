@@ -434,7 +434,14 @@ function buildMemoryContext(groupDir: string): string | null {
 
   if (parts.length === 0) return null;
 
-  return `\n\n# Injected Memory Context\nThe following memory files were loaded from your group directory at session start. Use this context to maintain continuity across sessions.\n\n${parts.join('\n\n')}`;
+  // Frozen Snapshot pattern (Hermes-inspired):
+  // Memory is loaded ONCE at session start and frozen into the system prompt.
+  // Mid-session writes (via memory_write tool) go to disk immediately but
+  // do NOT update this system prompt. Changes take effect on the NEXT session.
+  // This preserves the Anthropic prompt prefix cache for the entire session.
+  const frozenNote = `_Frozen snapshot at ${new Date().toISOString()}. Memory writes during this session go to disk but take effect next session._`;
+
+  return `\n\n# Injected Memory Context\nThe following memory files were loaded from your group directory at session start. Use this context to maintain continuity across sessions.\n${frozenNote}\n\n${parts.join('\n\n')}`;
 }
 
 /**

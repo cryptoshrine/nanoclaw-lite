@@ -1037,6 +1037,267 @@ server.tool(
   },
 );
 
+// ============ Security Scanner ============
+
+function scanSkillContent(content: string): { safe: boolean; reason?: string } {
+  const dangerous = [
+    { pattern: /curl\s+.*[-]d\s/i, reason: 'Potential data exfiltration via curl' },
+    { pattern: /wget\s+.*--post/i, reason: 'Potential data exfiltration via wget' },
+    { pattern: /\beval\s*\(/i, reason: 'Dynamic code execution (eval)' },
+    { pattern: /\bexec\s*\(/i, reason: 'Process execution' },
+    { pattern: /child_process/i, reason: 'Child process access' },
+    { pattern: /require\s*\(\s*['"](?:fs|os|child_process|net|http|https|dgram)/i, reason: 'Dangerous module import' },
+    { pattern: /ignore\s+(all\s+)?previous\s+instructions/i, reason: 'Prompt injection attempt' },
+    { pattern: /you\s+are\s+now\s+/i, reason: 'Identity override attempt' },
+    { pattern: /system\s*:\s*you\s+are/i, reason: 'System prompt injection' },
+    { pattern: /ANTHROPIC_API_KEY|CLAUDE_CODE_OAUTH|TELEGRAM_BOT_TOKEN/i, reason: 'Attempts to reference secrets' },
+    { pattern: /process\.env\[/i, reason: 'Dynamic environment variable access' },
+    { pattern: /rm\s+-rf\s+\//i, reason: 'Destructive file operation' },
+    { pattern: />\s*\/etc\//i, reason: 'System file write attempt' },
+  ];
+  for (const { pattern, reason } of dangerous) {
+    if (pattern.test(content)) return { safe: false, reason };
+  }
+  if (content.length > 50000) return { safe: false, reason: 'Content exceeds 50KB limit' };
+  return { safe: true };
+}
+
+const PROJECT_DIR = process.env.NANOCLAW_PROJECT_DIR || '/workspace/project';
+
+// ============ Agent-Writable Skills (P1) ============
+
+server.tool(
+  'create_skill',
+  `Create a new reusable skill. Skills are step-by-step procedures that persist across sessions.
+Use this after completing a non-trivial task that required multi-step workflows, trial and error,
+or discovering non-obvious approaches. The skill will be available to all future agent sessions.`,
+  {
+    name: z.string().describe('Skill name (kebab-case, e.g., "deploy-docker")'),
+    description: z.string().describe('One-line description'),
+    content: z.string().describe('Full skill content in markdown'),
+    category: z.string().optional().describe('Category folder'),
+  },
+  async (args) => {
+    const scan = scanSkillContent(args.content);
+    if (!scan.safe) {
+      return { content: [{ type: 'text' as const, text: `Skill creation blocked: ${scan.reason}` }], isError: true };
+    }
+    if (!/^[a-z0-9-]+$/.test(args.name)) {
+      return { content: [{ type: 'text' as const, text: 'Skill name must be kebab-case.' }], isError: true };
+    }
+    const skillDir = path.join(PROJECT_DIR, '.claude', 'skills', args.name);
+    if (fs.existsSync(path.join(skillDir, 'SKILL.md'))) {
+      return { content: [{ type: 'text' as const, text: `Skill "${args.name}" already exists. Use patch_skill to update it.` }], isError: true };
+    }
+    fs.mkdirSync(skillDir, { recursive: true });
+    const skillContent = `---
+name: "${args.name}"
+description: "${args.description.replace(/"/g, '\\"')}"
+version: "1.0.0"
+created: "${new Date().toISOString()}"
+created_by: "agent"
+category: "${args.category || 'general'}"
+---
+
+${args.content}
+`;
+    fs.writeFileSync(path.join(skillDir, 'SKILL.md'), skillContent);
+    return { content: [{ type: 'text' as const, text: `Skill "${args.name}" created at .claude/skills/${args.name}/SKILL.md` }] };
+  },
+);
+
+server.tool(
+  'patch_skill',
+  `Update an existing skill. Use when a skill has incorrect steps or needs refinement.`,
+  {
+    name: z.string().describe('Skill name to patch'),
+    section: z.string().optional().describe('Section header to replace. If omitted, replaces entire body.'),
+    new_content: z.string().describe('New content'),
+  },
+  async (args) => {
+    const skillPath = path.join(PROJECT_DIR, '.claude', 'skills', args.name, 'SKILL.md');
+    if (!fs.existsSync(skillPath)) {
+      return { content: [{ type: 'text' as const, text: `Skill "${args.name}" not found.` }], isError: true };
+    }
+    const scan = scanSkillContent(args.new_content);
+    if (!scan.safe) {
+      return { content: [{ type: 'text' as const, text: `Skill patch blocked: ${scan.reason}` }], isError: true };
+    }
+    let content = fs.readFileSync(skillPath, 'utf-8');
+    if (args.section) {
+      const sectionRegex = new RegExp(
+        `(${args.section.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\n)([\\s\\S]*?)(?=\\n## |$)`,
+      );
+      if (sectionRegex.test(content)) {
+        content = content.replace(sectionRegex, `$1${args.new_content}\n`);
+      } else {
+        content += `\n${args.section}\n${args.new_content}\n`;
+      }
+    } else {
+      const fmEnd = content.indexOf('---', content.indexOf('---') + 3);
+      if (fmEnd !== -1) {
+        content = `${content.slice(0, fmEnd + 3)}\n\n${args.new_content}\n`;
+      } else {
+        content = args.new_content;
+      }
+    }
+    content = content.replace(
+      /version:\s*"(\d+)\.(\d+)\.(\d+)"/,
+      (_, major: string, minor: string, patch: string) => `version: "${major}.${minor}.${parseInt(patch) + 1}"`,
+    );
+    fs.writeFileSync(skillPath, content);
+    return { content: [{ type: 'text' as const, text: `Skill "${args.name}" patched successfully.` }] };
+  },
+);
+
+server.tool(
+  'list_skills',
+  'List all available skills with their names and descriptions.',
+  {},
+  async () => {
+    const skillsDir = path.join(PROJECT_DIR, '.claude', 'skills');
+    if (!fs.existsSync(skillsDir)) {
+      return { content: [{ type: 'text' as const, text: 'No skills directory found.' }] };
+    }
+    const entries = fs.readdirSync(skillsDir, { withFileTypes: true }).filter(d => d.isDirectory());
+    if (entries.length === 0) {
+      return { content: [{ type: 'text' as const, text: 'No skills found.' }] };
+    }
+    const skills: string[] = [];
+    for (const entry of entries) {
+      const skillPath = path.join(skillsDir, entry.name, 'SKILL.md');
+      if (!fs.existsSync(skillPath)) continue;
+      const content = fs.readFileSync(skillPath, 'utf-8');
+      const desc = content.match(/description:\s*"([^"]+)"/)?.[1] || 'No description';
+      const version = content.match(/version:\s*"([^"]+)"/)?.[1] || '?';
+      const createdBy = content.match(/created_by:\s*"([^"]+)"/)?.[1] || 'unknown';
+      skills.push(`• ${entry.name} (v${version}, by ${createdBy}): ${desc}`);
+    }
+    return { content: [{ type: 'text' as const, text: `Available skills (${skills.length}):\n\n${skills.join('\n')}` }] };
+  },
+);
+
+server.tool(
+  'view_skill',
+  'Load the full content of a specific skill. Use after list_skills to get details.',
+  {
+    name: z.string().describe('Skill name to view'),
+    file: z.string().optional().describe('Supporting file within skill directory'),
+  },
+  async (args) => {
+    const baseDir = path.join(PROJECT_DIR, '.claude', 'skills', args.name);
+    const targetFile = args.file ? path.join(baseDir, args.file) : path.join(baseDir, 'SKILL.md');
+    if (!fs.existsSync(targetFile)) {
+      return { content: [{ type: 'text' as const, text: `Skill file not found: ${args.name}/${args.file || 'SKILL.md'}` }], isError: true };
+    }
+    const resolved = path.resolve(targetFile);
+    if (!resolved.startsWith(path.resolve(baseDir))) {
+      return { content: [{ type: 'text' as const, text: 'Path traversal blocked.' }], isError: true };
+    }
+    const content = fs.readFileSync(targetFile, 'utf-8');
+    return { content: [{ type: 'text' as const, text: content.slice(0, 30000) }] };
+  },
+);
+
+// ============ Session Search (P2) ============
+
+server.tool(
+  'search_sessions',
+  `Search past conversation sessions for relevant context. Uses full-text search across archived conversations.`,
+  {
+    query: z.string().describe('Search query (keywords, phrases)'),
+    max_results: z.number().optional().default(5).describe('Maximum sessions to return'),
+    days_back: z.number().optional().default(30).describe('How many days back to search'),
+  },
+  async (args) => {
+    const conversationsDir = path.join(NANOCLAW_GROUP_DIR, 'conversations');
+    if (!fs.existsSync(conversationsDir)) {
+      return { content: [{ type: 'text' as const, text: 'No conversation archives found.' }] };
+    }
+    const cutoff = new Date();
+    cutoff.setDate(cutoff.getDate() - args.days_back);
+    const cutoffStr = cutoff.toISOString().split('T')[0];
+    const files = fs.readdirSync(conversationsDir)
+      .filter(f => f.endsWith('.md') && f >= cutoffStr)
+      .sort()
+      .reverse();
+    if (files.length === 0) {
+      return { content: [{ type: 'text' as const, text: 'No conversations found in the specified time range.' }] };
+    }
+    const queryWords = args.query.toLowerCase().split(/\s+/).filter(w => w.length > 2);
+    if (queryWords.length === 0) {
+      return { content: [{ type: 'text' as const, text: 'Query too short. Use at least one word with 3+ characters.' }], isError: true };
+    }
+    type ScoredResult = { file: string; score: number; excerpt: string };
+    const results: ScoredResult[] = [];
+    for (const file of files) {
+      const content = fs.readFileSync(path.join(conversationsDir, file), 'utf-8');
+      const lower = content.toLowerCase();
+      let score = 0;
+      for (const word of queryWords) {
+        score += lower.split(word).length - 1;
+      }
+      if (score === 0) continue;
+      const firstMatchIdx = queryWords.reduce((best, word) => {
+        const idx = lower.indexOf(word);
+        return idx !== -1 && (best === -1 || idx < best) ? idx : best;
+      }, -1);
+      const excerpt = content.slice(Math.max(0, firstMatchIdx - 200), Math.min(content.length, firstMatchIdx + 500)).trim();
+      results.push({ file, score, excerpt });
+    }
+    results.sort((a, b) => b.score - a.score);
+    const topResults = results.slice(0, args.max_results);
+    if (topResults.length === 0) {
+      return { content: [{ type: 'text' as const, text: `No matches found for "${args.query}".` }] };
+    }
+    const formatted = topResults.map((r, i) =>
+      `### ${i + 1}. ${r.file} (relevance: ${r.score})\n\n${r.excerpt.slice(0, 500)}${r.excerpt.length > 500 ? '...' : ''}`,
+    ).join('\n\n---\n\n');
+    return { content: [{ type: 'text' as const, text: `Found ${topResults.length} matching sessions:\n\n${formatted}` }] };
+  },
+);
+
+// ============ Bounded Memory Write (P3) ============
+
+server.tool(
+  'memory_write',
+  `Write a declarative fact to the group's memory. Bounded to 5000 chars. Oldest entries trimmed automatically.`,
+  {
+    content: z.string().describe('The fact to remember (1-2 sentences, declarative)'),
+    target: z.enum(['memory', 'user']).default('memory').describe('"memory" = agent notes, "user" = user preferences'),
+  },
+  async (args) => {
+    const MEMORY_CHAR_LIMIT = 5000;
+    const USER_CHAR_LIMIT = 3000;
+    const targetFile = args.target === 'user'
+      ? path.join(NANOCLAW_GROUP_DIR, 'USER.md')
+      : path.join(NANOCLAW_GROUP_DIR, 'MEMORY.md');
+    const charLimit = args.target === 'user' ? USER_CHAR_LIMIT : MEMORY_CHAR_LIMIT;
+    const scan = scanSkillContent(args.content);
+    if (!scan.safe) {
+      return { content: [{ type: 'text' as const, text: `Memory write blocked: ${scan.reason}` }], isError: true };
+    }
+    let existing = '';
+    if (fs.existsSync(targetFile)) {
+      existing = fs.readFileSync(targetFile, 'utf-8');
+    }
+    const entry = `\n§ ${args.content} [${new Date().toISOString().split('T')[0]}]`;
+    let updated = existing + entry;
+    while (updated.length > charLimit) {
+      const firstDelim = updated.indexOf('\n§ ', 1);
+      if (firstDelim === -1) break;
+      const secondDelim = updated.indexOf('\n§ ', firstDelim + 1);
+      if (secondDelim === -1) break;
+      updated = updated.slice(0, firstDelim) + updated.slice(secondDelim);
+    }
+    const tmpPath = `${targetFile}.tmp`;
+    fs.writeFileSync(tmpPath, updated);
+    fs.renameSync(tmpPath, targetFile);
+    const remaining = charLimit - updated.length;
+    return { content: [{ type: 'text' as const, text: `Memory updated (${args.target}). ${remaining} chars remaining of ${charLimit} limit.` }] };
+  },
+);
+
 // Start the stdio transport
 const transport = new StdioServerTransport();
 await server.connect(transport);

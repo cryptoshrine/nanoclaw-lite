@@ -25,8 +25,10 @@ import {
 } from './config.js';
 import {
   AvailableGroup,
+  ContainerInput,
   runAgent as runContainerAgentDispatch,
 } from './container-runner.js';
+import { runLocalAgent } from './local-runner.js';
 import {
   getAllChats,
   getAllTasks,
@@ -230,6 +232,53 @@ async function runAgent(
   } catch (err) {
     logger.error({ group: group.name, err }, 'Pipeline error');
     return null;
+  }
+}
+
+/**
+ * Background Review Agent — Hermes-inspired post-session review.
+ * Spawns a lightweight agent (Haiku by default) that reviews the conversation
+ * and writes learnings to persistent storage. Fire-and-forget.
+ */
+async function runBackgroundReview(
+  group: RegisteredGroup,
+  prompt: string,
+  chatJid: string,
+  model?: string,
+): Promise<void> {
+  const reviewModel = model || process.env.REVIEW_MODEL || 'claude-haiku-4-5-20251001';
+  const timeout = 120_000; // 2 minutes max for review
+
+  const input: ContainerInput = {
+    prompt,
+    groupFolder: group.folder,
+    chatJid,
+    isMain: group.folder === MAIN_GROUP_FOLDER,
+    isScheduledTask: true, // Suppress output to user
+  };
+
+  // Override model for cost efficiency
+  const savedModel = process.env.NANOCLAW_MODEL;
+  process.env.NANOCLAW_MODEL = reviewModel;
+
+  try {
+    const result = await Promise.race([
+      runLocalAgent(group, input),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('Background review timed out')), timeout)
+      ),
+    ]);
+    logger.info(
+      { group: group.folder, status: result.status, model: reviewModel },
+      'Background review completed',
+    );
+  } finally {
+    // Restore original model
+    if (savedModel) {
+      process.env.NANOCLAW_MODEL = savedModel;
+    } else {
+      delete process.env.NANOCLAW_MODEL;
+    }
   }
 }
 
@@ -923,6 +972,39 @@ async function processTaskIpc(
         }
       }
       break;
+
+    case 'background_review': {
+      // Hermes-inspired post-session review: spawn a lightweight agent to
+      // review the conversation and write learnings to persistent storage.
+      const reviewData = data as {
+        prompt?: string;
+        groupFolder?: string;
+        chatJid?: string;
+        model?: string;
+      };
+      if (reviewData.prompt && reviewData.groupFolder) {
+        const reviewGroup = Object.entries(registeredGroups).find(
+          ([, g]) => g.folder === reviewData.groupFolder,
+        );
+        if (reviewGroup) {
+          const [reviewJid, reviewGroupConfig] = reviewGroup;
+          // Fire-and-forget: spawn review agent in background
+          runBackgroundReview(
+            reviewGroupConfig,
+            reviewData.prompt,
+            reviewData.chatJid || reviewJid,
+            reviewData.model,
+          ).catch((err) => {
+            logger.error({ err, group: reviewData.groupFolder }, 'Background review failed');
+          });
+          logger.info(
+            { group: reviewData.groupFolder },
+            'Background review agent spawned',
+          );
+        }
+      }
+      break;
+    }
 
     default:
       logger.warn({ type: data.type }, 'Unknown IPC task type');

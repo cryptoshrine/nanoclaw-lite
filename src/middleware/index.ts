@@ -15,6 +15,7 @@ export { createAgentMiddleware } from './agent.js';
 export { createErrorRecoveryMiddleware } from './error-recovery.js';
 export { createMemoryQueueMiddleware } from './memory-queue.js';
 export { createClarificationMiddleware } from './clarification.js';
+export { createBackgroundReviewMiddleware } from './background-review.js';
 
 import { FactExtractor } from '../memory/fact-extractor.js';
 
@@ -22,6 +23,7 @@ import { MiddlewarePipeline } from './pipeline.js';
 import { MiddlewareServices } from './services.js';
 
 import { createAgentMiddleware } from './agent.js';
+import { createBackgroundReviewMiddleware } from './background-review.js';
 import { createClarificationMiddleware } from './clarification.js';
 import { createErrorRecoveryMiddleware } from './error-recovery.js';
 import { createMemoryQueueMiddleware } from './memory-queue.js';
@@ -43,8 +45,9 @@ import { createSnapshotMiddleware } from './snapshot.js';
  *   6. SessionResolve    — resolve session ID from store
  *   7. Agent             — invoke the agent (short-circuits, triggers after hooks)
  *   8. MemoryQueue       — queue conversation for fact extraction (after hook)
- *   9. SessionPersist    — save new session ID (after hook)
- *  10. ErrorRecovery     — clear failed sessions (after hook)
+ *   9. BackgroundReview  — post-session review agent (after hook, fire-and-forget)
+ *  10. SessionPersist    — save new session ID (after hook)
+ *  11. ErrorRecovery     — clear failed sessions (after hook)
  */
 export function createDefaultPipeline(
   services: MiddlewareServices,
@@ -63,6 +66,9 @@ export function createDefaultPipeline(
   if (factExtractor?.isAvailable) {
     pipeline.use(createMemoryQueueMiddleware(factExtractor));
   }
+
+  // Background review (after hook) — Hermes-inspired post-session learning
+  pipeline.use(createBackgroundReviewMiddleware(services));
 
   pipeline
     .use(createSessionPersistMiddleware(services))
