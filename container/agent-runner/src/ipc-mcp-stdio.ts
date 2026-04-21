@@ -1298,6 +1298,176 @@ server.tool(
   },
 );
 
+// ============ OmX Tmux Team Runner Tools ============
+
+const TMUX_IPC_DIR = path.join(IPC_DIR, 'tmux');
+
+function writeTmuxIpc(data: object): string {
+  fs.mkdirSync(TMUX_IPC_DIR, { recursive: true });
+  const filename = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}.json`;
+  const filepath = path.join(TMUX_IPC_DIR, filename);
+  const tmpPath = `${filepath}.tmp`;
+  fs.writeFileSync(tmpPath, JSON.stringify(data, null, 2));
+  fs.renameSync(tmpPath, filepath);
+  return filename;
+}
+
+function readTmuxResponse(jobId: string, timeoutMs: number): object | null {
+  const responsesDir = path.join(TMUX_IPC_DIR, 'responses');
+  const responseFile = path.join(responsesDir, `${jobId}.json`);
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (fs.existsSync(responseFile)) {
+      try {
+        const resp = JSON.parse(fs.readFileSync(responseFile, 'utf-8'));
+        try { fs.unlinkSync(responseFile); } catch { /* ignore */ }
+        return resp;
+      } catch { /* partially written, retry */ }
+    }
+    // Synchronous wait (small — MCP tools are async but polling is fine here)
+    const wait = (ms: number) => { const end = Date.now() + ms; while (Date.now() < end) { /* spin */ } };
+    wait(300);
+  }
+  return null;
+}
+
+server.tool(
+  'omx_run_team_start',
+  `Spawn tmux CLI workers (codex/claude/gemini) in the background. Returns jobId immediately. Poll with omx_run_team_status.`,
+  {
+    teamName: z.string().describe('Slug name for the team'),
+    agentTypes: z.array(z.string()).describe('"codex", "claude", or "gemini" per worker'),
+    tasks: z.array(z.object({
+      subject: z.string(),
+      description: z.string(),
+    })).describe('Tasks to distribute to workers'),
+    cwd: z.string().describe('Working directory (absolute path)'),
+  },
+  async (args) => {
+    if (!isMain) {
+      return { content: [{ type: 'text' as const, text: 'Only the main group can start tmux teams.' }], isError: true };
+    }
+
+    const jobId = `tmux-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    writeTmuxIpc({
+      type: 'omx_run_team_start',
+      jobId,
+      teamName: args.teamName,
+      agentTypes: args.agentTypes,
+      tasks: args.tasks,
+      cwd: args.cwd,
+      timestamp: new Date().toISOString(),
+    });
+
+    // Wait briefly for host to confirm
+    const resp = readTmuxResponse(jobId, 5000);
+    if (resp) {
+      return { content: [{ type: 'text' as const, text: JSON.stringify(resp) }] };
+    }
+
+    return {
+      content: [{ type: 'text' as const, text: JSON.stringify({ jobId, status: 'submitted', message: 'Team start request submitted. Use omx_run_team_status to check progress.' }) }],
+    };
+  },
+);
+
+server.tool(
+  'omx_run_team_status',
+  `Non-blocking status check for a background omx_run_team job. Returns status and result when done.`,
+  {
+    job_id: z.string().describe('Job ID returned by omx_run_team_start'),
+  },
+  async (args) => {
+    if (!isMain) {
+      return { content: [{ type: 'text' as const, text: 'Only the main group can check tmux team status.' }], isError: true };
+    }
+
+    writeTmuxIpc({
+      type: 'omx_run_team_status',
+      jobId: args.job_id,
+      timestamp: new Date().toISOString(),
+    });
+
+    const resp = readTmuxResponse(args.job_id, 3000);
+    if (resp) {
+      return { content: [{ type: 'text' as const, text: JSON.stringify(resp) }] };
+    }
+
+    return {
+      content: [{ type: 'text' as const, text: JSON.stringify({ jobId: args.job_id, status: 'unknown', message: 'No response from host. The job may not exist or the tmux engine is not running.' }) }],
+    };
+  },
+);
+
+server.tool(
+  'omx_run_team_wait',
+  `Block (poll internally) until a background omx_run_team job reaches a terminal state or times out. Auto-nudges idle worker panes.`,
+  {
+    job_id: z.string().describe('Job ID returned by omx_run_team_start'),
+    timeout_ms: z.number().optional().describe('Maximum wait time in ms (default: 300000, max: 600000)'),
+    nudge_delay_ms: z.number().optional().describe('Milliseconds a pane must be idle before nudging (default: 30000)'),
+    nudge_max_count: z.number().optional().describe('Maximum nudges per pane (default: 3)'),
+    nudge_message: z.string().optional().describe('Message sent as nudge'),
+  },
+  async (args) => {
+    if (!isMain) {
+      return { content: [{ type: 'text' as const, text: 'Only the main group can wait on tmux teams.' }], isError: true };
+    }
+
+    const timeoutMs = Math.min(args.timeout_ms || 300000, 600000);
+
+    writeTmuxIpc({
+      type: 'omx_run_team_wait',
+      jobId: args.job_id,
+      timeoutMs,
+      nudgeDelayMs: args.nudge_delay_ms,
+      nudgeMaxCount: args.nudge_max_count,
+      nudgeMessage: args.nudge_message,
+      timestamp: new Date().toISOString(),
+    });
+
+    // Poll for response with the full timeout (host does the actual waiting)
+    const resp = readTmuxResponse(args.job_id, timeoutMs + 5000);
+    if (resp) {
+      return { content: [{ type: 'text' as const, text: JSON.stringify(resp) }] };
+    }
+
+    return {
+      content: [{ type: 'text' as const, text: JSON.stringify({ jobId: args.job_id, status: 'timeout', message: `No response after ${timeoutMs}ms. Workers may still be running — use omx_run_team_status to check.` }) }],
+    };
+  },
+);
+
+server.tool(
+  'omx_run_team_cleanup',
+  `Explicitly clean up worker panes. Kills all worker panes for the job.`,
+  {
+    job_id: z.string().describe('Job ID returned by omx_run_team_start'),
+    grace_ms: z.number().optional().describe('Grace period in ms before force-killing panes (default: 5000)'),
+  },
+  async (args) => {
+    if (!isMain) {
+      return { content: [{ type: 'text' as const, text: 'Only the main group can cleanup tmux teams.' }], isError: true };
+    }
+
+    writeTmuxIpc({
+      type: 'omx_run_team_cleanup',
+      jobId: args.job_id,
+      graceMs: args.grace_ms,
+      timestamp: new Date().toISOString(),
+    });
+
+    const resp = readTmuxResponse(args.job_id, 10000);
+    if (resp) {
+      return { content: [{ type: 'text' as const, text: JSON.stringify(resp) }] };
+    }
+
+    return {
+      content: [{ type: 'text' as const, text: `Cleanup requested for job ${args.job_id}. Panes will be terminated.` }],
+    };
+  },
+);
+
 // Start the stdio transport
 const transport = new StdioServerTransport();
 await server.connect(transport);

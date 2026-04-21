@@ -7,6 +7,7 @@ import {
   DATA_DIR,
   IPC_POLL_INTERVAL,
   MAIN_GROUP_FOLDER,
+  OMX_TMUX_ENABLED,
   TIMEZONE,
 } from './config.js';
 import { AvailableGroup } from './container-runner.js';
@@ -173,6 +174,33 @@ export function startIpcWatcher(deps: IpcDeps): void {
         }
       } catch (err) {
         logger.error({ err, sourceGroup }, 'Error reading IPC tasks directory');
+      }
+
+      // Process tmux IPC requests from this group
+      if (isMain && OMX_TMUX_ENABLED) {
+        const tmuxDir = path.join(ipcBaseDir, sourceGroup, 'tmux');
+        try {
+          if (fs.existsSync(tmuxDir)) {
+            const tmuxFiles = fs
+              .readdirSync(tmuxDir)
+              .filter((f) => f.endsWith('.json') && !f.startsWith('responses'));
+            for (const file of tmuxFiles) {
+              const filePath = path.join(tmuxDir, file);
+              try {
+                const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+                await processTmuxIpc(data, tmuxDir);
+                fs.unlinkSync(filePath);
+              } catch (err) {
+                logger.error({ file, sourceGroup, err }, 'Error processing tmux IPC');
+                const errorDir = path.join(ipcBaseDir, 'errors');
+                fs.mkdirSync(errorDir, { recursive: true });
+                fs.renameSync(filePath, path.join(errorDir, `tmux-${sourceGroup}-${file}`));
+              }
+            }
+          }
+        } catch (err) {
+          logger.error({ err, sourceGroup }, 'Error reading tmux IPC directory');
+        }
       }
     }
 
@@ -539,5 +567,184 @@ export async function processTaskIpc(
 
     default:
       logger.warn({ type: data.type }, 'Unknown IPC task type');
+  }
+}
+
+// ── OmX Tmux IPC Handler ��─────────────────────────────────────────────────
+
+// Lazy-loaded tmux module (only when OMX_TMUX_ENABLED=true)
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let tmuxModule: any = null;
+// Track active tmux jobs: jobId → { teamId, sessionName, workers[] }
+const tmuxJobs = new Map<string, { teamId: string; sessionName: string; workers: string[] }>();
+
+async function getTmuxModule() {
+  if (!tmuxModule) {
+    tmuxModule = await import('./omx-tmux.js');
+  }
+  return tmuxModule;
+}
+
+function writeTmuxResponse(tmuxDir: string, jobId: string, data: object): void {
+  const responsesDir = path.join(tmuxDir, 'responses');
+  fs.mkdirSync(responsesDir, { recursive: true });
+  const filePath = path.join(responsesDir, `${jobId}.json`);
+  const tmpPath = `${filePath}.tmp`;
+  fs.writeFileSync(tmpPath, JSON.stringify(data, null, 2));
+  fs.renameSync(tmpPath, filePath);
+}
+
+async function processTmuxIpc(
+  data: {
+    type: string;
+    jobId: string;
+    teamName?: string;
+    agentTypes?: string[];
+    tasks?: Array<{ subject: string; description: string }>;
+    cwd?: string;
+    timeoutMs?: number;
+    nudgeDelayMs?: number;
+    nudgeMaxCount?: number;
+    nudgeMessage?: string;
+    graceMs?: number;
+  },
+  tmuxDir: string,
+): Promise<void> {
+  const tmux = await getTmuxModule();
+
+  switch (data.type) {
+    case 'omx_run_team_start': {
+      if (!data.teamName || !data.agentTypes || !data.tasks || !data.cwd) {
+        writeTmuxResponse(tmuxDir, data.jobId, { jobId: data.jobId, status: 'error', error: 'Missing required fields' });
+        break;
+      }
+
+      const sessionName = tmux.createTmuxSession(data.teamName, data.jobId);
+      const workers: string[] = [];
+
+      for (let i = 0; i < data.tasks.length; i++) {
+        const agentType = data.agentTypes[i] || data.agentTypes[0] || 'claude-cli';
+        const task = data.tasks[i];
+        const prompt = `${task.subject}\n\n${task.description}`;
+
+        try {
+          const worker = await tmux.spawnTmuxWorker({
+            teamId: data.jobId,
+            stepNumber: i + 1,
+            agentType: agentType === 'claude' ? 'claude-cli' : agentType,
+            cwd: data.cwd,
+            prompt,
+          });
+          workers.push(worker.workerId);
+        } catch (err) {
+          logger.error({ jobId: data.jobId, step: i + 1, err }, 'Failed to spawn tmux worker');
+        }
+      }
+
+      tmuxJobs.set(data.jobId, { teamId: data.jobId, sessionName, workers });
+      writeTmuxResponse(tmuxDir, data.jobId, {
+        jobId: data.jobId,
+        status: 'running',
+        sessionName,
+        workerCount: workers.length,
+        workers,
+      });
+      logger.info({ jobId: data.jobId, sessionName, workers: workers.length }, 'Tmux team started');
+      break;
+    }
+
+    case 'omx_run_team_status': {
+      const job = tmuxJobs.get(data.jobId);
+      if (!job) {
+        writeTmuxResponse(tmuxDir, data.jobId, { jobId: data.jobId, status: 'not_found' });
+        break;
+      }
+
+      const workerStatuses = job.workers.map((wId: string) => {
+        const worker = tmux.getWorker(wId);
+        if (!worker) return { workerId: wId, status: 'unknown' };
+        const activity = tmux.checkWorkerActivity(worker);
+        return {
+          workerId: wId,
+          status: worker.status,
+          isAlive: activity.isAlive,
+          isIdle: activity.isIdle,
+          lastOutput: activity.lastOutput?.slice(-200),
+        };
+      });
+
+      const allDone = workerStatuses.every((w: { status: string }) => w.status === 'completed' || w.status === 'failed');
+      writeTmuxResponse(tmuxDir, data.jobId, {
+        jobId: data.jobId,
+        status: allDone ? 'completed' : 'running',
+        workers: workerStatuses,
+      });
+      break;
+    }
+
+    case 'omx_run_team_wait': {
+      const job = tmuxJobs.get(data.jobId);
+      if (!job) {
+        writeTmuxResponse(tmuxDir, data.jobId, { jobId: data.jobId, status: 'not_found' });
+        break;
+      }
+
+      const timeoutMs = data.timeoutMs || 300000;
+      const nudgeDelay = data.nudgeDelayMs || 30000;
+      const maxNudges = data.nudgeMaxCount || 3;
+      const deadline = Date.now() + timeoutMs;
+      const pollInterval = 5000;
+
+      while (Date.now() < deadline) {
+        let allDone = true;
+        for (const wId of job.workers) {
+          const worker = tmux.getWorker(wId);
+          if (!worker) continue;
+          if (worker.status !== 'completed' && worker.status !== 'failed') {
+            allDone = false;
+            const activity = tmux.checkWorkerActivity(worker);
+            if (activity.isAlive && activity.isIdle && activity.idleDuration >= nudgeDelay && worker.nudgeCount < maxNudges) {
+              tmux.nudgeWorker(worker, data.nudgeMessage);
+            }
+          }
+        }
+
+        if (allDone) {
+          const finalStatuses = job.workers.map((wId: string) => {
+            const w = tmux.getWorker(wId);
+            return { workerId: wId, status: w?.status || 'unknown' };
+          });
+          writeTmuxResponse(tmuxDir, data.jobId, { jobId: data.jobId, status: 'completed', workers: finalStatuses });
+          return;
+        }
+
+        await new Promise(r => setTimeout(r, pollInterval));
+      }
+
+      // Timeout
+      const timeoutStatuses = job.workers.map((wId: string) => {
+        const w = tmux.getWorker(wId);
+        return { workerId: wId, status: w?.status || 'unknown' };
+      });
+      writeTmuxResponse(tmuxDir, data.jobId, { jobId: data.jobId, status: 'timeout', workers: timeoutStatuses });
+      break;
+    }
+
+    case 'omx_run_team_cleanup': {
+      const job = tmuxJobs.get(data.jobId);
+      if (!job) {
+        writeTmuxResponse(tmuxDir, data.jobId, { jobId: data.jobId, status: 'not_found' });
+        break;
+      }
+
+      await tmux.shutdownAllWorkers(job.sessionName);
+      tmuxJobs.delete(data.jobId);
+      writeTmuxResponse(tmuxDir, data.jobId, { jobId: data.jobId, status: 'cleaned_up' });
+      logger.info({ jobId: data.jobId, sessionName: job.sessionName }, 'Tmux team cleaned up');
+      break;
+    }
+
+    default:
+      logger.warn({ type: data.type, jobId: data.jobId }, 'Unknown tmux IPC type');
   }
 }

@@ -51,3 +51,7 @@ export const TIMEZONE =
 // Memory IPC configuration
 export const MEMORY_IPC_POLL_MS = 100;
 export const MEMORY_IPC_TIMEOUT_MS = 30000;
+
+// OmX Tmux Workers (opt-in — set OMX_TMUX_ENABLED=true in .env)
+export const OMX_TMUX_ENABLED = process.env.OMX_TMUX_ENABLED === 'true';
+export const OMX_WORKFLOWS_DIR = path.resolve(DATA_DIR, 'omx-workflows');
