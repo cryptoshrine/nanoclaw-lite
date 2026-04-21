@@ -10,7 +10,7 @@
 
 NanoClaw Lite is a **personal AI assistant** powered by the Claude Agent SDK, accessible via Telegram. It runs as a single Node.js process on your machine — no containers, no cloud services, no microservices. Just you and Claude, connected through Telegram.
 
-It's designed to be **small enough to understand** (~10K lines of TypeScript), **powerful enough to be useful** (scheduling, memory, browser automation, agent teams), and **simple enough to hack on** (modify the code directly — no configuration sprawl).
+It's designed to be **small enough to understand** (~12K lines of TypeScript across 60 files), **powerful enough to be useful** (scheduling, memory, browser automation, agent teams, autonomous workflows), and **simple enough to hack on** (modify the code directly — no configuration sprawl).
 
 ## Quick Start
 
@@ -27,23 +27,39 @@ The setup wizard walks you through everything interactively. Or run `claude` the
 
 ## Features
 
+### Core
 - **Telegram I/O** — message Claude from your phone via Telegram bot (`grammy`)
 - **Isolated group context** — each group has its own `CLAUDE.md` memory and isolated filesystem
 - **Main channel** — your private chat for admin control; every other group is sandboxed
 - **Scheduled tasks** — recurring cron jobs, intervals, or one-time tasks that run Claude and message you back
 - **Web access** — search the web and fetch content from URLs
+- **Two execution modes** — local (Node.js child process, default) or Docker for OS-level isolation
+- **Structured logging** — `pino`-based structured logger across the entire system
+- **MCP server support** — extend with Model Context Protocol servers
+
+### Memory
 - **Hybrid memory search** — BM25 keyword search (FTS5) + local vector embeddings (`all-MiniLM-L6-v2` via `@xenova/transformers`) with `sqlite-vec`. Zero external API cost
 - **Fact extraction** — automatic extraction and indexing of facts from conversations for long-term memory
-- **Agent Swarms** — spin up teams of specialized agents that collaborate on complex tasks
-- **Middleware pipeline** — composable before/after hooks (metrics, prompt sanitization, session management, error recovery)
+- **Background review** — post-session learning agent that reviews conversations and extracts insights
+
+### Agents & Automation
+- **Agent teams** — spin up teams of specialized agents that collaborate on complex tasks
+- **OmX autonomous workflows** — step-file orchestration with specialist routing, dependency chains, and test gates
+- **PAL Router** — 3-tier model cost escalation (Haiku → Sonnet → Opus) that auto-upgrades on retries
+- **OmX tmux workers** — parallel CLI worker engine that dispatches tasks to Codex, Claude, or Gemini CLI tools
+- **Ouroboros integration** — deliberative planning (Double Diamond), evaluation (3-stage), and evolutionary iteration (Ralph mode) via Python MCP bridge. Feature-flagged behind `OUROBOROS_ENABLED=true`
+
+### Interaction
 - **Browser automation** — `agent-browser` CLI with Chromium for web scraping and interaction
 - **Voice transcription** — transcribe voice messages via Whisper so the agent can read them
 - **Inline approvals** — Telegram inline keyboards for human-in-the-loop flows
 - **DM allowlist** — control which users can DM the bot directly
-- **Structured logging** — `pino`-based structured logger across the entire system
-- **Two execution modes** — local (Node.js child process, default) or Docker for OS-level isolation
-- **MCP server support** — extend with Model Context Protocol servers
-- **Background review** — post-session learning agent that reviews conversations and extracts insights
+
+### Self-Improvement
+- **Middleware pipeline** — composable before/after hooks (metrics, prompt sanitization, session management, error recovery)
+- **Agent-writable skills** — agents can create new skills during execution and use them in future sessions
+- **Session search** — search past conversation history for context
+- **Bounded memory with frozen snapshots** — memory files are snapshotted at session start, writes take effect next session
 
 ## Usage
 
@@ -94,7 +110,7 @@ The codebase is small enough that Claude can safely modify it.
 ## Architecture
 
 ```
-Telegram (grammy) → SQLite → Polling Loop → Agent (Claude Agent SDK) → Response
+Telegram (grammy) → SQLite → Polling Loop → Middleware Pipeline → Agent (Claude Agent SDK) → Response
 ```
 
 Single Node.js process. Two execution modes:
@@ -122,6 +138,10 @@ Per-group message queue with concurrency control. IPC via filesystem.
 | `src/dm-allowlist.ts` | DM access control |
 | `src/transcription.ts` | Voice message transcription |
 | `src/browser-daemon.ts` | Persistent browser daemon for automation |
+| `src/omx-pal.ts` | PAL Router — 3-tier model cost escalation |
+| `src/omx-tmux.ts` | Parallel CLI worker engine (Codex/Claude/Gemini) |
+| `src/omx-ouroboros.ts` | Ouroboros bridge — deliberative planning + Ralph mode |
+| `src/omx-context.ts` | OmX shared context management |
 | `groups/*/CLAUDE.md` | Per-group memory |
 
 ### Middleware Pipeline (`src/middleware/`)
@@ -157,7 +177,7 @@ Composable before/after hooks, like Express/Koa:
 
 ```
 nanoclaw-lite/
-├── src/                          # Main TypeScript source (~56 files)
+├── src/                          # Main TypeScript source (~60 files)
 │   ├── middleware/                # Composable middleware pipeline
 │   ├── memory/                   # Hybrid search + fact extraction
 │   └── *.ts                      # Core modules
@@ -167,6 +187,8 @@ nanoclaw-lite/
 │   ├── Dockerfile                # Node 22 + Chromium
 │   └── skills/                   # Built-in skills (agent-browser)
 ├── .claude/skills/               # Claude Code skills (9 skills)
+├── addons/                       # Optional add-ons (oh-my-codex, clawhip)
+├── browser-harness/              # Persistent CDP daemon with skill accumulation (Python)
 ├── docs/                         # Architecture docs
 ├── groups/                       # Per-group isolated workspaces
 │   └── {group}/CLAUDE.md         # Group-specific memory
@@ -177,6 +199,33 @@ nanoclaw-lite/
 │   └── registered_groups.json    # Group registry
 └── dist/                         # Compiled JavaScript (gitignored)
 ```
+
+## Add-Ons
+
+Optional extensions that add capabilities without being required dependencies. See [`addons/README.md`](addons/README.md).
+
+| Add-On | Description | Requires |
+|--------|-------------|----------|
+| **oh-my-codex** | Routes coding tasks through Codex/Claude/Gemini CLI workers via tmux | `omx-tmux` feature enabled |
+| **clawhip** | Discord bridge for agent lifecycle events (#mission-control) | Discord bot token |
+
+Install with:
+```bash
+bash addons/oh-my-codex/install.sh   # Unix
+.\addons\oh-my-codex\install.ps1     # Windows
+```
+
+## Browser Harness
+
+Persistent CDP (Chrome DevTools Protocol) daemon with skill accumulation. The daemon survives across agent sessions and learns browser interaction patterns over time. See [`browser-harness/README.md`](browser-harness/README.md).
+
+```bash
+cd browser-harness
+pip install -e .
+browser-harness
+```
+
+Provides JSON-RPC methods: `navigate`, `evaluate`, `click`, `fill`, `screenshot`, `wait_for`, `get_html`, `get_text`, plus skill accumulation (`skill_record`, `skill_find`, `skill_execute`).
 
 ## Configuration
 
@@ -198,6 +247,7 @@ MAX_HISTORY_AGE_MS=14400000      # Message history window (default: 4 hours)
 OPENAI_API_KEY=                  # For voice transcription (optional)
 GITHUB_TOKEN=                    # For agent git operations (optional)
 LOG_LEVEL=info                   # fatal, error, warn, info, debug, trace
+OUROBOROS_ENABLED=false           # Enable Ouroboros deliberative planning (optional)
 ```
 
 ## Skills
@@ -214,6 +264,7 @@ Built-in skills you can run with Claude Code:
 | `/add-voice-transcription` | Add voice message transcription via Whisper |
 | `/code-assistant` | Code assistance workflows |
 | `/task` | Task scheduling and management |
+| `/browser-harness` | Install and configure the persistent browser daemon |
 
 ## Contributing
 
@@ -251,6 +302,7 @@ Everything else (new capabilities, OS compatibility, hardware support, enhanceme
 - Node.js 20+
 - [Claude Code](https://claude.ai/download)
 - Optional: [Docker](https://docker.com/products/docker-desktop) for container isolation
+- Optional: Python 3.11+ for browser harness
 
 ## FAQ
 
@@ -273,6 +325,10 @@ In Docker mode, agents run in containers with OS-level isolation — they can on
 **Why no configuration files?**
 
 No configuration sprawl. Every user should customize it so that the code matches exactly what they want rather than configuring a generic system. If you like having config files, tell Claude to add them.
+
+**What's OmX / PAL / Ouroboros?**
+
+Advanced orchestration modules ported from the production NanoClaw. **OmX** handles autonomous multi-step workflows with specialist routing. **PAL** auto-escalates model tiers on retries to save cost. **Ouroboros** adds deliberative planning and evolutionary iteration loops. All are opt-in — the base system works without them.
 
 **How do I debug issues?**
 
